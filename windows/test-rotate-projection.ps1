@@ -172,11 +172,18 @@ try {
     } finally { Remove-Item Env:\MERGE_PR_STATE_DIR -ErrorAction SilentlyContinue }
   } else { Write-Host "  SKIP  real-launcher checks (launcher not found)" -ForegroundColor DarkYellow }
 
-  # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock whose session transcript was
-  #      modified after ts (+ grace) is woken; everything else about "parked" is unchanged.
+  # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock is woken only when its
+  #      transcript holds a message the OWNER typed after ts. Anything else written while parked
+  #      (task notifications, cross-session messages, compactions, limit errors) is not an answer.
   $nowS = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $tr = Join-Path $sd 'session.jsonl'; 'x' | Set-Content $tr
-  function SetTranscriptAge([int]$secAfterTs, [double]$ts) { (Get-Item $tr).LastWriteTimeUtc = [DateTimeOffset]::FromUnixTimeSeconds([long]($ts + $secAfterTs)).UtcDateTime }
+  $tr = Join-Path $sd 'session.jsonl'
+  function Stamp([int]$secAfterTs, [double]$ts) { [DateTimeOffset]::FromUnixTimeSeconds([long]($ts + $secAfterTs)).ToString('o') }
+  function UserLine($content, [int]$sec, [double]$ts, [hashtable]$extra = @{}) {
+    $o = [ordered]@{ type = 'user'; timestamp = (Stamp $sec $ts); message = @{ role = 'user'; content = $content } }
+    foreach ($k in $extra.Keys) { $o[$k] = $extra[$k] }
+    $o | ConvertTo-Json -Compress -Depth 6
+  }
+  function WriteTranscript([string[]]$lines) { Set-Content -LiteralPath $tr -Value $lines -Encoding UTF8 }
   function WriteLock([string]$path, $ts, $session) {
     $o = [ordered]@{ repo = $repo; pr = 90; state = 'parked'; ts = $ts }; if ($null -ne $session) { $o.session = $session }
     ($o | ConvertTo-Json -Compress) | Set-Content $path
@@ -185,17 +192,25 @@ try {
   $parkedJson = '{"status": "parked", "lock": ' + (ConvertTo-Json $lk) + '}'
   $ts0 = $nowS - 86400
   WriteLock $lk $ts0 $tr
-  SetTranscriptAge 24970 $ts0
-  Check 'answered (transcript far past ts) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  $noise = @(
+    (UserLine '<task-notification><task-id>x</task-id><status>completed</status></task-notification>' 900 $ts0),
+    (UserLine 'Another Claude session sent a message: <cross-session-message>status?</cross-session-message>' 1200 $ts0 @{ isMeta = $true }),
+    (UserLine '<command-name>/compact</command-name>' 1500 $ts0),
+    (UserLine 'This session is being continued from a previous conversation.' 1501 $ts0 @{ isCompactSummary = $true }),
+    (UserLine @(@{ type = 'tool_result'; tool_use_id = 't'; content = 'ok' }) 1600 $ts0),
+    (UserLine 'Usage reset: the session limit capped, so the CLI account was rotated to D.' 1700 $ts0),
+    ('{"type":"assistant","timestamp":"' + (Stamp 1800 $ts0) + '","isApiErrorMessage":true,"error":"rate_limit","message":{"content":[{"type":"text","text":"limit"}]}}')
+  )
+  WriteTranscript $noise
+  Check 'notifications, meta, compaction, tool results, rotator pings after park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  Check 'parked + only noise since => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
+  WriteTranscript (@((UserLine 'a' -60 $ts0)) + $noise)
+  Check 'owner message typed BEFORE the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
+  Check 'owner message typed after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
-  SetTranscriptAge 233 $ts0   # real trailing write of a freshly parked session (measured on #5992)
-  Check 'closing-turn write inside grace => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
-  Check 'closing-turn write inside grace => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
-  SetTranscriptAge 601 $ts0
-  Check 'transcript just past the 600 s grace => answered' (Test-ParkedLockAnswered -LockPath $lk)
-  SetTranscriptAge -50 $ts0
-  Check 'transcript older than ts => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
-  Check 'custom grace is honoured' (Test-ParkedLockAnswered -LockPath $lk -GraceSec -100)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
+  Check 'owner answer as a text block => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteLock $lk $ts0 $null
   Check 'lock without session => no evidence => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
   WriteLock $lk $ts0 (Join-Path $sd 'gone.jsonl')
@@ -205,11 +220,11 @@ try {
   Check 'no lock path in status JSON => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus '{"status": "parked"}'))
   # end to end through the REAL launcher (it reports the lock path itself)
   if (Test-Path $realLauncher) {
-    WriteLock $lk $ts0 $tr; SetTranscriptAge 24970 $ts0
+    WriteLock $lk $ts0 $tr; WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
     $env:MERGE_PR_STATE_DIR = $sd
     try {
       Check 'real launcher: parked + answered => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90))
-      SetTranscriptAge 30 $ts0
+      WriteTranscript $noise
       Check 'real launcher: parked + not answered => skipped' (Test-MergePrParked -Repo $repo -Pr 90)
     } finally { Remove-Item Env:\MERGE_PR_STATE_DIR -ErrorAction SilentlyContinue }
   }

@@ -19,7 +19,7 @@ FAIL-OPEN, in both functions. A session that is wrongly nudged costs one turn; a
 is wrongly skipped never learns its quota is back. So every doubt answers "inject":
 unidentifiable PR, no lock, unreadable lock, launcher missing, timeout, non-zero exit,
 unparseable output, or any status other than exactly "parked" — and a parked lock whose session
-transcript was written after it parked (the owner answered; see Test-ParkedLockAnswered).
+transcript holds an owner message typed after it parked (see Test-ParkedLockAnswered).
 #>
 
 # ---- window -> PR ---------------------------------------------------------------------------
@@ -65,21 +65,42 @@ function Get-MergePrTarget {
 # ---- answered-but-still-parked --------------------------------------------------------------
 # A lock leaves `parked` only when the session itself runs --unpark. If the owner answers while the
 # seat is capped, that turn dies on the usage limit first, the lock stays `parked`, and skipping
-# the window would strand his answer. So a parked lock whose session transcript was written AFTER
-# it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `ts` (epoch s).
-# GraceSec exists because a session keeps writing for a while AFTER it parks (its closing turn):
-# measured 2026-10-20 on real parked locks, +59 s and +233 s with nobody having answered, versus
-# +24970 s for a genuinely answered one. 600 s clears the former; an answer typed within GraceSec
-# of parking is not detected (it is nudged only once the transcript passes the margin).
+# the window would strand his answer. So a parked lock whose session transcript shows an owner
+# answer AFTER it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `ts` (epoch s).
+# "Answered" means a message the OWNER typed, timestamped after the park. It used to mean "the
+# transcript file changed 600 s after parking", but a parked window keeps writing with nobody
+# there: background task notifications, orchestrator cross-session messages, idle compactions,
+# a limit error on a notification turn. Each of those read as an answer and the window was
+# woken for nothing (2026-11-02). Not an answer: meta lines, compaction summaries, tool results,
+# anything that opens with a tag (<task-notification>, <command-name>, <local-command-...>,
+# <cross-session-message>) and the rotator's own "Usage reset:" ping.
+# The whole transcript is scanned: a busy window can write megabytes after the answer.
 # No `session`/`ts`, or the transcript missing/unreadable => no evidence of an answer => stays parked.
+function Test-OwnerMessage($e) {
+  if ($e.type -ne 'user' -or $e.isMeta -or $e.isSidechain -or $e.isCompactSummary) { return $false }
+  $c = $e.message.content
+  $text = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
+  $text = ([string]$text).TrimStart()
+  return ($text -and -not $text.StartsWith('<') -and -not $text.StartsWith('Usage reset:'))
+}
 function Test-ParkedLockAnswered {
-  param([string]$LockPath, [int]$GraceSec = 600)
+  param([string]$LockPath)
   try {
     $lock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if (-not $lock.session -or $null -eq $lock.ts) { return $false }
-    $item = Get-Item -LiteralPath ([string]$lock.session) -ErrorAction Stop
-    $mtime = [DateTimeOffset]::new($item.LastWriteTimeUtc).ToUnixTimeSeconds()
-    return ($mtime -gt ([double]$lock.ts + $GraceSec))
+    $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$lock.ts * 1000))
+    $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss')
+    $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
+    try { $all = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8).ReadToEnd() } finally { $fs.Dispose() }
+    foreach ($l in ($all -split "`n")) {
+      # Cheap pre-filters before parsing: a user entry stamped at or after the park second.
+      if ($l -notmatch '"type"\s*:\s*"user"' -or $l -notmatch '"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
+      if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
+      try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+      if (-not $e.timestamp -or [DateTimeOffset]::Parse([string]$e.timestamp) -le $since) { continue }
+      if (Test-OwnerMessage $e) { return $true }
+    }
+    return $false
   } catch { return $false }
 }
 
@@ -89,7 +110,6 @@ function Test-MergePrParked {
     [Parameter(Mandatory)][string]$Repo,
     [Parameter(Mandatory)][int]$Pr,
     [int]$TimeoutSec = 10,
-    [int]$AnsweredGraceSec = 600,
     [string]$Launcher,
     [string]$Python,
     # Test seam: scriptblock taking (@arguments) and returning @{ ExitCode; Stdout }.
@@ -133,7 +153,7 @@ function Test-MergePrParked {
     $j = [string]$res.Stdout | ConvertFrom-Json -ErrorAction Stop
     if (-not ($j.status -is [string] -and $j.status -ceq 'parked')) { return $false }
     # Parked per the launcher; but if the owner has answered since (see Test-ParkedLockAnswered), wake it.
-    if ($j.lock -is [string] -and $j.lock -and (Test-ParkedLockAnswered -LockPath $j.lock -GraceSec $AnsweredGraceSec)) { return $false }
+    if ($j.lock -is [string] -and $j.lock -and (Test-ParkedLockAnswered -LockPath $j.lock)) { return $false }
     return $true
   } catch { return $false }
 }
