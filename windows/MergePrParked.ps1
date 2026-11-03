@@ -77,7 +77,8 @@ function Get-MergePrTarget {
 # of those read as an answer and the window was woken for nothing (2026-11-02).
 # Who wrote a line: current CLIs stamp `origin.kind` on it. `human` is the owner (typed, pasted --
 # which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted suggestion).
-# These kinds are automated and never count, whatever the text says: `task-notification`, `peer`,
+# These kinds are automated and never count, whatever the text says (except a relayed ruling for
+# this PR, below): `task-notification`, `peer`,
 # `auto-continuation` (the CLI's "usage limit has reset"), `coordinator`, `observer`,
 # `observer-activity`, `unclassified` (CLI schema: "never presumed human"), and `plugin` without
 # `asUser`. That check runs before the AskUserQuestion branch, because a plugin can re-emit an old
@@ -187,28 +188,34 @@ function Test-ParkedLockAnswered {
     $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     # A queued_command attachment is stamped when he TYPED it, not when the session read it (it can sit
     # queued for minutes), so its stamp cannot say which side of the park it was read on. Its place in
-    # the file can: it counts only once a line stamped after the park has been written before it.
-    $pastPark = $false
+    # the file can: it counts only when the line written just before it is stamped at or after the
+    # park. Not "any earlier line": a compaction writes a boundary stamped now and then re-writes the
+    # retained history with its ORIGINAL stamps, so a pre-park queued message reappears after a
+    # post-park line. So a boundary resets the test, the compaction summary (stamped now) does not
+    # set it, and the copied history's old stamps keep it reset until genuinely new lines follow.
+    $prevAfter = $false
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
         # Cheap pre-filters before parsing. The entry's own timestamp is the LAST one on the line: an
         # attachment nests its own copy first. (A "timestamp" quoted inside message text is
-        # JSON-escaped, so it cannot match.) Any line stamped after the park second moves us past it.
+        # JSON-escaped, so it cannot match.)
         if ($l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
         $key = $Matches[1]
-        $wasPast = $pastPark
-        if ([string]::CompareOrdinal($key, $sinceKey) -gt 0) { $pastPark = $true }
+        $queued = $l -match '"type"\s*:\s*"attachment"' -and $l -match '"queued_command"'
+        $readAfter = $prevAfter
+        if ($l -match '"subtype"\s*:\s*"compact_boundary"') { $prevAfter = $false }
+        elseif (-not $queued -and $l -notmatch '"isCompactSummary"\s*:\s*true') {
+          $prevAfter = [string]::CompareOrdinal($key, $sinceKey) -ge 0
+        }
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"') { continue }
-        $queued = $l -match '"type"\s*:\s*"attachment"'
-        if ($queued) { if (-not $wasPast) { continue } }
+        if ($queued) { if (-not $readAfter) { continue } }
         elseif ([string]::CompareOrdinal($key, $sinceKey) -lt 0) { continue }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if ($e.type -ne 'attachment') {
           if (-not $e.timestamp) { continue }
           try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
-          $pastPark = $true
         }
         if (Test-OwnerMessage $e $lock.pr) { return $true }
       }

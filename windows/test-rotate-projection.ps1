@@ -286,11 +286,19 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'resubmitted owner text that happens to start with < => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'bridge' } })))
   Check 'owner text with an unknown origin kind (e.g. remote) => answered (fail-open)' (Test-ParkedLockAnswered -LockPath $lk)
-  # Typed while a turn ran: stored only as a queued_command attachment, which nests a timestamp of
-  # its own before the entry's (equal in observed transcripts; this fixture makes it earlier to pin
-  # that the entry's own, last, timestamp is the one compared).
+  # Typed while a turn ran: stored only as a queued_command attachment. Its stamps are typing time
+  # and are not compared; it counts because the line written just before it is post-park.
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
-  Check 'owner text queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  Check 'owner text queued mid-turn, after post-park lines => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # A compaction after the park writes a boundary stamped now, then re-writes the retained history
+  # with ORIGINAL stamps -- including a queued message read before the park. Not an answer.
+  $q = '{"type":"attachment","attachment":{"type":"queued_command","prompt":"park it, I will decide tonight","origin":{"kind":"human"},"timestamp":"' + (Stamp -40 $ts0) + '"},"timestamp":"' + (Stamp -40 $ts0) + '"}'
+  $pre = (UserLine @(@{ type = 'tool_result'; tool_use_id = 't0'; content = 'ok' }) -45 $ts0)
+  $boundary = '{"type":"system","subtype":"compact_boundary","timestamp":"' + (Stamp 5000 $ts0) + '"}'
+  WriteTranscript (@($pre, $q) + $noise + @($boundary, $q))
+  Check 'pre-park queued message re-written by a later compaction => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript (@($pre, $q) + $noise + @($boundary, $pre, $q))
+  Check 'same, with older history copied ahead of it => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture
