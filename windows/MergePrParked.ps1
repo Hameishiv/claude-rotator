@@ -19,7 +19,8 @@ FAIL-OPEN, in both functions. A session that is wrongly nudged costs one turn; a
 is wrongly skipped never learns its quota is back. So every doubt answers "inject":
 unidentifiable PR, no lock, unreadable lock, launcher missing, timeout, non-zero exit,
 unparseable output, or any status other than exactly "parked" — and a parked lock whose session
-transcript holds an owner message typed after it parked (see Test-ParkedLockAnswered).
+transcript holds an owner answer after it parked -- typed, an AskUserQuestion pick, or a relayed
+"Owner ruling for #N" (see Test-ParkedLockAnswered).
 #>
 
 # ---- window -> PR ---------------------------------------------------------------------------
@@ -67,53 +68,77 @@ function Get-MergePrTarget {
 # seat is capped, that turn dies on the usage limit first, the lock stays `parked`, and skipping
 # the window would strand his answer. So a parked lock whose session transcript shows an owner
 # answer AFTER it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `parked_at` or else `ts` (epoch s).
-# "Answered" means a message the OWNER typed, timestamped after the park. It used to mean "the
+# "Answered" means an owner answer timestamped after the park: something he typed (or cache-keeper
+# resubmitted for him), an AskUserQuestion pick, or a ruling relayed from another session. It used to mean "the
 # transcript file changed 600 s after parking", but a parked window keeps writing with nobody
 # there: background task notifications, orchestrator cross-session messages, idle compactions,
 # plugin prompts ("Resume", "Try again", /compact), a limit error on a notification turn. Each
 # of those read as an answer and the window was woken for nothing (2026-11-02).
-# Who wrote a line: current CLIs stamp `origin.kind` on it, and only `human` is the owner (typed,
-# pasted -- which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted
-# suggestion); `plugin`, `task-notification`, `peer` are not, whatever the text says -- and that
-# check runs FIRST, because a plugin can re-emit an old AskUserQuestion answer with a fresh stamp.
-# Two exceptions to the origin rule, both measured on real transcripts:
+# Who wrote a line: current CLIs stamp `origin.kind` on it. `human` is the owner (typed, pasted --
+# which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted suggestion).
+# `task-notification`, `peer` and plain `plugin` lines are not, whatever the text says, and that
+# check runs before the AskUserQuestion branch, because a plugin can re-emit an old pick with a
+# fresh stamp. Exceptions, each measured on real transcripts:
+#  - a `plugin` line with `asUser` is cache-keeper resubmitting the owner's own held text after a
+#    /compact; it is often the ONLY copy of his answer. It counts, unless it is one of cache-keeper's
+#    own prompts ("Resume", "Try again", the usage-limit / handoff continuations) or the exact text
+#    of a human line from before the park (a replay of an old message).
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
-#    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text first.
-#  - an owner ruling relayed by deliver_ruling.py arrives as a meta `peer` line whose body starts
-#    "Owner ruling for #<N>"; that IS his answer, given in another session.
+#    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
+#  - an owner ruling relayed by deliver_ruling.py arrives as a `peer` message (a meta user line, or a
+#    queued_command attachment mid-turn) whose body starts "Owner ruling for #<N>"; it counts when N
+#    is this lock's PR.
 # Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
 # with a tag, not "/compact" or "[Request interrupted".
-# An AskUserQuestion pick comes back as a tool_result and IS his answer, in either harness phrasing
+# An AskUserQuestion pick comes back as a tool_result and counts, in either harness phrasing
 # ("Your questions have been answered:" / "The user answered:" with at least one undismissed pick);
-# every other tool_result is not. Text typed while a turn runs can be stored only as an `attachment`
-# line of type `queued_command`, so those count too when their origin is human.
+# every other tool_result does not.
 # The whole transcript is streamed line by line: a busy window can write megabytes after the answer.
 # No `session`, no `parked_at`/`ts`, or the transcript missing/unreadable => no evidence => stays parked.
 function Get-OriginKind($o) { if ($null -ne $o -and $o.PSObject.Properties['kind']) { [string]$o.kind } else { $null } }
-function Test-RotatorPing([string]$t) { $t = $t.Trim(); return ($t.StartsWith('Usage reset:') -or $t -eq 'resume') }
-function Test-OwnerMessage($e) {
+function Get-Prop($o, [string]$n) { if ($null -ne $o -and $o.PSObject.Properties[$n]) { $o.$n } else { $null } }
+function Test-RotatorPing([string]$t) { $t = $t.Trim(); return ($t.StartsWith('Usage reset:') -or $t -ceq 'resume') }
+function Test-CacheKeeperPrompt([string]$t) {
+  $t = $t.Trim()
+  return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
+    $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Handoff from my previous session'))
+}
+function Test-RelayedRuling($origin, $Pr) {
+  if ((Get-OriginKind $origin) -ne 'peer') { return $false }
+  if ([string](Get-Prop $origin 'body') -notmatch '^\s*Owner ruling for #(\d+)') { return $false }
+  return ($null -eq $Pr -or [long]$Matches[1] -eq [long]$Pr)
+}
+function Get-LineText($e) {
+  $c = $e.message.content
+  $t = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
+  return ([string]$t).Trim()
+}
+# $Before: texts of human lines written before the park (a plugin replay of one is not new).
+function Test-OwnerMessage($e, $Pr = $null, $Before = $null) {
   if ($e.type -eq 'attachment') {
     $a = $e.attachment
-    if ($null -eq $a -or $a.type -ne 'queued_command' -or (Get-OriginKind $a.origin) -ne 'human') { return $false }
+    if ($null -eq $a -or $a.type -ne 'queued_command') { return $false }
+    if (Test-RelayedRuling $a.origin $Pr) { return $true }
+    if ((Get-OriginKind $a.origin) -ne 'human') { return $false }
     $t = ([string]$a.prompt).Trim()
     return ($t -and -not (Test-RotatorPing $t))
   }
   if ($e.type -ne 'user' -or $e.isSidechain -or $e.isCompactSummary) { return $false }
   $kind = Get-OriginKind $e.origin
-  if ($kind -eq 'peer') {
-    $body = if ($e.origin.PSObject.Properties['body']) { [string]$e.origin.body } else { '' }
-    return ($body -match '^\s*Owner ruling for #\d+')
+  if ($kind -eq 'peer') { return (Test-RelayedRuling $e.origin $Pr) }
+  $resubmitted = ($kind -eq 'plugin' -and (Get-Prop $e.origin 'asUser') -eq $true)
+  if ($e.isMeta -or ($kind -and $kind -ne 'human' -and -not $resubmitted)) { return $false }
+  $text = Get-LineText $e
+  if ($resubmitted) {
+    return ($text -and -not $text.StartsWith('<') -and -not (Test-RotatorPing $text) -and
+      -not (Test-CacheKeeperPrompt $text) -and -not ($Before -and $Before.Contains($text)))
   }
-  if ($e.isMeta -or ($kind -and $kind -ne 'human')) { return $false }
-  $c = $e.message.content
-  foreach ($b in @($c | Where-Object { $_.type -eq 'tool_result' })) {
+  foreach ($b in @($e.message.content | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
     $r = ([string]$r).TrimStart()
     if ($r.StartsWith('Your questions have been answered:')) { return $true }
     if ($r.StartsWith('The user answered:') -and $r -match '"="(?!\[User dismissed)') { return $true }
   }
-  $text = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
-  $text = ([string]$text).Trim()
   if (-not $text -or (Test-RotatorPing $text)) { return $false }
   if ($kind) { return $true }
   return -not ($text.StartsWith('<') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
@@ -138,17 +163,24 @@ function Test-ParkedLockAnswered {
     $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
+    $before = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
         # Cheap pre-filters before parsing: a user/attachment entry stamped at or after the park second.
         # The entry's own timestamp is the LAST one on the line: an attachment nests its own earlier
         # one first. (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"' -or $l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
-        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
+        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) {
+          # Before the park: remember what the owner typed, so a later plugin replay of it is not new.
+          if ($l -match '"kind"\s*:\s*"human"') {
+            try { $p0 = $l | ConvertFrom-Json -ErrorAction Stop; if ($p0.type -eq 'user') { $t0 = Get-LineText $p0; if ($t0) { [void]$before.Add($t0) } } } catch { }
+          }
+          continue
+        }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if (-not $e.timestamp) { continue }
         try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
-        if (Test-OwnerMessage $e) { return $true }
+        if (Test-OwnerMessage $e $lock.pr $before) { return $true }
       }
     } finally { $rd.Dispose(); $fs.Dispose() }
     return $false

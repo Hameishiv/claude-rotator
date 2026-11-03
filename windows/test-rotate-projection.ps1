@@ -173,8 +173,10 @@ try {
   } else { Write-Host "  SKIP  real-launcher checks (launcher not found)" -ForegroundColor DarkYellow }
 
   # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock is woken only when its
-  #      transcript holds a message the OWNER typed after it parked. Anything else written while parked
-  #      (task notifications, cross-session messages, compactions, limit errors) is not an answer.
+  #      transcript holds an owner answer after it parked: typed (or resubmitted for him by
+  #      cache-keeper), an AskUserQuestion pick, or a relayed "Owner ruling for #N". Anything else
+  #      written while parked (task notifications, other cross-session messages, compactions,
+  #      plugin prompts, the rotator's own ping, limit errors) is not an answer.
   $nowS = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $tr = Join-Path $sd 'session.jsonl'
   function Stamp([int]$secAfterTs, [double]$ts) { [DateTimeOffset]::FromUnixTimeSeconds([long]($ts + $secAfterTs)).ToString('o') }
@@ -212,6 +214,11 @@ try {
     ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"Usage reset: rotated to D.","origin":{"kind":"human"}},"timestamp":"' + (Stamp 1776 $ts0) + '"}'),
     # A plugin re-emitting an OLD AskUserQuestion answer with a fresh stamp; and a peer message that is not a ruling.
     (UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes".' }) 1780 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper' } }),
+    (UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #91: a.</cross-session-message>' 1785 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #91 (given in: x): a.' } }),
+    (UserLine 'I hit my usage limit while you were working, but it has reset now. Please continue.' 1786 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
+    (UserLine 'Handoff from my previous session:
+
+stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
     (UserLine 'Another Claude session sent a message: <cross-session-message>status?</cross-session-message>' 1790 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'status?' } }),
     ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification>x</task-notification>","origin":{"kind":"task-notification"},"timestamp":"' + (Stamp 1760 $ts0) + '"},"timestamp":"' + (Stamp 1761 $ts0) + '"}'),
     ('{"type":"assistant","timestamp":"' + (Stamp 1800 $ts0) + '","isApiErrorMessage":true,"error":"rate_limit","message":{"content":[{"type":"text","text":"limit"}]}}')
@@ -240,6 +247,13 @@ try {
   Check 'AskUserQuestion with one pick and one dismissal => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #90: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #90 (given in: orchestrator): a.' } })))
   Check 'owner ruling relayed by deliver_ruling (meta peer line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # cache-keeper resubmitting his held text after a /compact: often the only copy of the answer.
+  WriteTranscript ($noise + @((UserLine '6529 A, router A - unpark and carry on' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true }; turnOrigin = 'system' })))
+  Check 'owner answer resubmitted by cache-keeper (plugin, asUser) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript (@((UserLine 'old instruction' -600 $ts0 @{ origin = @{ kind = 'human' } })) + $noise + @((UserLine 'old instruction' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'cache-keeper replay of a message typed before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"peer","body":"Owner ruling for #90 (given in: y): a."}},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
+  Check 'relayed ruling queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # Typed while a turn ran: stored only as a queued_command attachment, whose nested timestamp
   # (when it was queued) precedes the entry's own. Queued before the park, written after: still his.
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
