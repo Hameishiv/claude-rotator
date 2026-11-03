@@ -173,7 +173,7 @@ try {
   } else { Write-Host "  SKIP  real-launcher checks (launcher not found)" -ForegroundColor DarkYellow }
 
   # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock is woken only when its
-  #      transcript holds a message the OWNER typed after ts. Anything else written while parked
+  #      transcript holds a message the OWNER typed after it parked. Anything else written while parked
   #      (task notifications, cross-session messages, compactions, limit errors) is not an answer.
   $nowS = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $tr = Join-Path $sd 'session.jsonl'
@@ -199,6 +199,14 @@ try {
     (UserLine 'This session is being continued from a previous conversation.' 1501 $ts0 @{ isCompactSummary = $true }),
     (UserLine @(@{ type = 'tool_result'; tool_use_id = 't'; content = 'ok' }) 1600 $ts0),
     (UserLine 'Usage reset: the session limit capped, so the CLI account was rotated to D.' 1700 $ts0),
+    # Real plugin-written lines (cache-keeper / compact-early): origin says plugin, the text looks typed.
+    (UserLine 'Resume' 1710 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true }; turnOrigin = 'system' }),
+    (UserLine 'Try again' 1720 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true }; turnOrigin = 'system' }),
+    (UserLine '/compact' 1730 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper' } }),
+    (UserLine '/compact' 1735 $ts0),
+    (UserLine '[Request interrupted by user for tool use]' 1740 $ts0),
+    (UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="[User dismissed the question]"' }) 1750 $ts0),
+    ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification>x</task-notification>","origin":{"kind":"task-notification"},"timestamp":"' + (Stamp 1760 $ts0) + '"},"timestamp":"' + (Stamp 1761 $ts0) + '"}'),
     ('{"type":"assistant","timestamp":"' + (Stamp 1800 $ts0) + '","isApiErrorMessage":true,"error":"rate_limit","message":{"content":[{"type":"text","text":"limit"}]}}')
   )
   WriteTranscript $noise
@@ -215,6 +223,29 @@ try {
   Check 'owner answer picked in AskUserQuestion => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = @(@{ type = 'text'; text = 'Your questions have been answered: "Ship it?"="No".' }) }) 4000 $ts0)))
   Check 'AskUserQuestion pick as a text-block tool_result => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine '<pasted_content id="c1">go with B</pasted_content>' 4000 $ts0 @{ origin = @{ kind = 'human' }; turnOrigin = 'human' })))
+  Check 'owner answer pasted (opens with a tag, origin human) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' }; promptSource = 'typed' })))
+  Check 'owner answer typed, origin human => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Yes"' }) 4000 $ts0)))
+  Check 'AskUserQuestion pick phrased "The user answered:" => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # Typed while a turn ran: stored only as a queued_command attachment, whose nested timestamp
+  # (when it was queued) precedes the entry's own. Queued before the park, written after: still his.
+  WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
+  Check 'owner text queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
+  # swapped month and day (or threw on a day above 12, abandoning the scan).
+  $cult = [cultureinfo]::CurrentCulture
+  foreach ($cn in 'en-GB', 'he-IL', 'de-DE') {
+    try {
+      [cultureinfo]::CurrentCulture = [cultureinfo]::new($cn)
+      WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
+      $ok1 = Test-ParkedLockAnswered -LockPath $lk
+      WriteTranscript (@((UserLine 'a' -30 $ts0)) + $noise)
+      $ok2 = -not (Test-ParkedLockAnswered -LockPath $lk)
+    } finally { [cultureinfo]::CurrentCulture = $cult }
+    Check "culture ${cn}: answer after the park found, answer before it not" ($ok1 -and $ok2)
+  }
   WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
   ([ordered]@{ repo = $repo; pr = 90; state = 'parked'; ts = $ts0 + 3600; parked_at = $ts0; session = $tr } | ConvertTo-Json -Compress) | Set-Content $lk
   Check 'heartbeat re-stamped ts after the answer => parked_at still finds it' (Test-ParkedLockAnswered -LockPath $lk)

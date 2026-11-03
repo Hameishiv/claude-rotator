@@ -70,25 +70,47 @@ function Get-MergePrTarget {
 # "Answered" means a message the OWNER typed, timestamped after the park. It used to mean "the
 # transcript file changed 600 s after parking", but a parked window keeps writing with nobody
 # there: background task notifications, orchestrator cross-session messages, idle compactions,
-# a limit error on a notification turn. Each of those read as an answer and the window was
-# woken for nothing (2026-11-02). Not an answer: meta lines, compaction summaries, tool results
-# (except an AskUserQuestion pick, which IS his answer),
-# anything that opens with a tag (<task-notification>, <command-name>, <local-command-...>,
-# <cross-session-message>) and the rotator's own "Usage reset:" ping.
-# The whole transcript is scanned: a busy window can write megabytes after the answer.
+# plugin prompts ("Resume", "Try again", /compact), a limit error on a notification turn. Each
+# of those read as an answer and the window was woken for nothing (2026-11-02).
+# Who wrote a line: current CLIs stamp `origin.kind` on it, and only `human` is the owner (typed,
+# pasted -- which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted
+# suggestion); `plugin`, `task-notification`, `peer` are not, whatever the text says. Older lines
+# with no `origin` fall back to the text: not meta, not a compaction summary, not opening with a
+# tag, not "/compact", "[Request interrupted", or the rotator's own "Usage reset:" ping.
+# An AskUserQuestion pick comes back as a tool_result and IS his answer, in either harness
+# phrasing ("Your questions have been answered:" / "The user answered:", not a dismissal); every
+# other tool_result is not. Text typed while a turn runs can be stored only as an `attachment`
+# line of type `queued_command`, so those count too when their origin is human.
+# The whole transcript is streamed line by line: a busy window can write megabytes after the answer.
 # No `session`/`ts`, or the transcript missing/unreadable => no evidence of an answer => stays parked.
+function Get-OriginKind($o) { if ($null -ne $o -and $o.PSObject.Properties['kind']) { [string]$o.kind } else { $null } }
 function Test-OwnerMessage($e) {
+  if ($e.type -eq 'attachment') {
+    $a = $e.attachment
+    return ($null -ne $a -and $a.type -eq 'queued_command' -and (Get-OriginKind $a.origin) -eq 'human' -and ([string]$a.prompt).Trim())
+  }
   if ($e.type -ne 'user' -or $e.isMeta -or $e.isSidechain -or $e.isCompactSummary) { return $false }
   $c = $e.message.content
-  # An AskUserQuestion pick comes back as a tool_result in this exact harness shape
-  # (same contract as merge-pr's transcript_answers.py); every other tool_result is not an answer.
   foreach ($b in @($c | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
-    if (([string]$r).StartsWith('Your questions have been answered:')) { return $true }
+    $r = ([string]$r).TrimStart()
+    if ($r.StartsWith('Your questions have been answered:')) { return $true }
+    if ($r.StartsWith('The user answered:') -and $r -notmatch '\[User dismissed') { return $true }
   }
   $text = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
-  $text = ([string]$text).TrimStart()
-  return ($text -and -not $text.StartsWith('<') -and -not $text.StartsWith('Usage reset:'))
+  $text = ([string]$text).Trim()
+  if (-not $text) { return $false }
+  $kind = Get-OriginKind $e.origin
+  if ($kind) { return ($kind -eq 'human') }
+  return -not ($text.StartsWith('<') -or $text.StartsWith('Usage reset:') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
+}
+# ConvertFrom-Json turns an ISO timestamp into a [datetime] under pwsh 7 and leaves a string under
+# Windows PowerShell 5.1. Never round-trip the [datetime] through [string]: that drops the offset and
+# re-parses in the current culture (day/month swap on en-GB, a local-offset shift everywhere).
+function ConvertTo-UtcStamp($t) {
+  if ($t -is [datetime]) { return [DateTimeOffset]$t.ToUniversalTime() }
+  if ($t -is [DateTimeOffset]) { return $t }
+  return [DateTimeOffset]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
 }
 function Test-ParkedLockAnswered {
   param([string]$LockPath)
@@ -99,17 +121,22 @@ function Test-ParkedLockAnswered {
     $parkTs = if ($null -ne $lock.parked_at) { $lock.parked_at } else { $lock.ts }
     if (-not $lock.session -or $null -eq $parkTs) { return $false }
     $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$parkTs * 1000))
-    $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss')
+    $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
-    try { $all = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8).ReadToEnd() } finally { $fs.Dispose() }
-    foreach ($l in ($all -split "`n")) {
-      # Cheap pre-filters before parsing: a user entry stamped at or after the park second.
-      if ($l -notmatch '"type"\s*:\s*"user"' -or $l -notmatch '"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
-      if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
-      try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-      if (-not $e.timestamp -or [DateTimeOffset]::Parse([string]$e.timestamp) -le $since) { continue }
-      if (Test-OwnerMessage $e) { return $true }
-    }
+    $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
+    try {
+      while ($null -ne ($l = $rd.ReadLine())) {
+        # Cheap pre-filters before parsing: a user/attachment entry stamped at or after the park second.
+        # The entry's own timestamp is the LAST one on the line: an attachment nests its own earlier
+        # one first. (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
+        if ($l -notmatch '"type"\s*:\s*"(user|attachment)"' -or $l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
+        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
+        try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if (-not $e.timestamp) { continue }
+        try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
+        if (Test-OwnerMessage $e) { return $true }
+      }
+    } finally { $rd.Dispose(); $fs.Dispose() }
     return $false
   } catch { return $false }
 }
