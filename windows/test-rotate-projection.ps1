@@ -287,7 +287,8 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'bridge' } })))
   Check 'owner text with an unknown origin kind (e.g. remote) => answered (fail-open)' (Test-ParkedLockAnswered -LockPath $lk)
   # Typed while a turn ran: stored only as a queued_command attachment. Its stamps are typing time
-  # and are not compared; it counts because the line written just before it is post-park.
+  # and are not compared; it counts because the user/assistant line written most recently before it
+  # is post-park.
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'owner text queued mid-turn, after post-park lines => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # A compaction after the park writes a boundary stamped now, then re-writes the retained history
@@ -316,7 +317,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #6413 is merged; Owner ruling for #90: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
   Check 'relay naming another PR first, then this one => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } }), (UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
-  Check 'an absurd ruling number earlier does not abandon the scan => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  Check 'an oversized ruling number for another PR is not this one, and the scan carries on => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached.' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'CLI usage-reset continuation resubmitted by cache-keeper => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Usage reset: the 5-hour limit capped this window"' }) 4000 $ts0)))
+  Check 'rotator ping typed into an open AskUserQuestion => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="[User dismissed the question]"' }) 4000 $ts0)))
+  Check 'every question dismissed => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture

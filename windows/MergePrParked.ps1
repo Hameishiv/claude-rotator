@@ -113,7 +113,8 @@ function Test-RotatorPing([string]$t) { $t = $t.Trim(); return ($t.StartsWith('U
 function Test-CacheKeeperPrompt([string]$t) {
   $t = $t.Trim()
   return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
-    $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Handoff from my previous session'))
+    $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Your claude.ai usage limit has reset') -or
+    $t.StartsWith('Handoff from my previous session'))
 }
 $script:NonOwnerKinds = @('task-notification', 'peer', 'auto-continuation', 'coordinator', 'observer', 'observer-activity', 'unclassified')
 # Wrappers a non-owner message arrives in; a resubmission opening with one of these is not his text.
@@ -166,8 +167,13 @@ function Test-OwnerMessage($e, $Pr = $null) {
   foreach ($b in @($e.message.content | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
     $r = ([string]$r).TrimStart()
-    if ($r.StartsWith('Your questions have been answered:')) { return $true }
-    if ($r.StartsWith('The user answered:') -and $r -match '"="(?!\[User dismissed)') { return $true }
+    if ($r.StartsWith('Your questions have been answered:') -or $r.StartsWith('The user answered:')) {
+      $picks = @([regex]::Matches($r, '"="([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+      # One real pick is enough. A dismissal is not one, nor the rotator's own ping typed into the
+      # open dialog. No parsable pick in the main phrasing: count it (fail-open).
+      if ($picks.Count -eq 0) { if ($r.StartsWith('Your questions')) { return $true } else { continue } }
+      if (@($picks | Where-Object { -not $_.StartsWith('[User dismissed') -and -not (Test-RotatorPing $_) }).Count -gt 0) { return $true }
+    }
   }
   if ($text -and (Test-RotatorPing $text)) { return $false }
   # A human line with no text (an image-only answer) still counts.
@@ -196,9 +202,10 @@ function Test-ParkedLockAnswered {
     # A queued_command attachment is stamped when he TYPED it, not when the session read it (it can sit
     # queued for minutes), so its stamp cannot say which side of the park it was read on. Its place in
     # the file can: it counts only when the conversation line (user/assistant) written most recently
-    # before it is stamped at or after the park. Only conversation lines are stamped when written:
-    # PreToolUse hook attachments land after the tool_result but carry the hook's earlier time, and
-    # file-history-snapshot lines expose only a nested older stamp, so neither moves the test. Not
+    # before it is stamped at or after the park. Only user/assistant lines move the test, because
+    # some other lines carry an older stamp than their place in the file: PreToolUse hook
+    # attachments land after the tool_result with the hook's earlier time, and file-history-snapshot
+    # lines expose only a nested older stamp. Not
     # "any earlier line": a compaction writes a boundary and then re-writes the retained history with
     # its ORIGINAL stamps, so a pre-park queued message reappears after a post-park line. So a
     # boundary resets the test, the compaction summary does not set it, and the copied history's old
