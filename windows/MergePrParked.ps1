@@ -76,14 +76,17 @@ function Get-MergePrTarget {
 # of those read as an answer and the window was woken for nothing (2026-11-02).
 # Who wrote a line: current CLIs stamp `origin.kind` on it. `human` is the owner (typed, pasted --
 # which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted suggestion).
-# `task-notification`, `peer` and plain `plugin` lines are not, whatever the text says, and that
-# check runs before the AskUserQuestion branch, because a plugin can re-emit an old pick with a
-# fresh stamp. Exceptions, each measured on real transcripts:
+# The known non-owner kinds -- `task-notification`, `peer`, `auto-continuation`, `coordinator`, and
+# `plugin` without `asUser` -- are not, whatever the text says, and that check runs before the
+# AskUserQuestion branch, because a plugin can re-emit an old pick with a fresh stamp. A kind not
+# on that list is treated like `human` (fail-open: a new input path must not strand his answer).
+# Exceptions, each measured on real transcripts:
 #  - a `plugin` line with `asUser` is cache-keeper resubmitting a held message after a /compact (it
 #    drops the original, so this is the only copy). It is judged like the owner's own line: his
-#    typed or pasted text counts (after any leading <system-reminder> blocks the app prepended);
-#    cache-keeper's own "Resume" and handoff text, the desktop app's "Try again" and usage-limit
-#    continuation when resubmitted, and other tag-wrapped messages (task notifications) do not.
+#    typed or pasted text counts (after any leading <system-reminder> blocks the app prepended),
+#    whether it lands as a user line or a queued_command attachment; cache-keeper's own "Resume" and
+#    handoff text, the desktop app's "Try again" and usage-limit continuation when resubmitted, and
+#    messages in a known wrapper tag (task notifications, slash-command echoes) do not.
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
 #  - an owner ruling relayed from another session ("Owner ruling for #<N>", deliver_ruling.py's
@@ -105,6 +108,17 @@ function Test-CacheKeeperPrompt([string]$t) {
   return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
     $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Handoff from my previous session'))
 }
+$script:NonOwnerKinds = @('task-notification', 'peer', 'auto-continuation', 'coordinator')
+# Wrappers a non-owner message arrives in; a resubmission opening with one of these is not his text.
+$script:WrapperTag = '^<(task-notification|side-sessions-event|command-|local-command-|system-reminder)'
+function Test-Resubmitted($origin) { return ((Get-OriginKind $origin) -eq 'plugin' -and (Get-Prop $origin 'asUser') -eq $true) }
+# A cache-keeper resubmission: judged on its text, since it is the only copy of what it carries.
+function Test-ResubmittedText([string]$text, $Pr) {
+  $text = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
+  if (-not $text -or (Test-RotatorPing $text) -or (Test-CacheKeeperPrompt $text)) { return $false }
+  if ($text.StartsWith('<cross-session-message')) { return ((Test-RulingText $text $Pr) -eq $true) }
+  return ($text -notmatch $script:WrapperTag)
+}
 # $null = no ruling in the text; otherwise whether it is for this PR.
 function Test-RulingText([string]$t, $Pr) {
   if ($t -notmatch 'Owner ruling for #(\d+)') { return $null }
@@ -125,7 +139,9 @@ function Test-OwnerMessage($e, $Pr = $null) {
     $a = $e.attachment
     if ($null -eq $a -or $a.type -ne 'queued_command') { return $false }
     if (Test-RelayedRuling $a.origin ([string]$a.prompt) $Pr) { return $true }
-    if ((Get-OriginKind $a.origin) -ne 'human') { return $false }
+    if (Test-Resubmitted $a.origin) { return (Test-ResubmittedText ([string]$a.prompt) $Pr) }
+    $ak = Get-OriginKind $a.origin
+    if (-not $ak -or $ak -eq 'plugin' -or $script:NonOwnerKinds -contains $ak) { return $false }
     $t = ([string]$a.prompt).Trim()
     return ($t -and -not (Test-RotatorPing $t))
   }
@@ -133,14 +149,9 @@ function Test-OwnerMessage($e, $Pr = $null) {
   $kind = Get-OriginKind $e.origin
   $text = Get-LineText $e
   if ($kind -eq 'peer') { return (Test-RelayedRuling $e.origin $text $Pr) }
-  $resubmitted = ($kind -eq 'plugin' -and (Get-Prop $e.origin 'asUser') -eq $true)
-  if ($e.isMeta -or ($kind -and $kind -ne 'human' -and -not $resubmitted)) { return $false }
-  if ($resubmitted) {
-    $text = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
-    if (-not $text -or (Test-RotatorPing $text) -or (Test-CacheKeeperPrompt $text)) { return $false }
-    if ($text.StartsWith('<cross-session-message')) { return ((Test-RulingText $text $Pr) -eq $true) }
-    return (-not $text.StartsWith('<') -or $text.StartsWith('<pasted_content'))
-  }
+  if ($e.isMeta) { return $false }
+  if (Test-Resubmitted $e.origin) { return (Test-ResubmittedText $text $Pr) }
+  if ($kind -eq 'plugin' -or ($kind -and $script:NonOwnerKinds -contains $kind)) { return $false }
   foreach ($b in @($e.message.content | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
     $r = ([string]$r).TrimStart()
@@ -170,7 +181,10 @@ function Test-ParkedLockAnswered {
     $parkTs = if ($null -ne $lock.parked_at) { $lock.parked_at } else { $lock.ts }
     if (-not $lock.session -or $null -eq $parkTs) { return $false }
     $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$parkTs * 1000))
-    $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    # A queued_command attachment is stamped when he typed it, not when the turn absorbed it, so text
+    # queued during the closing turn can predate parked_at by a few seconds: allow 60 s for those.
+    $sinceQueued = $since.AddSeconds(-60)
+    $sinceKey = $sinceQueued.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
     try {
@@ -182,7 +196,8 @@ function Test-ParkedLockAnswered {
         if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if (-not $e.timestamp) { continue }
-        try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
+        $cut = if ($e.type -eq 'attachment') { $sinceQueued } else { $since }
+        try { if ((ConvertTo-UtcStamp $e.timestamp) -le $cut) { continue } } catch { continue }
         if (Test-OwnerMessage $e $lock.pr) { return $true }
       }
     } finally { $rd.Dispose(); $fs.Dispose() }
