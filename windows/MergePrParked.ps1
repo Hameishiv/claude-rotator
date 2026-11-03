@@ -74,35 +74,49 @@ function Get-MergePrTarget {
 # of those read as an answer and the window was woken for nothing (2026-11-02).
 # Who wrote a line: current CLIs stamp `origin.kind` on it, and only `human` is the owner (typed,
 # pasted -- which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted
-# suggestion); `plugin`, `task-notification`, `peer` are not, whatever the text says. Older lines
-# with no `origin` fall back to the text: not meta, not a compaction summary, not opening with a
-# tag, not "/compact", "[Request interrupted", or the rotator's own "Usage reset:" ping.
-# An AskUserQuestion pick comes back as a tool_result and IS his answer, in either harness
-# phrasing ("Your questions have been answered:" / "The user answered:", not a dismissal); every
-# other tool_result is not. Text typed while a turn runs can be stored only as an `attachment`
+# suggestion); `plugin`, `task-notification`, `peer` are not, whatever the text says -- and that
+# check runs FIRST, because a plugin can re-emit an old AskUserQuestion answer with a fresh stamp.
+# Two exceptions to the origin rule, both measured on real transcripts:
+#  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
+#    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text first.
+#  - an owner ruling relayed by deliver_ruling.py arrives as a meta `peer` line whose body starts
+#    "Owner ruling for #<N>"; that IS his answer, given in another session.
+# Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
+# with a tag, not "/compact" or "[Request interrupted".
+# An AskUserQuestion pick comes back as a tool_result and IS his answer, in either harness phrasing
+# ("Your questions have been answered:" / "The user answered:" with at least one undismissed pick);
+# every other tool_result is not. Text typed while a turn runs can be stored only as an `attachment`
 # line of type `queued_command`, so those count too when their origin is human.
 # The whole transcript is streamed line by line: a busy window can write megabytes after the answer.
-# No `session`/`ts`, or the transcript missing/unreadable => no evidence of an answer => stays parked.
+# No `session`, no `parked_at`/`ts`, or the transcript missing/unreadable => no evidence => stays parked.
 function Get-OriginKind($o) { if ($null -ne $o -and $o.PSObject.Properties['kind']) { [string]$o.kind } else { $null } }
+function Test-RotatorPing([string]$t) { $t = $t.Trim(); return ($t.StartsWith('Usage reset:') -or $t -eq 'resume') }
 function Test-OwnerMessage($e) {
   if ($e.type -eq 'attachment') {
     $a = $e.attachment
-    return ($null -ne $a -and $a.type -eq 'queued_command' -and (Get-OriginKind $a.origin) -eq 'human' -and ([string]$a.prompt).Trim())
+    if ($null -eq $a -or $a.type -ne 'queued_command' -or (Get-OriginKind $a.origin) -ne 'human') { return $false }
+    $t = ([string]$a.prompt).Trim()
+    return ($t -and -not (Test-RotatorPing $t))
   }
-  if ($e.type -ne 'user' -or $e.isMeta -or $e.isSidechain -or $e.isCompactSummary) { return $false }
+  if ($e.type -ne 'user' -or $e.isSidechain -or $e.isCompactSummary) { return $false }
+  $kind = Get-OriginKind $e.origin
+  if ($kind -eq 'peer') {
+    $body = if ($e.origin.PSObject.Properties['body']) { [string]$e.origin.body } else { '' }
+    return ($body -match '^\s*Owner ruling for #\d+')
+  }
+  if ($e.isMeta -or ($kind -and $kind -ne 'human')) { return $false }
   $c = $e.message.content
   foreach ($b in @($c | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
     $r = ([string]$r).TrimStart()
     if ($r.StartsWith('Your questions have been answered:')) { return $true }
-    if ($r.StartsWith('The user answered:') -and $r -notmatch '\[User dismissed') { return $true }
+    if ($r.StartsWith('The user answered:') -and $r -match '"="(?!\[User dismissed)') { return $true }
   }
   $text = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
   $text = ([string]$text).Trim()
-  if (-not $text) { return $false }
-  $kind = Get-OriginKind $e.origin
-  if ($kind) { return ($kind -eq 'human') }
-  return -not ($text.StartsWith('<') -or $text.StartsWith('Usage reset:') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
+  if (-not $text -or (Test-RotatorPing $text)) { return $false }
+  if ($kind) { return $true }
+  return -not ($text.StartsWith('<') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
 }
 # ConvertFrom-Json turns an ISO timestamp into a [datetime] under pwsh 7 and leaves a string under
 # Windows PowerShell 5.1. Never round-trip the [datetime] through [string]: that drops the offset and

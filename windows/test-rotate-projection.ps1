@@ -206,6 +206,13 @@ try {
     (UserLine '/compact' 1735 $ts0),
     (UserLine '[Request interrupted by user for tool use]' 1740 $ts0),
     (UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="[User dismissed the question]"' }) 1750 $ts0),
+    # The rotator's own ping is typed into the window, so the CLI stamps it human/typed.
+    (UserLine 'Usage reset: the session limit capped, so the CLI account was rotated to D.' 1770 $ts0 @{ origin = @{ kind = 'human' }; promptSource = 'typed' }),
+    (UserLine 'resume' 1775 $ts0 @{ origin = @{ kind = 'human' }; promptSource = 'typed' }),
+    ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"Usage reset: rotated to D.","origin":{"kind":"human"}},"timestamp":"' + (Stamp 1776 $ts0) + '"}'),
+    # A plugin re-emitting an OLD AskUserQuestion answer with a fresh stamp; and a peer message that is not a ruling.
+    (UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes".' }) 1780 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper' } }),
+    (UserLine 'Another Claude session sent a message: <cross-session-message>status?</cross-session-message>' 1790 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'status?' } }),
     ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification>x</task-notification>","origin":{"kind":"task-notification"},"timestamp":"' + (Stamp 1760 $ts0) + '"},"timestamp":"' + (Stamp 1761 $ts0) + '"}'),
     ('{"type":"assistant","timestamp":"' + (Stamp 1800 $ts0) + '","isApiErrorMessage":true,"error":"rate_limit","message":{"content":[{"type":"text","text":"limit"}]}}')
   )
@@ -229,6 +236,10 @@ try {
   Check 'owner answer typed, origin human => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Yes"' }) 4000 $ts0)))
   Check 'AskUserQuestion pick phrased "The user answered:" => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Yes", "Also?"="[User dismissed the question]"' }) 4000 $ts0)))
+  Check 'AskUserQuestion with one pick and one dismissal => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #90: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #90 (given in: orchestrator): a.' } })))
+  Check 'owner ruling relayed by deliver_ruling (meta peer line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # Typed while a turn ran: stored only as a queued_command attachment, whose nested timestamp
   # (when it was queued) precedes the entry's own. Queued before the park, written after: still his.
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
