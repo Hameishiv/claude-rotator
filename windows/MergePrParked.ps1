@@ -91,6 +91,9 @@ function Get-MergePrTarget {
 #    whether it lands as a user line or a queued_command attachment; cache-keeper's own "Resume" and
 #    handoff text, the desktop app's "Try again" and usage-limit continuation when resubmitted, and
 #    messages in a known wrapper tag (task notifications, slash-command echoes) do not.
+#    Known gap: a resubmission keeps no trace of its first origin, so if cache-keeper ever resubmits
+#    a SCHEDULED prompt (cold-cache path) it would count -- one wrong wake, the cheap direction.
+#    None observed; a marker from cache-keeper would close it.
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
 #  - an owner ruling relayed from another session ("Owner ruling for #<N>", deliver_ruling.py's
@@ -125,8 +128,12 @@ function Test-ResubmittedText([string]$text, $Pr) {
 }
 # $null = no ruling in the text; otherwise whether it is for this PR.
 function Test-RulingText([string]$t, $Pr) {
-  if ($t -notmatch 'Owner ruling for #(\d+)') { return $null }
-  return ($null -eq $Pr -or [long]$Matches[1] -eq [long]$Pr)
+  $ms = [regex]::Matches($t, 'Owner ruling for #(\d+)')
+  if ($ms.Count -eq 0) { return $null }
+  if ($null -eq $Pr) { return $true }
+  # Any ruling named in the text may be this PR's; an orchestrator's message can name several.
+  foreach ($m in $ms) { if ($m.Groups[1].Value.TrimStart('0') -eq ([string]$Pr).Trim().TrimStart('0')) { return $true } }
+  return $false
 }
 function Test-RelayedRuling($origin, [string]$fallbackText, $Pr) {
   if ((Get-OriginKind $origin) -ne 'peer') { return $false }
@@ -188,11 +195,14 @@ function Test-ParkedLockAnswered {
     $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     # A queued_command attachment is stamped when he TYPED it, not when the session read it (it can sit
     # queued for minutes), so its stamp cannot say which side of the park it was read on. Its place in
-    # the file can: it counts only when the line written just before it is stamped at or after the
-    # park. Not "any earlier line": a compaction writes a boundary stamped now and then re-writes the
-    # retained history with its ORIGINAL stamps, so a pre-park queued message reappears after a
-    # post-park line. So a boundary resets the test, the compaction summary (stamped now) does not
-    # set it, and the copied history's old stamps keep it reset until genuinely new lines follow.
+    # the file can: it counts only when the conversation line (user/assistant) written most recently
+    # before it is stamped at or after the park. Only conversation lines are stamped when written:
+    # PreToolUse hook attachments land after the tool_result but carry the hook's earlier time, and
+    # file-history-snapshot lines expose only a nested older stamp, so neither moves the test. Not
+    # "any earlier line": a compaction writes a boundary and then re-writes the retained history with
+    # its ORIGINAL stamps, so a pre-park queued message reappears after a post-park line. So a
+    # boundary resets the test, the compaction summary does not set it, and the copied history's old
+    # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
@@ -206,7 +216,9 @@ function Test-ParkedLockAnswered {
         $queued = $l -match '"type"\s*:\s*"attachment"' -and $l -match '"queued_command"'
         $readAfter = $prevAfter
         if ($l -match '"subtype"\s*:\s*"compact_boundary"') { $prevAfter = $false }
-        elseif (-not $queued -and $l -notmatch '"isCompactSummary"\s*:\s*true') {
+        elseif (-not $queued -and $l -notmatch '"isCompactSummary"\s*:\s*true' -and
+                $l -match '"type"\s*:\s*"(user|assistant)"' -and
+                $l -notmatch '"type"\s*:\s*"(attachment|file-history-snapshot)"') {
           $prevAfter = [string]::CompareOrdinal($key, $sinceKey) -ge 0
         }
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"') { continue }
@@ -217,7 +229,8 @@ function Test-ParkedLockAnswered {
           if (-not $e.timestamp) { continue }
           try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
         }
-        if (Test-OwnerMessage $e $lock.pr) { return $true }
+        # One odd line must not abandon the scan: a later line may hold his answer.
+        try { if (Test-OwnerMessage $e $lock.pr) { return $true } } catch { continue }
       }
     } finally { $rd.Dispose(); $fs.Dispose() }
     return $false

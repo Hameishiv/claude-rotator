@@ -299,6 +299,24 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'pre-park queued message re-written by a later compaction => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript (@($pre, $q) + $noise + @($boundary, $pre, $q))
   Check 'same, with older history copied ahead of it => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  $summary = (UserLine 'This session is being continued from a previous conversation.' 5001 $ts0 @{ isCompactSummary = $true })
+  WriteTranscript (@($pre, $q) + $noise + @($boundary, $summary, $q))
+  Check 'compaction summary between the boundary and a copied queued message => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # A PreToolUse hook line lands after the tool_result but carries the hook's earlier time; it must
+  # not hide an answer queued during the park call. Same for a snapshot update's nested older stamp.
+  $parkUse = '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"p","name":"Bash"}]},"timestamp":"' + (Stamp -5 $ts0) + '"}'
+  $parkRes = (UserLine @(@{ type = 'tool_result'; tool_use_id = 'p'; content = 'parked' }) 2 $ts0)
+  $hook = '{"type":"attachment","attachment":{"type":"hook_success","hookName":"PreToolUse:Bash"},"timestamp":"' + (Stamp -4 $ts0) + '"}'
+  $snap = '{"type":"file-history-snapshot","isSnapshotUpdate":true,"snapshot":{"trackedFileBackups":{},"timestamp":"' + (Stamp -60 $ts0) + '"}}'
+  $ans = '{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -1 $ts0) + '"},"timestamp":"' + (Stamp -1 $ts0) + '"}'
+  WriteTranscript @($parkUse, $parkRes, $hook, $ans)
+  Check 'answer queued during the park call, behind a PreToolUse hook line => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript @($parkUse, $parkRes, $snap, $ans)
+  Check 'same, behind a file-history snapshot update => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #6413 is merged; Owner ruling for #90: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'relay naming another PR first, then this one => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } }), (UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+  Check 'an absurd ruling number earlier does not abandon the scan => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture
