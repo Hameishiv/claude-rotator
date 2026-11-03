@@ -71,7 +71,8 @@ function Get-MergePrTarget {
 # transcript file changed 600 s after parking", but a parked window keeps writing with nobody
 # there: background task notifications, orchestrator cross-session messages, idle compactions,
 # a limit error on a notification turn. Each of those read as an answer and the window was
-# woken for nothing (2026-11-02). Not an answer: meta lines, compaction summaries, tool results,
+# woken for nothing (2026-11-02). Not an answer: meta lines, compaction summaries, tool results
+# (except an AskUserQuestion pick, which IS his answer),
 # anything that opens with a tag (<task-notification>, <command-name>, <local-command-...>,
 # <cross-session-message>) and the rotator's own "Usage reset:" ping.
 # The whole transcript is scanned: a busy window can write megabytes after the answer.
@@ -79,6 +80,12 @@ function Get-MergePrTarget {
 function Test-OwnerMessage($e) {
   if ($e.type -ne 'user' -or $e.isMeta -or $e.isSidechain -or $e.isCompactSummary) { return $false }
   $c = $e.message.content
+  # An AskUserQuestion pick comes back as a tool_result in this exact harness shape
+  # (same contract as merge-pr's transcript_answers.py); every other tool_result is not an answer.
+  foreach ($b in @($c | Where-Object { $_.type -eq 'tool_result' })) {
+    $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
+    if (([string]$r).StartsWith('Your questions have been answered:')) { return $true }
+  }
   $text = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
   $text = ([string]$text).TrimStart()
   return ($text -and -not $text.StartsWith('<') -and -not $text.StartsWith('Usage reset:'))

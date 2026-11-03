@@ -211,6 +211,10 @@ try {
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
   Check 'owner answer as a text block => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes". You can now continue with these answers in mind.' }) 4000 $ts0)))
+  Check 'owner answer picked in AskUserQuestion => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = @(@{ type = 'text'; text = 'Your questions have been answered: "Ship it?"="No".' }) }) 4000 $ts0)))
+  Check 'AskUserQuestion pick as a text-block tool_result => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteLock $lk $ts0 $null
   Check 'lock without session => no evidence => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
   WriteLock $lk $ts0 (Join-Path $sd 'gone.jsonl')
