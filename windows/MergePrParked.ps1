@@ -14,6 +14,8 @@ PORTABILITY: nothing here calls a Windows-only API (no CIM/WMI/registry/Win32). 
 supplies the command line; this file only does regex, file reads and one child process. It runs
 unchanged under pwsh on Linux/macOS, where the caller feeds it `/proc/<pid>/cmdline` instead.
 Only the DEFAULTS are OS-flavoured (python vs python3), and both are overridable.
+Needs PowerShell 7 (every caller runs it under pwsh): under Windows PowerShell 5.1 the launcher
+call throws (no ProcessStartInfo.ArgumentList there), which fails open, so every window is pinged.
 
 FAIL-OPEN, in both functions. A session that is wrongly nudged costs one turn; a session that
 is wrongly skipped never learns its quota is back. So every doubt answers "inject":
@@ -132,17 +134,32 @@ function Test-ResubmittedText([string]$text, $Pr) {
 # $null = no ruling in the text; otherwise whether it is for this PR.
 function Test-RulingText([string]$t, $Pr) {
   # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
-  $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) #(\d+)')
+  $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) (?:the )?#(\d+)')
   # Orchestrators also relay his answer in free text ("The owner answered your parked question on
   # PR #5727 ... His words, verbatim"). Count that when it names this PR and carries answer wording,
   # but NOT the orchestrator's acknowledgement of the park ("#5992 stays parked ... will relay his
   # words the moment he answers"): that marks the lock answered until the session re-parks, so every
-  # limit stop in between would wake it -- the original bug. Measured on 30 days of real relays:
-  # the ack wording below blocks every observed ack and none of the observed answers.
-  if ($null -ne $Pr -and $t -match ('#0*' + [regex]::Escape(([string]$Pr).Trim().TrimStart('0')) + '\b') -and
-      $t -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b" -and
-      $t -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|until he answers|once he answers|when he answers|the moment he answers|without his answer)\b") {
-    return $true
+  # limit stop in between would wake it -- the original bug. The veto is per SENTENCE: relays often
+  # bundle "he answered X. Y is still open with him", and a whole-message veto threw the answer away.
+  # A request to fetch his answer ("send me his answer", "has he answered?") is not one either.
+  # The answer sentence (or the one before it: "...Gate E for #5985. His words: ...") must name this
+  # PR, unless the whole message names no other PR: a broadcast listing several PRs must not hand one
+  # PR's answer to all of them.
+  # Known gap: an acknowledgement or request worded outside this list still counts (a wrong wake until
+  # re-park); an answer in a multi-PR message whose sentence omits the number is missed.
+  $prNum = ([string]$Pr).Trim().TrimStart('0')
+  $prRe = '#0*' + [regex]::Escape($prNum) + '\b'
+  if ($null -ne $Pr -and $t -match $prRe) {
+    $only = @([regex]::Matches($t, '#0*(\d+)\b') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique).Count -eq 1
+    $prev = ''
+    foreach ($s in ($t -split '(?<=[.!?])\s+|\r?\n')) {
+      $named = $only -or $s -match $prRe -or $prev -match $prRe; $prev = $s
+      if ($named -and
+          $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b" -and
+          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|the moment he answers|without his answer|(?:waiting|wait) (?:on|for) (?:the )?owner|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit)\b") {
+        return $true
+      }
+    }
   }
   if ($ms.Count -eq 0) { return $null }
   if ($null -eq $Pr) { return $true }
@@ -196,10 +213,12 @@ function Test-OwnerMessage($e, $Pr = $null) {
     # check something (/usage, /status: a <command-...> echo) is not an answer; a paste is.
     $bare = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
     if ($bare -and $bare -match $script:WrapperTag) {
-      # A slash command he typed is his word ("/merge-pr 5978 resume"), except a bare status check.
+      # A slash command he typed is his word ("/merge-pr 5978 resume"), except a bare status check
+      # and cache-keeper's housekeeping commands (the desktop app stamps /keepwarm, /board human).
       if ($bare -match '<command-name>/?([^<]*)</command-name>') {
-        $cmd = $Matches[1].Trim()
+        $cmd = ($Matches[1].Trim() -split ':')[-1]
         $cargs = if ($bare -match '(?s)<command-args>(.*?)</command-args>') { $Matches[1].Trim() } else { '' }
+        if (@('keepwarm', 'board', 'cache', 'handoff', 'seats') -contains $cmd -or $cmd -like 'ck-*') { return $false }
         return -not ($cargs -eq '' -and @('usage', 'status', 'cost', 'context') -contains $cmd)
       }
       return $false

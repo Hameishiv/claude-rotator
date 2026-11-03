@@ -163,14 +163,15 @@ try {
 
   # 10c. end-to-end against the REAL launcher, on the throwaway state dir (read-only call).
   $realLauncher = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.claude/skills/merge-pr/scripts/merge_pr_launcher.py'
-  if (Test-Path $realLauncher) {
+  if ((Test-Path $realLauncher) -and $PSVersionTable.PSVersion.Major -ge 7) {
     $env:MERGE_PR_STATE_DIR = $sd
     try {
-      Check 'real launcher: parked lock => skipped' (Test-MergePrParked -Repo $repo -Pr 77)
-      Check 'real launcher: active lock => pinged'  (-not (Test-MergePrParked -Repo $repo -Pr 78))
-      Check 'real launcher: no lock => pinged'      (-not (Test-MergePrParked -Repo $repo -Pr 5))
+      # -TimeoutSec 30: the real launcher takes ~3 s; the default 10 s cap raced it on a busy machine.
+      Check 'real launcher: parked lock => skipped' (Test-MergePrParked -Repo $repo -Pr 77 -TimeoutSec 30)
+      Check 'real launcher: active lock => pinged'  (-not (Test-MergePrParked -Repo $repo -Pr 78 -TimeoutSec 30))
+      Check 'real launcher: no lock => pinged'      (-not (Test-MergePrParked -Repo $repo -Pr 5 -TimeoutSec 30))
     } finally { Remove-Item Env:\MERGE_PR_STATE_DIR -ErrorAction SilentlyContinue }
-  } else { Write-Host "  SKIP  real-launcher checks (launcher not found)" -ForegroundColor DarkYellow }
+  } else { Write-Host "  SKIP  real-launcher checks (launcher not found, or not PowerShell 7)" -ForegroundColor DarkYellow }
 
   # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock is woken only when its
   #      transcript holds an owner answer from after it parked (for a queued message: read after it): typed (or resubmitted for him by
@@ -338,14 +339,27 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   # The desktop app's own continuation lands with no origin at all.
   WriteTranscript ($noise + @((UserLine 'I hit my usage limit while you were working, but it has reset now. Please continue.' 4000 $ts0 @{ promptSource = 'sdk' })))
   Check 'app usage-limit continuation with no origin => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
-  WriteTranscript ($noise + @((UserLine '<command-name>/usage</command-name>' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
-  Check 'a slash command he typed to check quota => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine "<command-message>usage</command-message>`n<command-name>/usage</command-name>`n<command-args></command-args>" 4000 $ts0)))
+  Check 'a slash command he typed to check quota (CLI: no origin) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # The desktop app stamps cache-keeper's immediate commands human (seen: /keepwarm while a question waited).
+  foreach ($c in 'keepwarm', 'board', 'cache-keeper:keepwarm') {
+    WriteTranscript ($noise + @((UserLine "<command-message>$c</command-message>`n<command-name>/$c</command-name>`n<command-args></command-args>" 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+    Check "cache-keeper housekeeping command /$c stamped human => still parked" (-not (Test-ParkedLockAnswered -LockPath $lk))
+  }
   # Real free-text relays of his answer (no "owner ruling" phrase).
   foreach ($body in @(
       'The owner answered your parked question on PR #90. His words, verbatim: "90 A".',
       '#90 has the owner''s answers to your parked question, so you can resume now.',
       '#90 has the owner''s approval ("A", in the orchestrator session just now).',
-      'PR #90: the owner OKed the look. His words: "looks good".')) {
+      'PR #90: the owner OKed the look. His words: "looks good".',
+      # Real shapes (#4682, #6609, #5988, #6534) that a whole-message veto threw away.
+      '#90: the owner said "90 yes". I''ll relay anything further he adds.',
+      'Owner ruling on the disc rule for #90. His words, verbatim: "Drop 175 as recommended." The other question is still open.',
+      'A further owner ruling for the #90 question: a.',
+      ('#90 decision. His words (2026-11-03): "re open 90".' + "`n" + 'The other item waits until he answers.'),
+      # #5985 / #5397 shape: the PR is named in the sentence before his words, and another PR is named too.
+      '#90 is pushed. The owner waives your Gate E for #90. His words, verbatim: "A. Create the marker." #91 is unaffected.',
+      'Owner instruction for #90 (you now own it). His words: "keep 90 but cherry pick from 91."')) {
     WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
     Check "free-text relay of his answer => answered: $body" (Test-ParkedLockAnswered -LockPath $lk)
   }
@@ -355,7 +369,15 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   foreach ($body in @(
       'Agreed, #90 stays parked. I''m putting your exact question to the owner now and will relay his words and the time the moment he answers. Nothing else needed from you meanwhile.',
       'One owner question on #90 is still open. Please don''t merge past it without his answer.',
-      'Stay parked on #90 1-4 until then; I''ll relay his answer to you verbatim.')) {
+      'Stay parked on #90 1-4 until then; I''ll relay his answer to you verbatim.',
+      'Keep #90 in draft. I''ll send you his answer word for word when he gives it. You can go idle.',
+      '#90 is waiting on the owner''s approval.',
+      'Give me #90''s question so I can put it to the owner. If the owner has already answered it in your window, say so and give his words.',
+      # Real broadcast shapes: another PR's answer, a request, a hold (#4904, #6468, #6585, #5986).
+      '#91 has the owner''s approval ("A"). Once it''s on main, re-run #90''s halacha-check.',
+      'Here is the #90 question. Please carry it to him; his answer must be given in session.',
+      'Do NOT merge #90 until I tell you. The fix is waiting on the owner''s approval.',
+      'Brief for the #90 review. Cherry-pick the fix and push only when no Test run is going. Owner ruling D (undo) is #92 and stays out.')) {
     WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
     Check "orchestrator park acknowledgement => still parked: $body" (-not (Test-ParkedLockAnswered -LockPath $lk))
   }
@@ -387,13 +409,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'unreadable lock => no evidence => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
   Check 'no lock path in status JSON => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus '{"status": "parked"}'))
   # end to end through the REAL launcher (it reports the lock path itself)
-  if (Test-Path $realLauncher) {
+  if ((Test-Path $realLauncher) -and $PSVersionTable.PSVersion.Major -ge 7) {
     WriteLock $lk $ts0 $tr; WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
     $env:MERGE_PR_STATE_DIR = $sd
     try {
-      Check 'real launcher: parked + answered => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90))
+      Check 'real launcher: parked + answered => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -TimeoutSec 30))
       WriteTranscript $noise
-      Check 'real launcher: parked + not answered => skipped' (Test-MergePrParked -Repo $repo -Pr 90)
+      Check 'real launcher: parked + not answered => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -TimeoutSec 30)
     } finally { Remove-Item Env:\MERGE_PR_STATE_DIR -ErrorAction SilentlyContinue }
   }
 
