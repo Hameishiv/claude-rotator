@@ -19,8 +19,8 @@ FAIL-OPEN, in both functions. A session that is wrongly nudged costs one turn; a
 is wrongly skipped never learns its quota is back. So every doubt answers "inject":
 unidentifiable PR, no lock, unreadable lock, launcher missing, timeout, non-zero exit,
 unparseable output, or any status other than exactly "parked" — and a parked lock whose session
-transcript holds an owner answer from after it parked -- typed, an AskUserQuestion pick, or a relayed
-"Owner ruling for #N" (see Test-ParkedLockAnswered).
+transcript holds an owner answer from after it parked -- typed, an AskUserQuestion pick, or his
+answer relayed from another session for this PR (see Test-ParkedLockAnswered).
 #>
 
 # ---- window -> PR ---------------------------------------------------------------------------
@@ -77,8 +77,8 @@ function Get-MergePrTarget {
 # of those read as an answer and the window was woken for nothing (2026-11-02).
 # Who wrote a line: current CLIs stamp `origin.kind` on it. `human` is the owner (typed, pasted --
 # which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted suggestion).
-# These kinds are automated and never count, whatever the text says (except a relayed ruling for
-# this PR, below): `task-notification`, `peer`,
+# These kinds are automated and never count on their own (a `peer` line counts only when it relays
+# his answer for this PR, below): `task-notification`, `peer`,
 # `auto-continuation` (the CLI's "usage limit has reset"), `coordinator`, `observer`,
 # `observer-activity`, `unclassified` (CLI schema: "never presumed human"), and `plugin` without
 # `asUser`. That check runs before the AskUserQuestion branch, because a plugin can re-emit an old
@@ -134,10 +134,14 @@ function Test-RulingText([string]$t, $Pr) {
   # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
   $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) #(\d+)')
   # Orchestrators also relay his answer in free text ("The owner answered your parked question on
-  # PR #5727 ... His words, verbatim"). Count that when it names this PR and carries answer wording;
-  # an occasional status line matching it costs one wake, the cheap direction.
+  # PR #5727 ... His words, verbatim"). Count that when it names this PR and carries answer wording,
+  # but NOT the orchestrator's acknowledgement of the park ("#5992 stays parked ... will relay his
+  # words the moment he answers"): that marks the lock answered until the session re-parks, so every
+  # limit stop in between would wake it -- the original bug. Measured on 30 days of real relays:
+  # the ack wording below blocks every observed ack and none of the observed answers.
   if ($null -ne $Pr -and $t -match ('#0*' + [regex]::Escape(([string]$Pr).Trim().TrimStart('0')) + '\b') -and
-      $t -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b") {
+      $t -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b" -and
+      $t -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|until he answers|once he answers|when he answers|the moment he answers|without his answer)\b") {
     return $true
   }
   if ($ms.Count -eq 0) { return $null }
@@ -191,7 +195,15 @@ function Test-OwnerMessage($e, $Pr = $null) {
     # A human line with no text (an image-only answer) still counts. A slash command he typed to
     # check something (/usage, /status: a <command-...> echo) is not an answer; a paste is.
     $bare = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
-    if ($bare -and $bare -match $script:WrapperTag) { return $false }
+    if ($bare -and $bare -match $script:WrapperTag) {
+      # A slash command he typed is his word ("/merge-pr 5978 resume"), except a bare status check.
+      if ($bare -match '<command-name>/?([^<]*)</command-name>') {
+        $cmd = $Matches[1].Trim()
+        $cargs = if ($bare -match '(?s)<command-args>(.*?)</command-args>') { $Matches[1].Trim() } else { '' }
+        return -not ($cargs -eq '' -and @('usage', 'status', 'cost', 'context') -contains $cmd)
+      }
+      return $false
+    }
     return ($text -or @($e.message.content | Where-Object { $_.type -and $_.type -ne 'tool_result' }).Count -gt 0)
   }
   if (-not $text) { return $false }

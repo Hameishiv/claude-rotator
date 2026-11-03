@@ -351,8 +351,16 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   }
   WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'The owner answered on PR #901: go.' } })))
   Check 'free-text relay naming another PR (#901, not #90) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
-  WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Device check for #90 passed; lock looks stale.' } })))
-  Check 'plain status relay naming this PR => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # Real orchestrator acknowledgements of a park (#5992, #5978, #4381): not answers.
+  foreach ($body in @(
+      'Agreed, #90 stays parked. I''m putting your exact question to the owner now and will relay his words and the time the moment he answers. Nothing else needed from you meanwhile.',
+      'One owner question on #90 is still open. Please don''t merge past it without his answer.',
+      'Stay parked on #90 1-4 until then; I''ll relay his answer to you verbatim.')) {
+    WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
+    Check "orchestrator park acknowledgement => still parked: $body" (-not (Test-ParkedLockAnswered -LockPath $lk))
+  }
+  WriteTranscript ($noise + @((UserLine "<command-message>merge-pr</command-message>`n<command-name>/merge-pr</command-name>`n<command-args>90 resume</command-args>" 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+  Check 'owner typed /merge-pr 90 resume => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<ci-monitor-event>"Auto-fix pushed"</ci-monitor-event>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'ci-monitor-event resubmitted by cache-keeper => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
