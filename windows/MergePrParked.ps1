@@ -81,8 +81,9 @@ function Get-MergePrTarget {
 # fresh stamp. Exceptions, each measured on real transcripts:
 #  - a `plugin` line with `asUser` is cache-keeper resubmitting a held message after a /compact (it
 #    drops the original, so this is the only copy). It is judged like the owner's own line: his
-#    typed or pasted text counts; cache-keeper's own prompts ("Resume", "Try again", the usage-limit
-#    and handoff continuations) and other tag-wrapped messages (task notifications, reminders) do not.
+#    typed or pasted text counts (after any leading <system-reminder> blocks the app prepended);
+#    cache-keeper's own "Resume" and handoff text, the desktop app's "Try again" and usage-limit
+#    continuation when resubmitted, and other tag-wrapped messages (task notifications) do not.
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
 #  - an owner ruling relayed from another session ("Owner ruling for #<N>", deliver_ruling.py's
@@ -135,6 +136,7 @@ function Test-OwnerMessage($e, $Pr = $null) {
   $resubmitted = ($kind -eq 'plugin' -and (Get-Prop $e.origin 'asUser') -eq $true)
   if ($e.isMeta -or ($kind -and $kind -ne 'human' -and -not $resubmitted)) { return $false }
   if ($resubmitted) {
+    $text = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
     if (-not $text -or (Test-RotatorPing $text) -or (Test-CacheKeeperPrompt $text)) { return $false }
     if ($text.StartsWith('<cross-session-message')) { return ((Test-RulingText $text $Pr) -eq $true) }
     return (-not $text.StartsWith('<') -or $text.StartsWith('<pasted_content'))
@@ -145,8 +147,10 @@ function Test-OwnerMessage($e, $Pr = $null) {
     if ($r.StartsWith('Your questions have been answered:')) { return $true }
     if ($r.StartsWith('The user answered:') -and $r -match '"="(?!\[User dismissed)') { return $true }
   }
-  if (-not $text -or (Test-RotatorPing $text)) { return $false }
-  if ($kind) { return $true }
+  if ($text -and (Test-RotatorPing $text)) { return $false }
+  # A human line with no text (an image-only answer) still counts.
+  if ($kind) { return ($text -or @($e.message.content | Where-Object { $_.type -and $_.type -ne 'tool_result' }).Count -gt 0) }
+  if (-not $text) { return $false }
   return -not ($text.StartsWith('<') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
 }
 # ConvertFrom-Json turns an ISO timestamp into a [datetime] under pwsh 7 and leaves a string under
@@ -172,8 +176,8 @@ function Test-ParkedLockAnswered {
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
         # Cheap pre-filters before parsing: a user/attachment entry stamped at or after the park second.
-        # The entry's own timestamp is the LAST one on the line: an attachment nests its own earlier
-        # one first. (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
+        # The entry's own timestamp is the LAST one on the line: an attachment nests its own copy
+        # first (equal in observed transcripts; the last one is the entry's either way). (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"' -or $l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
         if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }

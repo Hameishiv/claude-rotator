@@ -257,14 +257,21 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'pasted answer resubmitted by cache-keeper => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<cross-session-message from="x" from-name="ORCH">Owner ruling for #90 (given in: y): a.</cross-session-message>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'relayed ruling resubmitted by cache-keeper after a compact => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine "<system-reminder>`nLinked sessions now: x`n</system-reminder>`n`n<cross-session-message from=`"x`">Owner ruling for #90: a.</cross-session-message>" 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'resubmitted ruling behind a system-reminder block => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine "<system-reminder>`nx`n</system-reminder>`n`ngo with B" 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'resubmitted owner text behind a system-reminder block => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'image'; source = @{ type = 'base64'; media_type = 'image/png'; data = 'AA==' } }) 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+  Check 'image-only owner answer => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<cross-session-message from="x">Owner ruling for #91: a.</cross-session-message>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'resubmitted ruling for ANOTHER PR => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>From the orchestrator: Owner ruling for #90, his words: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
   Check 'wrapped ruling, peer origin without body => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"peer","body":"Owner ruling for #90 (given in: y): a."}},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'relayed ruling queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
-  # Typed while a turn ran: stored only as a queued_command attachment, whose nested timestamp
-  # (when it was queued) precedes the entry's own. Queued before the park, written after: still his.
+  # Typed while a turn ran: stored only as a queued_command attachment, which nests a timestamp of
+  # its own before the entry's (equal in observed transcripts; this fixture makes it earlier to pin
+  # that the entry's own, last, timestamp is the one compared).
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'owner text queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
