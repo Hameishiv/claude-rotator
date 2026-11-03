@@ -330,6 +330,16 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'a message sent instead of a pick => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: [fast-jev-compaction truncated 1641 chars of this tool result]' }) 4000 $ts0)))
   Check 'a truncated result with no parsable pick => answered (fail-open)' (Test-ParkedLockAnswered -LockPath $lk)
+  # Real relays reword the phrase itself.
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Flight coordinator here, with an owner ruling for #90, his words: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'relay worded "an owner ruling for #N" => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Flight coordinator: OWNER RULING on #90, his words exactly: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'relay worded "OWNER RULING on #N" => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # The desktop app's own continuation lands with no origin at all.
+  WriteTranscript ($noise + @((UserLine 'I hit my usage limit while you were working, but it has reset now. Please continue.' 4000 $ts0 @{ promptSource = 'sdk' })))
+  Check 'app usage-limit continuation with no origin => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine '<command-name>/usage</command-name>' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+  Check 'a slash command he typed to check quota => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture

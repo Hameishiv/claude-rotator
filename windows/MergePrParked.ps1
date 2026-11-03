@@ -130,7 +130,8 @@ function Test-ResubmittedText([string]$text, $Pr) {
 }
 # $null = no ruling in the text; otherwise whether it is for this PR.
 function Test-RulingText([string]$t, $Pr) {
-  $ms = [regex]::Matches($t, 'Owner ruling for #(\d+)')
+  # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
+  $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) #(\d+)')
   if ($ms.Count -eq 0) { return $null }
   if ($null -eq $Pr) { return $true }
   # Any ruling named in the text may be this PR's; an orchestrator's message can name several.
@@ -178,10 +179,17 @@ function Test-OwnerMessage($e, $Pr = $null) {
     }
   }
   if ($text -and (Test-RotatorPing $text)) { return $false }
-  # A human line with no text (an image-only answer) still counts.
-  if ($kind) { return ($text -or @($e.message.content | Where-Object { $_.type -and $_.type -ne 'tool_result' }).Count -gt 0) }
+  if ($kind) {
+    # A human line with no text (an image-only answer) still counts. A slash command he typed to
+    # check something (/usage, /status: a <command-...> echo) is not an answer; a paste is.
+    $bare = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
+    if ($bare -and $bare -match $script:WrapperTag) { return $false }
+    return ($text -or @($e.message.content | Where-Object { $_.type -and $_.type -ne 'tool_result' }).Count -gt 0)
+  }
   if (-not $text) { return $false }
-  return -not ($text.StartsWith('<') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted'))
+  # No origin: also not the app's own canned continuations ("I hit my usage limit ... Please continue").
+  return -not ($text.StartsWith('<') -or $text -eq '/compact' -or $text.StartsWith('[Request interrupted') -or
+    (Test-CacheKeeperPrompt $text))
 }
 # ConvertFrom-Json turns an ISO timestamp into a [datetime] under pwsh 7 and leaves a string under
 # Windows PowerShell 5.1. Never round-trip the [datetime] through [string]: that drops the offset and
