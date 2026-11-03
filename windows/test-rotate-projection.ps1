@@ -216,6 +216,7 @@ try {
     (UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes".' }) 1780 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper' } }),
     (UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #91: a.</cross-session-message>' 1785 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #91 (given in: x): a.' } }),
     (UserLine 'I hit my usage limit while you were working, but it has reset now. Please continue.' 1786 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
+    (UserLine '<task-notification><task-id>y</task-id></task-notification>' 1788 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
     (UserLine 'Handoff from my previous session:
 
 stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
@@ -250,8 +251,16 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   # cache-keeper resubmitting his held text after a /compact: often the only copy of the answer.
   WriteTranscript ($noise + @((UserLine '6529 A, router A - unpark and carry on' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true }; turnOrigin = 'system' })))
   Check 'owner answer resubmitted by cache-keeper (plugin, asUser) => answered' (Test-ParkedLockAnswered -LockPath $lk)
-  WriteTranscript (@((UserLine 'old instruction' -600 $ts0 @{ origin = @{ kind = 'human' } })) + $noise + @((UserLine 'old instruction' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
-  Check 'cache-keeper replay of a message typed before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript (@((UserLine 'A' -600 $ts0 @{ origin = @{ kind = 'human' } })) + $noise + @((UserLine 'A' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'resubmitted answer repeating an earlier short answer => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine '<pasted_content id="2f">go with B</pasted_content>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'pasted answer resubmitted by cache-keeper => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine '<cross-session-message from="x" from-name="ORCH">Owner ruling for #90 (given in: y): a.</cross-session-message>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'relayed ruling resubmitted by cache-keeper after a compact => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine '<cross-session-message from="x">Owner ruling for #91: a.</cross-session-message>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'resubmitted ruling for ANOTHER PR => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>From the orchestrator: Owner ruling for #90, his words: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'wrapped ruling, peer origin without body => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"peer","body":"Owner ruling for #90 (given in: y): a."}},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'relayed ruling queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # Typed while a turn ran: stored only as a queued_command attachment, whose nested timestamp

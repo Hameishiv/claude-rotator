@@ -79,15 +79,16 @@ function Get-MergePrTarget {
 # `task-notification`, `peer` and plain `plugin` lines are not, whatever the text says, and that
 # check runs before the AskUserQuestion branch, because a plugin can re-emit an old pick with a
 # fresh stamp. Exceptions, each measured on real transcripts:
-#  - a `plugin` line with `asUser` is cache-keeper resubmitting the owner's own held text after a
-#    /compact; it is often the ONLY copy of his answer. It counts, unless it is one of cache-keeper's
-#    own prompts ("Resume", "Try again", the usage-limit / handoff continuations) or the exact text
-#    of a human line from before the park (a replay of an old message).
+#  - a `plugin` line with `asUser` is cache-keeper resubmitting a held message after a /compact (it
+#    drops the original, so this is the only copy). It is judged like the owner's own line: his
+#    typed or pasted text counts; cache-keeper's own prompts ("Resume", "Try again", the usage-limit
+#    and handoff continuations) and other tag-wrapped messages (task notifications, reminders) do not.
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
-#  - an owner ruling relayed by deliver_ruling.py arrives as a `peer` message (a meta user line, or a
-#    queued_command attachment mid-turn) whose body starts "Owner ruling for #<N>"; it counts when N
-#    is this lock's PR.
+#  - an owner ruling relayed from another session ("Owner ruling for #<N>", deliver_ruling.py's
+#    wording, sometimes wrapped by the relaying agent) counts when N is this lock's PR, however it
+#    is stored: a meta `peer` user line, a `peer` queued_command attachment mid-turn, or a
+#    cache-keeper resubmission of the <cross-session-message>.
 # Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
 # with a tag, not "/compact" or "[Request interrupted".
 # An AskUserQuestion pick comes back as a tool_result and counts, in either harness phrasing
@@ -103,35 +104,40 @@ function Test-CacheKeeperPrompt([string]$t) {
   return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
     $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Handoff from my previous session'))
 }
-function Test-RelayedRuling($origin, $Pr) {
-  if ((Get-OriginKind $origin) -ne 'peer') { return $false }
-  if ([string](Get-Prop $origin 'body') -notmatch '^\s*Owner ruling for #(\d+)') { return $false }
+# $null = no ruling in the text; otherwise whether it is for this PR.
+function Test-RulingText([string]$t, $Pr) {
+  if ($t -notmatch 'Owner ruling for #(\d+)') { return $null }
   return ($null -eq $Pr -or [long]$Matches[1] -eq [long]$Pr)
+}
+function Test-RelayedRuling($origin, [string]$fallbackText, $Pr) {
+  if ((Get-OriginKind $origin) -ne 'peer') { return $false }
+  $body = [string](Get-Prop $origin 'body'); if (-not $body) { $body = $fallbackText }
+  return ((Test-RulingText $body $Pr) -eq $true)
 }
 function Get-LineText($e) {
   $c = $e.message.content
   $t = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
   return ([string]$t).Trim()
 }
-# $Before: texts of human lines written before the park (a plugin replay of one is not new).
-function Test-OwnerMessage($e, $Pr = $null, $Before = $null) {
+function Test-OwnerMessage($e, $Pr = $null) {
   if ($e.type -eq 'attachment') {
     $a = $e.attachment
     if ($null -eq $a -or $a.type -ne 'queued_command') { return $false }
-    if (Test-RelayedRuling $a.origin $Pr) { return $true }
+    if (Test-RelayedRuling $a.origin ([string]$a.prompt) $Pr) { return $true }
     if ((Get-OriginKind $a.origin) -ne 'human') { return $false }
     $t = ([string]$a.prompt).Trim()
     return ($t -and -not (Test-RotatorPing $t))
   }
   if ($e.type -ne 'user' -or $e.isSidechain -or $e.isCompactSummary) { return $false }
   $kind = Get-OriginKind $e.origin
-  if ($kind -eq 'peer') { return (Test-RelayedRuling $e.origin $Pr) }
+  $text = Get-LineText $e
+  if ($kind -eq 'peer') { return (Test-RelayedRuling $e.origin $text $Pr) }
   $resubmitted = ($kind -eq 'plugin' -and (Get-Prop $e.origin 'asUser') -eq $true)
   if ($e.isMeta -or ($kind -and $kind -ne 'human' -and -not $resubmitted)) { return $false }
-  $text = Get-LineText $e
   if ($resubmitted) {
-    return ($text -and -not $text.StartsWith('<') -and -not (Test-RotatorPing $text) -and
-      -not (Test-CacheKeeperPrompt $text) -and -not ($Before -and $Before.Contains($text)))
+    if (-not $text -or (Test-RotatorPing $text) -or (Test-CacheKeeperPrompt $text)) { return $false }
+    if ($text.StartsWith('<cross-session-message')) { return ((Test-RulingText $text $Pr) -eq $true) }
+    return (-not $text.StartsWith('<') -or $text.StartsWith('<pasted_content'))
   }
   foreach ($b in @($e.message.content | Where-Object { $_.type -eq 'tool_result' })) {
     $r = if ($b.content -is [string]) { $b.content } else { (@($b.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
@@ -163,24 +169,17 @@ function Test-ParkedLockAnswered {
     $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
-    $before = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
         # Cheap pre-filters before parsing: a user/attachment entry stamped at or after the park second.
         # The entry's own timestamp is the LAST one on the line: an attachment nests its own earlier
         # one first. (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"' -or $l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
-        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) {
-          # Before the park: remember what the owner typed, so a later plugin replay of it is not new.
-          if ($l -match '"kind"\s*:\s*"human"') {
-            try { $p0 = $l | ConvertFrom-Json -ErrorAction Stop; if ($p0.type -eq 'user') { $t0 = Get-LineText $p0; if ($t0) { [void]$before.Add($t0) } } } catch { }
-          }
-          continue
-        }
+        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if (-not $e.timestamp) { continue }
         try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
-        if (Test-OwnerMessage $e $lock.pr $before) { return $true }
+        if (Test-OwnerMessage $e $lock.pr) { return $true }
       }
     } finally { $rd.Dispose(); $fs.Dispose() }
     return $false
