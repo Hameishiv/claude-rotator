@@ -340,6 +340,21 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'app usage-limit continuation with no origin => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine '<command-name>/usage</command-name>' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
   Check 'a slash command he typed to check quota => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # Real free-text relays of his answer (no "owner ruling" phrase).
+  foreach ($body in @(
+      'The owner answered your parked question on PR #90. His words, verbatim: "90 A".',
+      '#90 has the owner''s answers to your parked question, so you can resume now.',
+      '#90 has the owner''s approval ("A", in the orchestrator session just now).',
+      'PR #90: the owner OKed the look. His words: "looks good".')) {
+    WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
+    Check "free-text relay of his answer => answered: $body" (Test-ParkedLockAnswered -LockPath $lk)
+  }
+  WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'The owner answered on PR #901: go.' } })))
+  Check 'free-text relay naming another PR (#901, not #90) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Device check for #90 passed; lock looks stale.' } })))
+  Check 'plain status relay naming this PR => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine '<ci-monitor-event>"Auto-fix pushed"</ci-monitor-event>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
+  Check 'ci-monitor-event resubmitted by cache-keeper => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture

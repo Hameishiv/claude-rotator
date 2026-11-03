@@ -96,8 +96,9 @@ function Get-MergePrTarget {
 #    None observed; a marker from cache-keeper would close it.
 #  - the rotator's own ping ("Usage reset: ..." or the default "resume") is typed into the window
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
-#  - an owner ruling relayed from another session ("Owner ruling for #<N>", deliver_ruling.py's
-#    wording, sometimes wrapped by the relaying agent) counts when N is this lock's PR, however it
+#  - an owner answer relayed from another session counts when it is for this lock's PR: either
+#    deliver_ruling.py's "Owner ruling for #<N>" (any case, "for" or "on", possibly wrapped), or
+#    free text naming #<N> with answer wording ("the owner answered", "his words"), however it
 #    is stored: a meta `peer` user line, a `peer` queued_command attachment mid-turn, or a
 #    cache-keeper resubmission of the <cross-session-message>.
 # Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
@@ -119,7 +120,7 @@ function Test-CacheKeeperPrompt([string]$t) {
 }
 $script:NonOwnerKinds = @('task-notification', 'peer', 'auto-continuation', 'coordinator', 'observer', 'observer-activity', 'unclassified')
 # Wrappers a non-owner message arrives in; a resubmission opening with one of these is not his text.
-$script:WrapperTag = '^<(task-notification|side-sessions-event|command-|local-command-|system-reminder)'
+$script:WrapperTag = '^<(task-notification|side-sessions-event|ci-monitor-event|[a-z]+(?:-[a-z]+)*-event>|command-|local-command-|system-reminder)'
 function Test-Resubmitted($origin) { return ((Get-OriginKind $origin) -eq 'plugin' -and (Get-Prop $origin 'asUser') -eq $true) }
 # A cache-keeper resubmission: judged on its text, since it is the only copy of what it carries.
 function Test-ResubmittedText([string]$text, $Pr) {
@@ -132,6 +133,13 @@ function Test-ResubmittedText([string]$text, $Pr) {
 function Test-RulingText([string]$t, $Pr) {
   # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
   $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) #(\d+)')
+  # Orchestrators also relay his answer in free text ("The owner answered your parked question on
+  # PR #5727 ... His words, verbatim"). Count that when it names this PR and carries answer wording;
+  # an occasional status line matching it costs one wake, the cheap direction.
+  if ($null -ne $Pr -and $t -match ('#0*' + [regex]::Escape(([string]$Pr).Trim().TrimStart('0')) + '\b') -and
+      $t -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b") {
+    return $true
+  }
   if ($ms.Count -eq 0) { return $null }
   if ($null -eq $Pr) { return $true }
   # Any ruling named in the text may be this PR's; an orchestrator's message can name several.
