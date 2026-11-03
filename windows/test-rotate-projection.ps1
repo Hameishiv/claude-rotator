@@ -324,6 +324,12 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'rotator ping typed into an open AskUserQuestion => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="[User dismissed the question]"' }) 4000 $ts0)))
   Check 'every question dismissed => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="resume", "Also?"="Yes"' }) 4000 $ts0)))
+  Check 'a ping beside a real pick => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="[User did not answer this question - they sent a message instead. Treat that message as their response; do not re-ask.]"' }) 4000 $ts0)))
+  Check 'a message sent instead of a pick => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: [fast-jev-compaction truncated 1641 chars of this tool result]' }) 4000 $ts0)))
+  Check 'a truncated result with no parsable pick => answered (fail-open)' (Test-ParkedLockAnswered -LockPath $lk)
   # The timestamp must not round-trip through the current culture: on en-GB a day-first re-parse
   # swapped month and day (or threw on a day above 12, abandoning the scan).
   $cult = [cultureinfo]::CurrentCulture

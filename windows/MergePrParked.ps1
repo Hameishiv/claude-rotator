@@ -89,7 +89,7 @@ function Get-MergePrTarget {
 #    drops the original, so this is the only copy). It is judged like the owner's own line: his
 #    typed or pasted text counts (after any leading <system-reminder> blocks the app prepended),
 #    whether it lands as a user line or a queued_command attachment; cache-keeper's own "Resume" and
-#    handoff text, the desktop app's "Try again" and usage-limit continuation when resubmitted, and
+#    handoff text, the desktop app's "Try again", and the desktop and CLI usage-limit continuations when resubmitted, and
 #    messages in a known wrapper tag (task notifications, slash-command echoes) do not.
 #    Known gap: a resubmission keeps no trace of its first origin, so if cache-keeper ever resubmits
 #    a SCHEDULED prompt (cold-cache path) it would count -- one wrong wake, the cheap direction.
@@ -103,7 +103,8 @@ function Get-MergePrTarget {
 # Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
 # with a tag, not "/compact" or "[Request interrupted".
 # An AskUserQuestion pick comes back as a tool_result and counts, in either harness phrasing
-# ("Your questions have been answered:" / "The user answered:" with at least one undismissed pick);
+# ("Your questions have been answered:" / "The user answered:") when at least one pick is neither a
+# dismissal nor the rotator's ping, or when no pick can be parsed;
 # every other tool_result does not.
 # The whole transcript is streamed line by line: a busy window can write megabytes after the answer.
 # No `session`, no `parked_at`/`ts`, or the transcript missing/unreadable => no evidence => stays parked.
@@ -169,9 +170,10 @@ function Test-OwnerMessage($e, $Pr = $null) {
     $r = ([string]$r).TrimStart()
     if ($r.StartsWith('Your questions have been answered:') -or $r.StartsWith('The user answered:')) {
       $picks = @([regex]::Matches($r, '"="([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
-      # One real pick is enough. A dismissal is not one, nor the rotator's own ping typed into the
-      # open dialog. No parsable pick in the main phrasing: count it (fail-open).
-      if ($picks.Count -eq 0) { if ($r.StartsWith('Your questions')) { return $true } else { continue } }
+      # One real pick is enough. A dismissal is not one, nor the rotator's own ping landing as the
+      # pick text. "[User did not answer ... sent a message instead]" counts: something was typed.
+      # No parsable pick (e.g. cut by compaction truncation), either phrasing: count it (fail-open).
+      if ($picks.Count -eq 0) { return $true }
       if (@($picks | Where-Object { -not $_.StartsWith('[User dismissed') -and -not (Test-RotatorPing $_) }).Count -gt 0) { return $true }
     }
   }
