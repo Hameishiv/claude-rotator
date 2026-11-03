@@ -66,7 +66,7 @@ function Get-MergePrTarget {
 # A lock leaves `parked` only when the session itself runs --unpark. If the owner answers while the
 # seat is capped, that turn dies on the usage limit first, the lock stays `parked`, and skipping
 # the window would strand his answer. So a parked lock whose session transcript shows an owner
-# answer AFTER it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `ts` (epoch s).
+# answer AFTER it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `parked_at` or else `ts` (epoch s).
 # "Answered" means a message the OWNER typed, timestamped after the park. It used to mean "the
 # transcript file changed 600 s after parking", but a parked window keeps writing with nobody
 # there: background task notifications, orchestrator cross-session messages, idle compactions,
@@ -94,8 +94,11 @@ function Test-ParkedLockAnswered {
   param([string]$LockPath)
   try {
     $lock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    if (-not $lock.session -or $null -eq $lock.ts) { return $false }
-    $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$lock.ts * 1000))
+    # parked_at is the park moment; ts is a heartbeat the launcher re-stamps even while parked,
+    # which would hide an answer given before the re-stamp. Locks parked before parked_at existed fall back to ts.
+    $parkTs = if ($null -ne $lock.parked_at) { $lock.parked_at } else { $lock.ts }
+    if (-not $lock.session -or $null -eq $parkTs) { return $false }
+    $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$parkTs * 1000))
     $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss')
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     try { $all = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8).ReadToEnd() } finally { $fs.Dispose() }

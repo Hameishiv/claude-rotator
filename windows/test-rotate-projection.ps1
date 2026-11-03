@@ -215,6 +215,9 @@ try {
   Check 'owner answer picked in AskUserQuestion => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = @(@{ type = 'text'; text = 'Your questions have been answered: "Ship it?"="No".' }) }) 4000 $ts0)))
   Check 'AskUserQuestion pick as a text-block tool_result => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
+  ([ordered]@{ repo = $repo; pr = 90; state = 'parked'; ts = $ts0 + 3600; parked_at = $ts0; session = $tr } | ConvertTo-Json -Compress) | Set-Content $lk
+  Check 'heartbeat re-stamped ts after the answer => parked_at still finds it' (Test-ParkedLockAnswered -LockPath $lk)
   WriteLock $lk $ts0 $null
   Check 'lock without session => no evidence => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
   WriteLock $lk $ts0 (Join-Path $sd 'gone.jsonl')
