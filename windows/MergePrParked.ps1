@@ -19,7 +19,7 @@ FAIL-OPEN, in both functions. A session that is wrongly nudged costs one turn; a
 is wrongly skipped never learns its quota is back. So every doubt answers "inject":
 unidentifiable PR, no lock, unreadable lock, launcher missing, timeout, non-zero exit,
 unparseable output, or any status other than exactly "parked" — and a parked lock whose session
-transcript holds an owner answer after it parked -- typed, an AskUserQuestion pick, or a relayed
+transcript holds an owner answer from after it parked -- typed, an AskUserQuestion pick, or a relayed
 "Owner ruling for #N" (see Test-ParkedLockAnswered).
 #>
 
@@ -68,18 +68,21 @@ function Get-MergePrTarget {
 # seat is capped, that turn dies on the usage limit first, the lock stays `parked`, and skipping
 # the window would strand his answer. So a parked lock whose session transcript shows an owner
 # answer AFTER it parked is treated as answered => inject. Lock JSON: `session` (transcript path), `parked_at` or else `ts` (epoch s).
-# "Answered" means an owner answer timestamped after the park: something he typed (or cache-keeper
-# resubmitted for him), an AskUserQuestion pick, or a ruling relayed from another session. It used to mean "the
+# "Answered" means an owner answer from after the park: something he typed (or cache-keeper
+# resubmitted for him), an AskUserQuestion pick, or a ruling relayed from another session. "After"
+# is the entry's timestamp, except for a queued_command attachment (below), where it is file order. It used to mean "the
 # transcript file changed 600 s after parking", but a parked window keeps writing with nobody
 # there: background task notifications, orchestrator cross-session messages, idle compactions,
 # plugin prompts ("Resume", "Try again", /compact), a limit error on a notification turn. Each
 # of those read as an answer and the window was woken for nothing (2026-11-02).
 # Who wrote a line: current CLIs stamp `origin.kind` on it. `human` is the owner (typed, pasted --
 # which opens with a <pasted_content> tag --, queued while a turn ran, or an accepted suggestion).
-# The known non-owner kinds -- `task-notification`, `peer`, `auto-continuation`, `coordinator`, and
-# `plugin` without `asUser` -- are not, whatever the text says, and that check runs before the
-# AskUserQuestion branch, because a plugin can re-emit an old pick with a fresh stamp. A kind not
-# on that list is treated like `human` (fail-open: a new input path must not strand his answer).
+# These kinds are automated and never count, whatever the text says: `task-notification`, `peer`,
+# `auto-continuation` (the CLI's "usage limit has reset"), `coordinator`, `observer`,
+# `observer-activity`, `unclassified` (CLI schema: "never presumed human"), and `plugin` without
+# `asUser`. That check runs before the AskUserQuestion branch, because a plugin can re-emit an old
+# pick with a fresh stamp. Any other kind counts like `human`: `channel` and `slack-ping` carry a
+# person's words from another surface, and an unknown future kind must not strand his answer.
 # Exceptions, each measured on real transcripts:
 #  - a `plugin` line with `asUser` is cache-keeper resubmitting a held message after a /compact (it
 #    drops the original, so this is the only copy). It is judged like the owner's own line: his
@@ -108,7 +111,7 @@ function Test-CacheKeeperPrompt([string]$t) {
   return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
     $t.StartsWith('I hit my usage limit while you were working') -or $t.StartsWith('Handoff from my previous session'))
 }
-$script:NonOwnerKinds = @('task-notification', 'peer', 'auto-continuation', 'coordinator')
+$script:NonOwnerKinds = @('task-notification', 'peer', 'auto-continuation', 'coordinator', 'observer', 'observer-activity', 'unclassified')
 # Wrappers a non-owner message arrives in; a resubmission opening with one of these is not his text.
 $script:WrapperTag = '^<(task-notification|side-sessions-event|command-|local-command-|system-reminder)'
 function Test-Resubmitted($origin) { return ((Get-OriginKind $origin) -eq 'plugin' -and (Get-Prop $origin 'asUser') -eq $true) }
@@ -181,23 +184,32 @@ function Test-ParkedLockAnswered {
     $parkTs = if ($null -ne $lock.parked_at) { $lock.parked_at } else { $lock.ts }
     if (-not $lock.session -or $null -eq $parkTs) { return $false }
     $since = [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$parkTs * 1000))
-    # A queued_command attachment is stamped when he typed it, not when the turn absorbed it, so text
-    # queued during the closing turn can predate parked_at by a few seconds: allow 60 s for those.
-    $sinceQueued = $since.AddSeconds(-60)
-    $sinceKey = $sinceQueued.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $sinceKey = $since.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    # A queued_command attachment is stamped when he TYPED it, not when the session read it (it can sit
+    # queued for minutes), so its stamp cannot say which side of the park it was read on. Its place in
+    # the file can: it counts only once a line stamped after the park has been written before it.
+    $pastPark = $false
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
-        # Cheap pre-filters before parsing: a user/attachment entry stamped at or after the park second.
-        # The entry's own timestamp is the LAST one on the line: an attachment nests its own copy
-        # first (equal in observed transcripts; the last one is the entry's either way). (A "timestamp" quoted inside message text is JSON-escaped, so it cannot match.)
-        if ($l -notmatch '"type"\s*:\s*"(user|attachment)"' -or $l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
-        if ([string]::CompareOrdinal($Matches[1], $sinceKey) -lt 0) { continue }
+        # Cheap pre-filters before parsing. The entry's own timestamp is the LAST one on the line: an
+        # attachment nests its own copy first. (A "timestamp" quoted inside message text is
+        # JSON-escaped, so it cannot match.) Any line stamped after the park second moves us past it.
+        if ($l -notmatch '.*"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { continue }
+        $key = $Matches[1]
+        $wasPast = $pastPark
+        if ([string]::CompareOrdinal($key, $sinceKey) -gt 0) { $pastPark = $true }
+        if ($l -notmatch '"type"\s*:\s*"(user|attachment)"') { continue }
+        $queued = $l -match '"type"\s*:\s*"attachment"'
+        if ($queued) { if (-not $wasPast) { continue } }
+        elseif ([string]::CompareOrdinal($key, $sinceKey) -lt 0) { continue }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-        if (-not $e.timestamp) { continue }
-        $cut = if ($e.type -eq 'attachment') { $sinceQueued } else { $since }
-        try { if ((ConvertTo-UtcStamp $e.timestamp) -le $cut) { continue } } catch { continue }
+        if ($e.type -ne 'attachment') {
+          if (-not $e.timestamp) { continue }
+          try { if ((ConvertTo-UtcStamp $e.timestamp) -le $since) { continue } } catch { continue }
+          $pastPark = $true
+        }
         if (Test-OwnerMessage $e $lock.pr) { return $true }
       }
     } finally { $rd.Dispose(); $fs.Dispose() }

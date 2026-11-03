@@ -173,7 +173,7 @@ try {
   } else { Write-Host "  SKIP  real-launcher checks (launcher not found)" -ForegroundColor DarkYellow }
 
   # 10e. answered-but-still-parked (owner, 2026-10-20): a parked lock is woken only when its
-  #      transcript holds an owner answer after it parked: typed (or resubmitted for him by
+  #      transcript holds an owner answer from after it parked (for a queued message: read after it): typed (or resubmitted for him by
   #      cache-keeper), an AskUserQuestion pick, or a relayed "Owner ruling for #N". Anything else
   #      written while parked (task notifications, other cross-session messages, compactions,
   #      plugin prompts, the rotator's own ping, limit errors) is not an answer.
@@ -218,6 +218,8 @@ try {
     (UserLine 'I hit my usage limit while you were working, but it has reset now. Please continue.' 1786 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
     (UserLine '<task-notification><task-id>y</task-id></task-notification>' 1788 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
     (UserLine 'keep going' 1789 $ts0 @{ origin = @{ kind = 'auto-continuation' } }),
+    (UserLine 'observer report: tests green' 1792 $ts0 @{ origin = @{ kind = 'observer' } }),
+    ('{"type":"attachment","attachment":{"type":"queued_command","prompt":"observer activity","origin":{"kind":"observer-activity"}},"timestamp":"' + (Stamp 1793 $ts0) + '"}'),
     (UserLine '<command-name>/usage</command-name>' 1791 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }),
     (UserLine 'Handoff from my previous session:
 
@@ -272,9 +274,12 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"x","origin":{"kind":"peer","body":"Owner ruling for #90 (given in: y): a."}},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'relayed ruling queued mid-turn (attachment line) => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -5 $ts0) + '"},"timestamp":"' + (Stamp -5 $ts0) + '"}'))
-  Check 'owner text queued 5 s before the park, absorbed after it => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  Check 'owner text stamped 5 s before the park, written after post-park lines => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -600 $ts0) + '"},"timestamp":"' + (Stamp -600 $ts0) + '"}'))
-  Check 'owner text queued 10 min before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  Check 'owner text stamped 10 min before the park but read after it (file order) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # Read BEFORE the park (no post-park line precedes it), e.g. "park it, I'll decide tonight": not an answer.
+  WriteTranscript (@('{"type":"attachment","attachment":{"type":"queued_command","prompt":"park it, I will decide tonight","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp -30 $ts0) + '"}') + $noise)
+  Check 'owner text queued and read before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"plugin","name":"cache-keeper","asUser":true}},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'cache-keeper resubmission queued as an attachment => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<- this one' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
