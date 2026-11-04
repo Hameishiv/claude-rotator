@@ -100,7 +100,8 @@ function Get-MergePrTarget {
 #    with WriteConsoleInput, so the CLI stamps it `human`/`typed`; it is excluded by its text.
 #  - an owner answer relayed from another session counts when it is for this lock's PR: either
 #    deliver_ruling.py's "Owner ruling for #<N>" (any case, "for" or "on", possibly wrapped), or
-#    free text naming #<N> with answer wording ("the owner answered", "his words"), however it
+#    free text naming #<N> with answer wording ("the owner answered", "his words"), or an
+#    orchestrator's park release ("the blocker you parked on is cleared"), even naming no PR, however it
 #    is stored: a meta `peer` user line, a `peer` queued_command attachment mid-turn, or a
 #    cache-keeper resubmission of the <cross-session-message>.
 # Older lines with no `origin` fall back to the text: not meta, not a compaction summary, not opening
@@ -165,10 +166,13 @@ function Test-RulingText([string]$t, $Pr) {
   $prRe = '(?i)(?:#|pull/|--pr\s+)' + $n + '|\b' + $lead + $n +
     '(?![^"\u201C\u201D\r\n]*["\u201D]\s*,?\s*or\s+["\u201C])'
   # Every PR the message names, in the same forms; "no other PR" and "no PR at all" are judged on these.
-  $numRe = '(?i)(?:#|pull/|--pr\s+|\b' + $lead + ')0*(\d+)\b'
+  # Two digits or more: "#1" and an option list's "1 B, 2 replace" are not PRs.
+  $numRe = '(?i)(?:#|pull/|--pr\s+|\b' + $lead + ')0*(\d{2,})\b'
   $nums = @([regex]::Matches($t, $numRe) | ForEach-Object { $_.Groups[1].Value.TrimStart('0') })
-  $release = '(?i)\b(?:park(?: condition)? (?:has been |is |has )?cleared|blocker you parked on is cleared|unpark your own lock)\b'
-  if ($null -ne $Pr -and ($t -match $prRe -or ($nums.Count -eq 0 -and $t -match $release))) {
+  # "not an owner ruling/question" is how orchestrators mark a release in practice (every real one).
+  $release = '(?i)(?<!\bnot |n''t |\bdo not )\b(?:park(?: condition)? (?:has been |is |has )?cleared|blocker you parked on is cleared|unpark your own lock|release the park|(?:not|isn''t) an owner (?:ruling|question))\b'
+  $byRelease = $null -ne $Pr -and $t -notmatch $prRe -and $nums.Count -eq 0 -and $t -match $release
+  if ($null -ne $Pr -and ($t -match $prRe -or $byRelease)) {
     $only = @($nums | Where-Object { $_ -ne $prNum }).Count -eq 0
     $prev = ''
     # A sentence ends at . ! ? (plus any closing quote, bracket or bold marker), but not after e.g./i.e.
@@ -176,12 +180,16 @@ function Test-RulingText([string]$t, $Pr) {
       if (-not $s.Trim()) { continue }
       $label = $s -match '^[-*\s]*\*\*[^*]+\*\*\s*$' -and $s -notmatch '(?:#|pull/)\d'
       # The lookback does not apply to a sentence that names a different PR itself.
-      $otherHere = @([regex]::Matches($s, $numRe) | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -gt 0
+      # A plain #N / pull/N / --pr N outside his quoted words (not an issue or comment number), or the
+      # PR his quoted reply opens with ("His words "91 A""); a PR mentioned later inside his quote is not one.
+      $unquoted = $s -replace '"[^"]*"|\u201C[^\u201D]*\u201D', ''
+      $otherHere = @(@([regex]::Matches($unquoted, '(?i)(?<!issue |comment )(?:#|pull/|--pr\s+)0*(\d{2,})\b')) +
+        @([regex]::Matches($s, '(?i)\b' + $lead + '0*(\d{2,})\b')) | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -gt 0
       $named = $only -or $s -match $prRe -or ($prev -match $prRe -and -not $otherHere)
       if (-not $label) { $prev = $s }
       if ($named -and
-          ($s -match $release -or $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b") -and
-          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit|no (?:owner )?answer yet|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
+          (($s -match $release -and $s -notmatch '\?\s*$') -or (-not $byRelease -and $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b")) -and
+          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit|no (?:owner )?answer yet|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
         return $true
       }
     }

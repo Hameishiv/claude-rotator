@@ -387,6 +387,14 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relayed about #91''s sibling. He chose "90 B".',
       '#90: he chose option B.',
       '#90: he chose option b.',
+      # A release with no disclaimer and no PR, and #6468's real "release the park" wording.
+      'resume (second notice). Your disk-space park is cleared. Continue the review.',
+      'From the orchestrator (not an owner ruling): your parked question isn''t an owner question, so fix both gaps and carry on. Release the park through your own lock as usual.',
+      # Other numbers in the answer sentence are not other PRs: options, #1, an issue, a PR in his quote.
+      'Relay for #90. His words: "1 B, 2 replace".',
+      '#90: two questions. On question #1 he answered A.',
+      'Relay for your parked question on #90. His words, verbatim: "approve", recorded on issue #5079.',
+      'Gate E for #90. His words: "approve, and fold #6400 in too".',
       # Real park releases (#6091/#6093): named by --pr N, or by nothing at all.
       'resume. From the orchestrator: C: now has about 39 GB free (it was 0 when you parked), so the blocker you parked on is cleared. This isn''t an owner ruling, because a disk-space block is agent work. Unpark your own lock with `--unpark --pr 90` and carry on with the review.',
       'resume (second notice from the orchestrator). C: has about 39 GB free now, so your disk-space park is cleared. Unpark your own lock with `--unpark --pr 90` and continue the review.',
@@ -458,7 +466,12 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Hold #90: the owner''s approval has not come through.',
       '#90 is blocked on the owner''s decision.',
       'I will forward his answer on #90 once he gives it.',
-      '#90: his decision is due tonight; I will pass it on.',
+      '#90: his decision is due tonight.',
+      '#90: I will pass it on.',
+      # Release wording negated, asked, or conditional; and a no-PR message judged only on its release.
+      'Do NOT unpark your own lock yet: the owner has not answered.',
+      'Is your park condition cleared? Reply with one line.',
+      'Waiting on his answer. Unpark your own lock after he answers.',
       # Each prompt guard on its own: an option list after a lead-in, and a bare "verbatim"/"words".
       'Re #91. Offer him two replies, in his words "90 A" or "90 B". His answer comes through me.',
       'Re #91. Tell him to reply verbatim "90 approve". His answer comes through me.',
