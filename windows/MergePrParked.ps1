@@ -160,7 +160,7 @@ function Test-RulingText([string]$t, $Pr) {
   # PR too, an answer two or more sentences from this PR's number.
   $prNum = ([string]$Pr).Trim().TrimStart('0')
   $n = '0*' + [regex]::Escape($prNum) + '\b'
-  $prRe = '(?i)(?:#|pull/)' + $n + '|\b(?:(?:his|these|(?:the )?owner''s) words|his answer|answered|said|chose|(?:the owner|he) (?:typed|replied))(?:,? verbatim)?\W{0,5}["\u201C]' + $n +
+  $prRe = '(?i)(?:#|pull/)' + $n + '|\b(?:(?:his|these|with the|(?:the )?owner''s) words|his answer|answered|said|chose|(?:the owner|he) (?:typed|replied))(?:,? verbatim)?\W{0,5}["\u201C]' + $n +
     '(?![^"\u201C\u201D\r\n]*["\u201D]\s*,?\s*or\s+["\u201C])'
   if ($null -ne $Pr -and $t -match $prRe) {
     $only = @([regex]::Matches($t, '(?:#|pull/)0*(\d+)\b') | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -eq 0
@@ -172,7 +172,7 @@ function Test-RulingText([string]$t, $Pr) {
       $named = $only -or $s -match $prRe -or $prev -match $prRe
       if (-not $label) { $prev = $s }
       if ($named -and
-          $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option )?(?:(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b" -and
+          $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b" -and
           $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |\bno longer )(?:a?wait(?:ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit)\b") {
         return $true
       }

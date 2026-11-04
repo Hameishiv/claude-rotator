@@ -384,6 +384,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relayed about #91''s sibling. He replied "90 A".',
       'Relayed about #91''s sibling. He chose "90 B".',
       '#90: he chose option B.',
+      '#90: he chose option b.',
+      'Re #91. He answered with the words "90 approve".',
+      'Relayed about #91''s sibling. For #90 he chose "+1".',
+      '#90: his answer is A; approval no longer pending.',
+      '#90: his answer is A; no more decision needed.',
       # Any quoted reply after typed/replied counts, word character or not.
       'Relayed about #91''s sibling. He replied "+1" to #90.',
       'Relayed about #91''s sibling. For #90 he typed "**A**".',
