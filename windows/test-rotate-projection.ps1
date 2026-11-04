@@ -372,7 +372,17 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relayed from the orchestrator about #91''s sibling. He answered "90 copy: A".',
       'Answers are at https://github.com/o/r/pull/90#issuecomment-1. His words: "A".',
       # e.g. and a blank line after a heading do not cut the PR off from the answer.
-      ('Re #91: merged. For #90, e.g. the v2 question, his answer: A.'),
+      ('Re #91: merged. For #90, e.g. the v2 question. His answer: A.'),
+      # A bold label line between the PR heading and the answer (#6481's real shape).
+      ("**#90**`n- **Design approval.** The owner gave it today, in his words: `"Design approved`".`n**#91** is unaffected."),
+      # Every closer after the terminator ends the sentence: bold, curly quote, single quote.
+      '#90: he answered **"A."** The other question is still open.',
+      ('#90: he answered ' + [char]0x201C + 'A.' + [char]0x201D + ' The other question is still open.'),
+      "#90: he answered 'A.' The other question is still open.",
+      # "#090" is this PR, not another one.
+      'Review of #90 resumed (also written #090). CI green. Head ok. His words: "A".',
+      # Curly quotes, as the desktop app types them.
+      ("Relayed about #91's sibling too. His words: " + [char]0x201C + '90 copy: A' + [char]0x201D + '.'),
       ("Re #91: merged.`nFor #90:`n`nHis words: A."),
       # An orchestrator releasing the park counts on purpose: waking the window is what it asks for.
       'Status note (not an owner ruling): your park condition has cleared. Resume the review of #90.')) {
@@ -396,6 +406,14 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Brief for the #90 review. Cherry-pick the fix and push only when no Test run is going. Owner ruling D (undo) is #92 and stays out.',
       # Reject twin of the single-PR test: another PR named, answer far from #90.
       'Review of #90 resumed. #91 is merged. CI is green. His words, verbatim: "A".',
+      # The other PR named only by its link still makes this a multi-PR message.
+      'Review of #90 resumed. See https://github.com/o/r/pull/91 for CI. Head is green. His words, verbatim: "A".',
+      # #6481/#6471's real shape, seen from #6471 (#90): the answer sits under another PR's bold heading.
+      ("Reply from the #91/#90 session: #91 needs nothing, and #90 waits for #91.`n`n**#91**`n- **Design approval.** The owner gave it today, in his words: `"Design approved`".`n`n**#90**`n- I'm holding it."),
+      # A prompt quoting the reply format is not his reply.
+      'Re #91. To answer, he types "90 A" or "90 B". His answer comes through me.',
+      # The sender's name holding the ruling phrase is not a ruling.
+      '<cross-session-message from="x" from-name="Owner ruling for #90 relay">Status: CI green on #91.',
       # The sender's name mentioning the PR is not a mention.
       '<cross-session-message from="x" from-name="Answer page PRs #90/#91">Status: CI green on #91. His words: "A".')) {
     WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))

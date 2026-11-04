@@ -133,6 +133,8 @@ function Test-ResubmittedText([string]$text, $Pr) {
 }
 # $null = no ruling in the text; otherwise whether it is for this PR.
 function Test-RulingText([string]$t, $Pr) {
+  # The wrapper's from-name ("Answer page PRs #6481/#6471") is the sender, not a mention.
+  $t = $t -replace '<cross-session-message[^>]*>', ''
   # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
   $ms = [regex]::Matches($t, '(?i)owner ruling (?:for|on) (?:the )?#(\d+)')
   # Orchestrators also relay his answer in free text ("The owner answered your parked question on
@@ -145,22 +147,23 @@ function Test-RulingText([string]$t, $Pr) {
   # The answer sentence (or the one before it: "...Gate E for #5985. His words: ...") must name this
   # PR, unless the whole message names no other PR: a broadcast listing several PRs must not hand one
   # PR's answer to all of them.
-  # The PR is named as "#N", in a link ".../pull/N", or as the first word of a quoted reply ("6363
-  # approve" is how he answers). The sender's from-name ("Answer page PRs #6481/#6471") is not a mention.
+  # The PR is named as "#N", in a link ".../pull/N", or as the first word of his quoted reply right
+  # after "words"/"answered"/"said" (his words "6363 approve"); not a prompt like Reply "90 A".
+  # A bold label on its own ("- **Design approval.**") is skipped, so it does not use up the lookback;
+  # a bold PR heading ("**#6481**") is not, so the next PR's section does not inherit the one before.
   # An orchestrator's park release ("not an owner ruling: your park condition has cleared, resume")
   # counts, deliberately: waking that window is what the release asks for.
   # Known gaps: an acknowledgement or request worded outside this list still counts (a wrong wake
   # until re-park). Missed: an answer worded outside the answer list, and, in a message naming another
   # PR too, an answer two or more sentences from this PR's number.
-  $t = $t -replace '<cross-session-message[^>]*>', ''
   $prNum = ([string]$Pr).Trim().TrimStart('0')
-  $prRe = '(?:#|pull/|["\u201C])0*' + [regex]::Escape($prNum) + '\b'
+  $prRe = '(?i)(?:#|pull/|\b(?:words|answered|said)\W{0,5}["\u201C])0*' + [regex]::Escape($prNum) + '\b'
   if ($null -ne $Pr -and $t -match $prRe) {
     $only = @([regex]::Matches($t, '(?:#|pull/)0*(\d+)\b') | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -eq 0
     $prev = ''
     # A sentence ends at . ! ? (plus any closing quote, bracket or bold marker), but not after e.g./i.e.
     foreach ($s in ($t -split '(?<=[.!?][)"''\u201D\u2019*\]]*)(?<!\b[eE]\.g\.|\b[iI]\.e\.)\s+|\r?\n')) {
-      if (-not $s.Trim()) { continue }
+      if (-not $s.Trim() -or ($s -match '^[-*\s]*\*\*[^*]+\*\*\s*$' -and $s -notmatch '(?:#|pull/)\d')) { continue }
       $named = $only -or $s -match $prRe -or $prev -match $prRe; $prev = $s
       if ($named -and
           $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b" -and
