@@ -278,6 +278,8 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'owner text stamped 5 s before the park, written after post-park lines => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -600 $ts0) + '"},"timestamp":"' + (Stamp -600 $ts0) + '"}'))
   Check 'owner text stamped 10 min before the park but read after it (file order) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"/usage","origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
+  Check 'bare /usage typed mid-turn (queued) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # Read BEFORE the park (no post-park line precedes it), e.g. "park it, I'll decide tonight": not an answer.
   WriteTranscript (@('{"type":"attachment","attachment":{"type":"queued_command","prompt":"park it, I will decide tonight","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp -30 $ts0) + '"}') + $noise)
   Check 'owner text queued and read before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
@@ -385,6 +387,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relayed about #91''s sibling. He chose "90 B".',
       '#90: he chose option B.',
       '#90: he chose option b.',
+      # Real park releases (#6091/#6093): named by --pr N, or by nothing at all.
+      'resume. From the orchestrator: C: now has about 39 GB free (it was 0 when you parked), so the blocker you parked on is cleared. This isn''t an owner ruling, because a disk-space block is agent work. Unpark your own lock with `--unpark --pr 90` and carry on with the review.',
+      'resume (second notice from the orchestrator). C: has about 39 GB free now, so your disk-space park is cleared. Unpark your own lock with `--unpark --pr 90` and continue the review.',
+      'Status note from the succah close-out orchestrator (not an owner ruling): your park condition has cleared. C: now has 39 GB free. Your question asked for disk to be freed and then "resume", so resume the review.',
       'Re #91. He answered with the words "90 approve".',
       'Relayed about #91''s sibling. For #90 he chose "+1".',
       '#90: his answer is A; approval no longer pending.',
@@ -442,6 +448,17 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#90: he replied that he needs more time.',
       '#90 review. He chose this because the last brief misread the work.',
       '#90 brief: last round he chose a narrower fix, so keep the scope tight.',
+      # Another PR's release is not this one's.
+      'From the orchestrator: your disk-space park is cleared. Unpark your own lock with `--unpark --pr 91`.',
+      # An answer quoted for another PR does not make this a one-PR message.
+      '#90 is pushed. His words "91 A".',
+      # Third-person and plain-English holds.
+      '#90 awaits the owner''s decision.',
+      'No owner answer yet on #90.',
+      'Hold #90: the owner''s approval has not come through.',
+      '#90 is blocked on the owner''s decision.',
+      'I will forward his answer on #90 once he gives it.',
+      '#90: his decision is due tonight; I will pass it on.',
       # Each prompt guard on its own: an option list after a lead-in, and a bare "verbatim"/"words".
       'Re #91. Offer him two replies, in his words "90 A" or "90 B". His answer comes through me.',
       'Re #91. Tell him to reply verbatim "90 approve". His answer comes through me.',
