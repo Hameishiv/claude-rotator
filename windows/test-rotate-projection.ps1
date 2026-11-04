@@ -359,7 +359,23 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       ('#90 decision. His words (2026-11-03): "re open 90".' + "`n" + 'The other item waits until he answers.'),
       # #5985 / #5397 shape: the PR is named in the sentence before his words, and another PR is named too.
       '#90 is pushed. The owner waives your Gate E for #90. His words, verbatim: "A. Create the marker." #91 is unaffected.',
-      'Owner instruction for #90 (you now own it). His words: "keep 90 but cherry pick from 91."')) {
+      'Owner instruction for #90 (you now own it). His words: "keep 90 but cherry pick from 91."',
+      # Punctuation inside the closing quote/bracket still ends the sentence, so the next one's veto stays there.
+      'For #90, his words, verbatim: "A." The other question is still open.',
+      '#90: he answered "A." I will relay anything further.',
+      'The owner answered #90 (verbatim: "A, keep it.") Q2 stays parked.',
+      # One PR named: the answer may sit several sentences after it (pins the single-PR rule).
+      'Review of #90 resumed. Head is abc123. CI is green. His words, verbatim: "A".',
+      # Only the "owner ruling for the #N" form can carry this one (the free-text sentence is vetoed).
+      'Owner ruling for the #90 question, and I''ll relay anything further.',
+      # The PR named without "#": in a link, or as the first word of his quoted reply.
+      'Relayed from the orchestrator about #91''s sibling. He answered "90 copy: A".',
+      'Answers are at https://github.com/o/r/pull/90#issuecomment-1. His words: "A".',
+      # e.g. and a blank line after a heading do not cut the PR off from the answer.
+      ('Re #91: merged. For #90, e.g. the v2 question, his answer: A.'),
+      ("Re #91: merged.`nFor #90:`n`nHis words: A."),
+      # An orchestrator releasing the park counts on purpose: waking the window is what it asks for.
+      'Status note (not an owner ruling): your park condition has cleared. Resume the review of #90.')) {
     WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
     Check "free-text relay of his answer => answered: $body" (Test-ParkedLockAnswered -LockPath $lk)
   }
@@ -377,7 +393,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#91 has the owner''s approval ("A"). Once it''s on main, re-run #90''s halacha-check.',
       'Here is the #90 question. Please carry it to him; his answer must be given in session.',
       'Do NOT merge #90 until I tell you. The fix is waiting on the owner''s approval.',
-      'Brief for the #90 review. Cherry-pick the fix and push only when no Test run is going. Owner ruling D (undo) is #92 and stays out.')) {
+      'Brief for the #90 review. Cherry-pick the fix and push only when no Test run is going. Owner ruling D (undo) is #92 and stays out.',
+      # Reject twin of the single-PR test: another PR named, answer far from #90.
+      'Review of #90 resumed. #91 is merged. CI is green. His words, verbatim: "A".',
+      # The sender's name mentioning the PR is not a mention.
+      '<cross-session-message from="x" from-name="Answer page PRs #90/#91">Status: CI green on #91. His words: "A".')) {
     WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
     Check "orchestrator park acknowledgement => still parked: $body" (-not (Test-ParkedLockAnswered -LockPath $lk))
   }

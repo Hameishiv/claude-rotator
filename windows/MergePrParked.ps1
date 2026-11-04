@@ -145,14 +145,22 @@ function Test-RulingText([string]$t, $Pr) {
   # The answer sentence (or the one before it: "...Gate E for #5985. His words: ...") must name this
   # PR, unless the whole message names no other PR: a broadcast listing several PRs must not hand one
   # PR's answer to all of them.
-  # Known gap: an acknowledgement or request worded outside this list still counts (a wrong wake until
-  # re-park); an answer in a multi-PR message whose sentence omits the number is missed.
+  # The PR is named as "#N", in a link ".../pull/N", or as the first word of a quoted reply ("6363
+  # approve" is how he answers). The sender's from-name ("Answer page PRs #6481/#6471") is not a mention.
+  # An orchestrator's park release ("not an owner ruling: your park condition has cleared, resume")
+  # counts, deliberately: waking that window is what the release asks for.
+  # Known gaps: an acknowledgement or request worded outside this list still counts (a wrong wake
+  # until re-park). Missed: an answer worded outside the answer list, and, in a message naming another
+  # PR too, an answer two or more sentences from this PR's number.
+  $t = $t -replace '<cross-session-message[^>]*>', ''
   $prNum = ([string]$Pr).Trim().TrimStart('0')
-  $prRe = '#0*' + [regex]::Escape($prNum) + '\b'
+  $prRe = '(?:#|pull/|["\u201C])0*' + [regex]::Escape($prNum) + '\b'
   if ($null -ne $Pr -and $t -match $prRe) {
-    $only = @([regex]::Matches($t, '#0*(\d+)\b') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique).Count -eq 1
+    $only = @([regex]::Matches($t, '(?:#|pull/)0*(\d+)\b') | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -eq 0
     $prev = ''
-    foreach ($s in ($t -split '(?<=[.!?])\s+|\r?\n')) {
+    # A sentence ends at . ! ? (plus any closing quote, bracket or bold marker), but not after e.g./i.e.
+    foreach ($s in ($t -split '(?<=[.!?][)"''\u201D\u2019*\]]*)(?<!\b[eE]\.g\.|\b[iI]\.e\.)\s+|\r?\n')) {
+      if (-not $s.Trim()) { continue }
       $named = $only -or $s -match $prRe -or $prev -match $prRe; $prev = $s
       if ($named -and
           $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|his (?:answer|answers|words|ruling|approval|decision))\b" -and
