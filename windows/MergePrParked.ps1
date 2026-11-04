@@ -148,8 +148,9 @@ function Test-RulingText([string]$t, $Pr) {
   # PR, unless the whole message names no other PR: a broadcast listing several PRs must not hand one
   # PR's answer to all of them.
   # The PR is named as "#N", in a link ".../pull/N", or as the first word of his quoted reply right
-  # after "his words"/"his answer"/"answered"/"said"/"chose"/"he typed"/"he replied", optionally ", verbatim"
-  # (his words "6363 approve"); not a prompt like Reply "90 A" nor a list of options ("90 A" or "90 B").
+  # after "his/these/owner's words", "his answer", "answered", "said", "chose", "he typed" or "he replied",
+  # optionally ", verbatim" (his words "6363 approve"); not a prompt like Reply "90 A", nor a quoted reply that
+  # opens a list of options ("90 A" or "90 B").
   # A bold label on its own ("- **Design approval.**") is still judged, but does not use up the lookback;
   # a bold PR heading ("**#6481**") is not, so the next PR's section does not inherit the one before.
   # An orchestrator's park release ("not an owner ruling: your park condition has cleared, resume")
@@ -158,7 +159,9 @@ function Test-RulingText([string]$t, $Pr) {
   # until re-park). Missed: an answer worded outside the answer list, and, in a message naming another
   # PR too, an answer two or more sentences from this PR's number.
   $prNum = ([string]$Pr).Trim().TrimStart('0')
-  $prRe = '(?i)(?:#|pull/|\b(?:words|his answer|answered|said|chose|(?:the owner|he) (?:typed|replied))(?:,? verbatim)?\W{0,5}["\u201C])0*' + [regex]::Escape($prNum) + '\b(?![^"\u201D]*["\u201D]\s*,?\s*or\s+["\u201C])'
+  $n = '0*' + [regex]::Escape($prNum) + '\b'
+  $prRe = '(?i)(?:#|pull/)' + $n + '|\b(?:(?:his|these|(?:the )?owner''s) words|his answer|answered|said|chose|(?:the owner|he) (?:typed|replied))(?:,? verbatim)?\W{0,5}["\u201C]' + $n +
+    '(?![^"\u201C\u201D\r\n]*["\u201D]\s*,?\s*or\s+["\u201C])'
   if ($null -ne $Pr -and $t -match $prRe) {
     $only = @([regex]::Matches($t, '(?:#|pull/)0*(\d+)\b') | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -eq 0
     $prev = ''
@@ -169,8 +172,8 @@ function Test-RulingText([string]$t, $Pr) {
       $named = $only -or $s -match $prRe -or $prev -match $prRe
       if (-not $label) { $prev = $s }
       if ($named -and
-          $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked) (?:option )?(?:[A-D]\b|[\x22\u201C])|(?:the owner|he) (?:typed|replied)\W{0,5}[\x22\u201C]|his (?:answer|answers|words|ruling|approval|decision))\b" -and
-          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|the moment he answers|without his answer|a?wait(?:ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed)|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit)\b") {
+          $s -match "(?i)\b(owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option )?(?:(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b" -and
+          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|when he answers|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |\bno longer )(?:a?wait(?:ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit)\b") {
         return $true
       }
     }

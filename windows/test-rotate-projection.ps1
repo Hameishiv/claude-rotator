@@ -384,6 +384,14 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relayed about #91''s sibling. He replied "90 A".',
       'Relayed about #91''s sibling. He chose "90 B".',
       '#90: he chose option B.',
+      # Any quoted reply after typed/replied counts, word character or not.
+      'Relayed about #91''s sibling. He replied "+1" to #90.',
+      'Relayed about #91''s sibling. For #90 he typed "**A**".',
+      # Saying nothing more is pending is not a hold.
+      '#90: his answer is A, so no further decision needed.',
+      '#90 is not awaiting the owner any more: his answer is "approve".',
+      # A curly-quoted option list about ANOTHER PR does not un-name this one.
+      ('#90: the owner answered A. #91: he has not chosen between ' + [char]0x201C + 'keep' + [char]0x201D + ' or ' + [char]0x201C + 'drop' + [char]0x201D + ' yet.'),
       'Relayed about #91''s sibling. He typed "90 approve".',
       'Relayed about #91''s sibling. The owner replied "90: yes".',
       # Every closer after the terminator ends the sentence: bold, curly quote, single quote.
@@ -428,6 +436,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#90: the owner typed nothing yet.',
       '#90: he replied that he needs more time.',
       '#90 review. He chose this because the last brief misread the work.',
+      '#90 brief: last round he chose a narrower fix, so keep the scope tight.',
+      # Each prompt guard on its own: an option list after a lead-in, and a bare "verbatim"/"words".
+      'Re #91. Offer him two replies, in his words "90 A" or "90 B". His answer comes through me.',
+      'Re #91. Tell him to reply verbatim "90 approve". His answer comes through me.',
+      'Re #91. Ask him for the exact words "90 approve". His answer comes through me.',
       # Awaiting / pending / needed (#5375's real wording), bold or not.
       '#90 copy is still awaiting the owner''s approval, so please don''t treat a push as the trigger.',
       ("**#90**`n- **Awaiting owner approval.**"),
