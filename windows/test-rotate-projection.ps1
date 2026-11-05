@@ -237,6 +237,8 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
   Check 'owner message typed after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
+  WriteTranscript (@(1..520 | ForEach-Object { $noise[0] }) + $noise)
+  Check 'transcript scan over its time budget => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
   Check 'owner answer as a text block => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes". You can now continue with these answers in mind.' }) 4000 $ts0)))
@@ -546,6 +548,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#90: no answer yet; his words will follow.',
       # Known gap (missed answer): a hold judges the whole sentence, so another PR's hold vetoes it too.
       'He approved #90; #91 still needs his approval.',
+      # A real request relayed to a parked window (#6673, 2026-11-05): a hold, not his answer.
+      'I am putting your parked copy question to the owner. Please post one PR comment on #90. Then reply to me with the comment URL. Keep parked until his answer arrives.',
+      '#90: keep it parked until the owner''s ruling arrives.',
       # A quoted label or status string is not his words: its hold still vetoes.
       'Status for #90: its PR body still reads "awaiting owner approval".',
       'The lock note for #90 says "his answer is still pending".',

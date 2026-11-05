@@ -227,7 +227,7 @@ function Test-RulingText([string]$t, $Pr) {
       if (-not $label) { $prev = $s }
       if ($named -and
           (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $vetoText -notmatch $answerHold -and $s -match $answerWord)) -and
-          $vetoText -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|unless his answer|to be confirmed by|may revisit|has not come|(?<!\bno longer |\bnot |n['\u2019]t )blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
+          $vetoText -notmatch "(?i)\b(stays? parked|keep(?:ing)? (?:it |the lock |your lock )?parked|until (?:his|the owner'?s) (?:answer|ruling|reply|decision)|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|unless his answer|to be confirmed by|may revisit|has not come|(?<!\bno longer |\bnot |n['\u2019]t )blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
         return $true
       }
     }
@@ -311,7 +311,10 @@ function ConvertTo-UtcStamp($t) {
   return [DateTimeOffset]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
 }
 function Test-ParkedLockAnswered {
-  param([string]$LockPath)
+  # BudgetSec bounds the transcript read, which runs inside the synchronous ping loop (a 217 MB
+  # transcript took about two minutes). Past it the lock counts as answered, so the window is
+  # pinged: the fail-open direction, which is what every limit-stopped window got before this check.
+  param([string]$LockPath, [double]$BudgetSec = 20)
   try {
     $lock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     # parked_at is the park moment; ts is a heartbeat the launcher re-stamps even while parked,
@@ -332,10 +335,13 @@ function Test-ParkedLockAnswered {
     # boundary resets the test, the compaction summary does not set it, and the copied history's old
     # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $n = 0
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
+        if ((++$n % 512) -eq 0 -and $sw.Elapsed.TotalSeconds -gt $BudgetSec) { return $true }
         # Cheap pre-filters before parsing. The entry's own timestamp is the LAST one on the line: an
         # attachment nests its own copy first. (A "timestamp" quoted inside message text is
         # JSON-escaped, so it cannot match.)
