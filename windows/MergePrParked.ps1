@@ -133,6 +133,8 @@ function Test-Resubmitted($origin) { return ((Get-OriginKind $origin) -eq 'plugi
 # A cache-keeper resubmission: judged on its text, since it is the only copy of what it carries.
 function Test-ResubmittedText([string]$text, $Pr) {
   $text = ($text -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
+  # A peer message can carry the harness's display prefix in front of its wrapper.
+  $text = ($text -replace '^Another Claude session sent a message:\s*', '').Trim()
   if (-not $text -or (Test-RotatorPing $text) -or (Test-CacheKeeperPrompt $text)) { return $false }
   if ($text.StartsWith('<cross-session-message')) { return ((Test-RulingText $text $Pr) -eq $true) }
   return ($text -notmatch $script:WrapperTag)

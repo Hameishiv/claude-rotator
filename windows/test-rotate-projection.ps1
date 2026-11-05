@@ -275,6 +275,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   # cache-keeper resubmitting his held text after a /compact: often the only copy of the answer.
   WriteTranscript ($noise + @((UserLine '6529 A, router A - unpark and carry on' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true }; turnOrigin = 'system' })))
   Check 'owner answer resubmitted by cache-keeper (plugin, asUser) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  $ck = @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } }
+  WriteTranscript ($noise + @((UserLine "Another Claude session sent a message:`n<cross-session-message from=`"x`">Owner ruling for #91: A.</cross-session-message>" 4000 $ts0 $ck)))
+  Check 'prefixed peer message resubmitted, ruling for another PR => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine "Another Claude session sent a message:`n<cross-session-message from=`"x`">Status: CI green on #91.</cross-session-message>" 4000 $ts0 $ck)))
+  Check 'prefixed peer status resubmitted => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine "Another Claude session sent a message:`n<cross-session-message from=`"x`">Owner ruling for #90 (given in: y): A.</cross-session-message>" 4000 $ts0 $ck)))
+  Check 'prefixed peer ruling for this PR resubmitted => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript (@((UserLine 'A' -600 $ts0 @{ origin = @{ kind = 'human' } })) + $noise + @((UserLine 'A' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'resubmitted answer repeating an earlier short answer => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<pasted_content id="2f">go with B</pasted_content>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
