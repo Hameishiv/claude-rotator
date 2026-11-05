@@ -497,6 +497,17 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Status for #90 (not an owner ruling): CI is red on main, so hold until I tell you.',
       'This is not an owner ruling on #90, just a status note: CI is red on main.',
       'Not an owner ruling for #90: my read is option A, but hold until he answers.',
+      'This isn''t an owner ruling for #90.',
+      'This isn''t an owner ruling; CI is red on #90.',
+      # The formal ruling phrase mid-sentence is judged with the vetoes, not as a ruling.
+      'No owner ruling on #90 yet.',
+      '#90 stays parked until the owner ruling on #90 arrives.',
+      'Without an owner ruling on #90, hold.',
+      '#90: no owner decision yet.',
+      '#90: this needs owner approval.',
+      # "He hasn't answered" vetoes answer wording (a release with it still counts, above).
+      '#90: he hasn''t answered; his answer will follow.',
+      'Never release the park.',
       # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
       # with a closer after the "?".
       ('Don' + [char]0x2019 + 't release the park yet.'),

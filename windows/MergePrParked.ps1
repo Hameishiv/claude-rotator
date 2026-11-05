@@ -136,9 +136,11 @@ function Test-ResubmittedText([string]$text, $Pr) {
 function Test-RulingText([string]$t, $Pr) {
   # The wrapper's from-name ("Answer page PRs #6481/#6471") is the sender, not a mention.
   $t = $t -replace '</?cross-session-message[^>]*>', ''
-  # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match loosely.
-  # "This is not an owner ruling on #N" is a label, not one.
-  $ms = [regex]::Matches($t, '(?i)(?<!\bnot an |n[''\u2019]t an )owner ruling (?:for|on) (?:the )?#(\d+)')
+  # Relaying agents reword it ("owner ruling for #N", "OWNER RULING on #N"), so match the case loosely,
+  # but only where a ruling is stated: at the start of a line, as every real one is. Mid-sentence
+  # ("not an owner ruling on #N", "stays parked until the owner ruling on #N") goes through the
+  # free-text check below and its vetoes instead, since this match has none.
+  $ms = [regex]::Matches($t, '(?im)^[\s>*_#-]*owner ruling (?:for|on) (?:the )?#(\d+)')
   # Orchestrators also relay his answer in free text ("The owner answered your parked question on
   # PR #5727 ... His words, verbatim"). Count that when it names this PR and carries answer wording,
   # but NOT the orchestrator's acknowledgement of the park ("#5992 stays parked ... will relay his
@@ -195,8 +197,8 @@ function Test-RulingText([string]$t, $Pr) {
       $named = $only -or $s -match $prRe -or ($prev -match $prRe -and -not $otherHere)
       if (-not $label) { $prev = $s }
       if ($named -and
-          (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $s -match "(?i)\b((?<!\bnot an |n['\u2019]t an )owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b")) -and
-          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit|no (?:owner )?answer yet|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
+          (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $s -notmatch "(?i)\b(?:has not|hasn't|hasn\u2019t) answered\b" -and $s -match "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b")) -and
+          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|owner|his)|unless his answer|to be confirmed by|may revisit|no (?:owner(?:'s)? )?(?:answer|decision|approval|ruling)(?: (?:on|for) (?:the )?#\d+)? yet|still no (?:owner(?:'s)? )?(?:answer|decision|approval|ruling)|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
         return $true
       }
     }
