@@ -425,6 +425,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # Issue numbers in a list, and a quantity opening his quoted reply, are not other PRs.
       ('Relay for #90.' + "`n" + 'His words: "approve" (also closes issues #5079 and #5080).'),
       'Relay for #90. His words: "48 hours is fine".',
+      # "Don't wait for him/the owner" in a release is part of the release, not a hold.
+      'This isn''t an owner question, so don''t wait for him.',
+      'Your park condition has cleared: don''t wait for the owner.',
+      'The blocker you parked on is cleared, even though he hasn''t answered the copy question.',
       # An orchestrator releasing the park counts on purpose: waking the window is what it asks for.
       'Status note (not an owner ruling): your park condition has cleared. Resume the review of #90.')) {
     WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
@@ -491,6 +495,8 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'My view (not an owner ruling): option A looks right, but wait for him.',
       'Status note (not an owner ruling): main went red at 14:00. Nothing for you to do yet.',
       'Status for #90 (not an owner ruling): CI is red on main, so hold until I tell you.',
+      'This is not an owner ruling on #90, just a status note: CI is red on main.',
+      'Not an owner ruling for #90: my read is option A, but hold until he answers.',
       # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
       # with a closer after the "?".
       ('Don' + [char]0x2019 + 't release the park yet.'),
