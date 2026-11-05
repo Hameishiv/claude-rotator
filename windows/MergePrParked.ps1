@@ -322,7 +322,16 @@ function Test-ParkedLockAnswered {
   # window is pinged: the fail-open direction, which is what every limit-stopped window got before
   # this check. Both are read before every JSON parse and every 512 lines. If the CPU time cannot be
   # read, only the wall clock bounds the scan.
-  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60)
+  # PassSec bounds the whole resume pass: claude-resume-sessions.ps1 checks every window in one
+  # process, one after another, inside the rotation mutex, so the scans' wall time is summed across
+  # calls in this process ($script:ParkedScanPassSpent). Once the pass has spent PassSec, each further
+  # parked window counts as answered without a scan (fail-open, pinged).
+  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60, [double]$PassSec = 60)
+  if ($null -eq $script:ParkedScanPassSpent) { $script:ParkedScanPassSpent = 0.0 }
+  $left = $PassSec - $script:ParkedScanPassSpent
+  if ($left -le 0) { return $true }
+  if ($left -lt $WallSec) { $WallSec = $left }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
   try {
     $lock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     # parked_at is the park moment; ts is a heartbeat the launcher re-stamps even while parked,
@@ -343,7 +352,6 @@ function Test-ParkedLockAnswered {
     # boundary resets the test, the compaction summary does not set it, and the copied history's old
     # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
-    $sw = [Diagnostics.Stopwatch]::StartNew()
     $cpuNow = { try { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds } catch { $null } }
     $cpu0 = & $cpuNow
     $n = 0
@@ -379,7 +387,7 @@ function Test-ParkedLockAnswered {
       }
     } finally { $rd.Dispose(); $fs.Dispose() }
     return $false
-  } catch { return $false }
+  } catch { return $false } finally { $script:ParkedScanPassSpent += $sw.Elapsed.TotalSeconds }
 }
 
 # ---- the decision ---------------------------------------------------------------------------

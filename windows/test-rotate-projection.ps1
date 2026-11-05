@@ -121,6 +121,8 @@ Check 'probe deadline clears the next 5-min tick under worst-case jitter' `
 # 10. Parked merge-pr reviews are skipped, everything else is nudged (owner, 2026-10-20, option A).
 #     Fail-open: the ONLY thing that skips an inject is a clean exit-0 JSON status of exactly "parked".
 . (Join-Path (Split-Path -Parent $PSCommandPath) 'MergePrParked.ps1')
+# The suite runs far more scans than one resume pass; only the pass-budget tests below set PassSec.
+$PSDefaultParameterValues['Test-ParkedLockAnswered:PassSec'] = 1e9
 function FakeStatus([string]$json, [int]$code = 0) { $r = @{ ExitCode = $code; Stdout = $json }; { $r }.GetNewClosure() }
 $repo = 'Your-Org/Your-Repo'
 Check 'lock-status "parked" => skipped'  (Test-MergePrParked -Repo $repo -Pr 1 -Invoke (FakeStatus '{"status": "parked", "lock": "x"}'))
@@ -234,6 +236,14 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'parked + only noise since => skipped' (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson))
   WriteTranscript (@((UserLine 'a' -60 $ts0)) + $noise)
   Check 'owner message typed BEFORE the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  $script:ParkedScanPassSpent = 0.0
+  Check 'pass budget left => scanned, still parked' (-not (Test-ParkedLockAnswered -LockPath $lk -PassSec 1e6))
+  Check 'a scan adds its wall time to the pass' ($script:ParkedScanPassSpent -gt 0)
+  $script:ParkedScanPassSpent = 5.0
+  Check 'pass budget spent by earlier windows => answered without a scan (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -PassSec 5)
+  $script:ParkedScanPassSpent = 2e9   # past even the suite's PassSec default
+  Check 'pass budget spent => parked window pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
+  $script:ParkedScanPassSpent = 0.0
   WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
   Check 'owner message typed after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
