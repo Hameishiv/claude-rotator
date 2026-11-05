@@ -207,12 +207,15 @@ function Test-RulingText([string]$t, $Pr) {
       # The lookback does not apply to a sentence that names a different PR itself.
       # A plain #N / pull/N / --pr N outside his quoted words (not an issue or comment number), or the
       # PR his quoted reply opens with ("His words "91 A""); a PR mentioned later inside his quote is not one.
-      # Quoted text is not a PR mention below. It also escapes the vetoes whenever answer wording appears
+      # Quoted text is not a PR mention below (except that reply-opening number). It also escapes the
+      # vetoes whenever answer wording appears
       # outside the quotes ("His words: "A, leave Q2 still open"", He replied "..."). So a quoted label
       # with no answer wording beside it (#N's body says "awaiting owner approval") is judged whole, but
-      # one beside unquoted answer wording is not (a wrong wake). The quote marks are kept, empty, because
-      # the "he replied/typed/chose" answer wording needs the opening mark after it.
-      $unquoted = $s -replace '"[^"]*"', '""' -replace '\u201C[^\u201D]*\u201D', '""'
+      # one beside unquoted answer wording is not (a wrong wake). Each quoted span, straight or curly, is
+      # replaced by an empty straight pair, because the "he replied/typed/chose" answer wording needs a
+      # mark after it; one left-to-right pass, so a stray straight mark inside a curly quote cannot pair
+      # across it. Known gap (missed answer): a mixed pair (curly open, straight close) is not blanked.
+      $unquoted = $s -replace '"[^"]*"|\u201C[^\u201D]*\u201D', '""'
       $vetoText = if ($unquoted -match $answerWord) { $unquoted } else { $s }
       $otherHere = @(@([regex]::Matches($unquoted, '(?i)' + $notIssue + '(?:#|pull/|--pr\s+)0*(\d{2,})\b')) +
         @([regex]::Matches($s, '(?i)\b' + $lead + '0*(\d{2,})\b' + $unit)) | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -gt 0

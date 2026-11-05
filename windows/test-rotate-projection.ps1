@@ -453,6 +453,12 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # A hold word inside his quote after "he replied/typed/chose" is his answer too.
       'Relay for #90. He replied "A, and leave the second question still open".',
       'Relay for #90. He chose "B, keep Q2 still open for now".',
+      # The same with curly quotes, as the desktop app types them.
+      ("Relay for #90. His words, verbatim: " + [char]0x201C + "A, and leave the second question still open" + [char]0x201D + "."),
+      ("Relay for #90. He replied " + [char]0x201C + "A, and leave the second question still open" + [char]0x201D + "."),
+      ("Relay for #90. He chose " + [char]0x201C + "B, keep Q2 still open for now" + [char]0x201D + "."),
+      # A stray straight mark inside his curly quote does not pair across it.
+      ("Relay for #90. His words: " + [char]0x201C + 'Q2 still open, take the 5" panel' + [char]0x201D + ', and he typed "A".'),
       # These phrasings are not holds at all (the declared wrong-wake gap), so they neither block a
       # release nor veto this PR's answer, whichever PR they are about.
       'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
