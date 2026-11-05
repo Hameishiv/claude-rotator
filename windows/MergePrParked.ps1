@@ -190,9 +190,11 @@ function Test-RulingText([string]$t, $Pr) {
   # ("Unpark ... --pr 91; #N still needs his approval") or a conditional one counts (a wrong wake
   # until re-park); and these holds judge the whole sentence, so another PR's hold beside
   # this PR's answer ("He approved #N; #M still needs his approval") vetoes it (a missed answer).
-  # Negated, it is not a hold: "he approved A, so it no longer needs his sign-off" / "no need to
-  # keep it parked". "Keep parked until his answer arrives" is one (a live relay to #6673, 2026-11-05).
-  $answerHold = '(?i)\b(?:(?<!\b(?:no longer|not|nothing(?: else| more)?|nobody|no one|neither(?: [\w-]+)?) )needs (?:the owner|his)|no (?:owner )?answer yet|(?<!\b(?:no need to|no longer need to|no reason to|not|do not|don[''\u2019]t|stop) )keep(?:ing)? (?:it |the lock |your lock )?parked|(?:stay|keep|wait|hold)\w* until (?:his|the owner[''\u2019]?s) (?:answer|ruling|reply|decision)|parked until (?:his|the owner[''\u2019]?s) (?:answer|ruling|reply|decision))\b'
+  # Negated, it is not a hold: "he approved A, so it no longer needs his sign-off".
+  # Known gap (wrong wake): "Keep parked until his answer arrives" (a live relay to #6673, 2026-11-05)
+  # counts. Holding it was tried and dropped: every wording of it also caught negated or past-tense
+  # answers ("you don't need to keep it parked", "it was parked until his answer; he approved A").
+  $answerHold = '(?i)\b(?:(?<!\b(?:no longer|not|nothing(?: else| more)?|nobody|no one|neither(?: [\w-]+)?) )needs (?:the owner|his)|no (?:owner )?answer yet)\b'
   $answerWord = "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b"
   # Known gaps (missed answer): a negated "stays parked" / "still open" ("it no longer stays parked") still
   # vetoes; and a quote spanning sentences is split before its quotes are matched, so a hold word in an
@@ -314,11 +316,13 @@ function ConvertTo-UtcStamp($t) {
 function Test-ParkedLockAnswered {
   # The transcript read runs inside the synchronous ping loop, under the rotation mutex and the
   # proxy's 150 s wait on a held request (a 217 MB transcript took about two minutes). BudgetSec is
-  # this process's CPU time for the scan, which machine load does not inflate (a 38 MB transcript
-  # needs 2-3 s); WallSec is a backstop for a starved process. Past either, the lock counts as
-  # answered, so the window is pinged: the fail-open direction, which is what every limit-stopped
-  # window got before this check. Both are read before every JSON parse (the costly step).
-  param([string]$LockPath, [double]$BudgetSec = 5, [double]$WallSec = 60)
+  # this process's CPU time for the scan (a live 37 MB transcript took 3.4-4.6 s at idle priority on a
+  # loaded machine; it is mostly the per-line pre-filters, and still rises somewhat under load);
+  # WallSec is a backstop for a starved process. Past either, the lock counts as answered, so the
+  # window is pinged: the fail-open direction, which is what every limit-stopped window got before
+  # this check. Both are read before every JSON parse and every 512 lines. If the CPU time cannot be
+  # read, only the wall clock bounds the scan.
+  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60)
   try {
     $lock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     # parked_at is the park moment; ts is a heartbeat the launcher re-stamps even while parked,
@@ -340,13 +344,14 @@ function Test-ParkedLockAnswered {
     # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $cpu0 = [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime
+    $cpuNow = { try { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds } catch { $null } }
+    $cpu0 = & $cpuNow
     $n = 0
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
     $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8)
     try {
       while ($null -ne ($l = $rd.ReadLine())) {
-        if ((++$n % 512) -eq 0 -and ((([Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime - $cpu0).TotalSeconds -ge $BudgetSec) -or $sw.Elapsed.TotalSeconds -ge $WallSec)) { return $true }
+        if ((++$n % 512) -eq 0 -and (($null -ne $cpu0 -and ((& $cpuNow) - $cpu0) -ge $BudgetSec) -or $sw.Elapsed.TotalSeconds -ge $WallSec)) { return $true }
         # Cheap pre-filters before parsing. The entry's own timestamp is the LAST one on the line: an
         # attachment nests its own copy first. (A "timestamp" quoted inside message text is
         # JSON-escaped, so it cannot match.)
@@ -363,7 +368,7 @@ function Test-ParkedLockAnswered {
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"') { continue }
         if ($queued) { if (-not $readAfter) { continue } }
         elseif ([string]::CompareOrdinal($key, $sinceKey) -lt 0) { continue }
-        if (((([Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime - $cpu0).TotalSeconds -ge $BudgetSec) -or $sw.Elapsed.TotalSeconds -ge $WallSec)) { return $true }
+        if ((($null -ne $cpu0 -and ((& $cpuNow) - $cpu0) -ge $BudgetSec) -or $sw.Elapsed.TotalSeconds -ge $WallSec)) { return $true }
         try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if ($e.type -ne 'attachment') {
           if (-not $e.timestamp) { continue }

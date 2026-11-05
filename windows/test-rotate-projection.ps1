@@ -239,6 +239,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
   WriteTranscript $noise
   Check 'transcript scan over its CPU budget => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0)
+  WriteTranscript @(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 })
+  Check 'over budget among 512+ pre-park lines (no parse reached) => answered' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
+  Check 'same 512+ pre-park lines within budget => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript $noise
   Check 'transcript scan over its wall-clock backstop => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
   Check 'owner answer as a text block => answered' (Test-ParkedLockAnswered -LockPath $lk)
@@ -451,6 +455,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relay for #90. His words, verbatim: "A, and leave the second question still open".',
       'Relay for #90. His words, verbatim: "approve; no answer yet from legal but ship it".',
       'He approved #90, so it is no longer blocked on the owner.',
+      # Known gap (wrong wake): a real request relayed to a parked window (#6673, 2026-11-05) counts.
+      'I am putting your parked copy question to the owner. Please post one PR comment on #90. Then reply to me with the comment URL. Keep parked until his answer arrives.',
+      # Negated or past-tense keep-parked wording beside his answer counts.
+      'He approved #90, so you don''t need to keep it parked.',
+      '#90 was parked until his answer; he approved option A.',
       # Not keeping it parked is a release or an answer, not a hold.
       'He approved #90, so you no longer need to keep it parked.',
       'Your park condition has cleared for #90, so there is no need to keep it parked.',
@@ -554,12 +563,6 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#90: no answer yet; his words will follow.',
       # Known gap (missed answer): a hold judges the whole sentence, so another PR's hold vetoes it too.
       'He approved #90; #91 still needs his approval.',
-      # A real request relayed to a parked window (#6673, 2026-11-05): a hold, not his answer.
-      'I am putting your parked copy question to the owner. Please post one PR comment on #90. Then reply to me with the comment URL. Keep parked until his answer arrives.',
-      '#90: keep it parked until the owner''s ruling arrives.',
-      # Each arm on its own.
-      '#90: keep it parked; his answer may change the copy.',
-      '#90: his answer is due; wait until his decision on the copy.',
       # A quoted label or status string is not his words: its hold still vetoes.
       'Status for #90: its PR body still reads "awaiting owner approval".',
       'The lock note for #90 says "his answer is still pending".',
