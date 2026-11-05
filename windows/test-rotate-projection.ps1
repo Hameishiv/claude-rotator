@@ -237,8 +237,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
   Check 'owner message typed after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
-  WriteTranscript (@(1..520 | ForEach-Object { $noise[0] }) + $noise)
-  Check 'transcript scan over its time budget => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0)
+  WriteTranscript $noise
+  Check 'transcript scan over its CPU budget => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0)
+  Check 'transcript scan over its wall-clock backstop => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
   Check 'owner answer as a text block => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'Your questions have been answered: "Ship it?"="Yes". You can now continue with these answers in mind.' }) 4000 $ts0)))
@@ -450,6 +451,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relay for #90. His words, verbatim: "A, and leave the second question still open".',
       'Relay for #90. His words, verbatim: "approve; no answer yet from legal but ship it".',
       'He approved #90, so it is no longer blocked on the owner.',
+      # Not keeping it parked is a release or an answer, not a hold.
+      'He approved #90, so you no longer need to keep it parked.',
+      'Your park condition has cleared for #90, so there is no need to keep it parked.',
+      'Unpark your own lock with --unpark --pr 90; do not keep it parked.',
+      'The blocker you parked on is cleared: you were waiting until the owner''s ruling, which he gave.',
       'He approved #90; it is not blocked on the owner now.',
       ("He approved #90; it isn" + [char]0x2019 + "t blocked on the owner now."),
       # A hold word inside his quote after "he replied/typed/chose" is his answer too.
@@ -551,6 +557,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # A real request relayed to a parked window (#6673, 2026-11-05): a hold, not his answer.
       'I am putting your parked copy question to the owner. Please post one PR comment on #90. Then reply to me with the comment URL. Keep parked until his answer arrives.',
       '#90: keep it parked until the owner''s ruling arrives.',
+      # Each arm on its own.
+      '#90: keep it parked; his answer may change the copy.',
+      '#90: his answer is due; wait until his decision on the copy.',
       # A quoted label or status string is not his words: its hold still vetoes.
       'Status for #90: its PR body still reads "awaiting owner approval".',
       'The lock note for #90 says "his answer is still pending".',
