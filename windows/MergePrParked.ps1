@@ -183,9 +183,12 @@ function Test-RulingText([string]$t, $Pr) {
   # "not an owner question" tells a parked window its question was never his to answer: carry on.
   # "not an owner ruling" alone is NOT a release: orchestrators label any status note or opinion with it.
   $release = '(?i)(?<!\bnot |n[''\u2019]t |\bcannot |\bnever |\bdo not )\b(?:park(?: condition)? (?:has been |is |has )?cleared|blocker you parked on is cleared|unpark your own lock|release the park|(?:not|isn[''\u2019]t) an owner question)\b'
-  # Holds that veto answer WORDING only, never a release sentence ("Your park condition has cleared:
-  # no owner ruling yet, and none is needed" is a release). Another PR's hold is not this one's.
-  $answerHold = '(?i)\b(?:(?:the owner|he) (?:has not|hasn''t|hasn\u2019t) answered(?!\s+(?:on |for )?(?:#|pull/|--pr\s+)(?!' + $n + ')\d)|needs (?:the )?owner|no owner(?:''s)? (?:answer|decision|approval|ruling)(?: (?:on|for) (?:the )?#' + $n + ')? yet|still no owner(?:''s)? (?:answer|decision|approval|ruling))'
+  # Holds that veto answer WORDING only, never a release sentence ("Your park condition has cleared,
+  # though #N still needs his approval at Gate E" is a release).
+  # Known gaps: other hold phrasings ("no owner decision yet", "he hasn't answered") are not held (a
+  # wrong wake until re-park); and these holds judge the whole sentence, so another PR's hold beside
+  # this PR's answer ("He approved #N; #M still needs his approval") vetoes it (a missed answer).
+  $answerHold = '(?i)\b(?:needs (?:the owner|his)|no (?:owner )?answer yet)\b'
   $byRelease = $null -ne $Pr -and $t -notmatch $prRe -and $nums.Count -eq 0 -and $t -match $release
   if ($null -ne $Pr -and ($t -match $prRe -or $byRelease)) {
     $only = @($nums | Where-Object { $_ -ne $prNum }).Count -eq 0
@@ -204,7 +207,7 @@ function Test-RulingText([string]$t, $Pr) {
       if (-not $label) { $prev = $s }
       if ($named -and
           (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $s -notmatch $answerHold -and $s -match "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b")) -and
-          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|needs (?:the owner|his)|unless his answer|to be confirmed by|may revisit|no (?:owner )?answer yet|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
+          $s -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|unless his answer|to be confirmed by|may revisit|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
         return $true
       }
     }

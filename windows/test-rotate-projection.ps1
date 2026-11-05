@@ -437,6 +437,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
       'Unpark your own lock with --unpark --pr 90: no owner ruling yet, and none is needed.',
       'The blocker you parked on is cleared, still no owner decision but none is required.',
+      'Your park condition has cleared, though #90 still needs the owner''s approval at Gate E later.',
+      'Your park condition has cleared, though #90 still needs his approval at Gate E later.',
+      'Unpark your own lock with --unpark --pr 90: no owner answer yet, and none is needed.',
+      # A hold's last word is a whole word: "needs ownership" is not "needs the owner".
+      '#90: his answer is A; this needs ownership review by CI.',
       # Another PR's hold in the same sentence is not this PR's.
       'He approved #90; no owner decision on #91 yet.',
       'He answered #90 (A); he hasn''t answered #91.',
@@ -512,13 +517,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'This isn''t an owner ruling for #90.',
       'This isn''t an owner ruling; CI is red on #90.',
       # The formal ruling phrase mid-sentence is judged with the vetoes, not as a ruling.
-      'No owner ruling on #90 yet.',
       '#90 stays parked until the owner ruling on #90 arrives.',
       'Without an owner ruling on #90, hold.',
-      '#90: no owner decision yet.',
-      '#90: this needs owner approval.',
-      # "He hasn't answered" vetoes answer wording (a release with it still counts, above).
-      '#90: he hasn''t answered; his answer will follow.',
+      '#90: his answer needs his approval first.',
+      '#90: no owner answer yet; his words will follow.',
       'Never release the park.',
       # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
       # with a closer after the "?".
