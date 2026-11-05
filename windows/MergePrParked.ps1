@@ -115,7 +115,11 @@ function Get-MergePrTarget {
 # No `session`, no `parked_at`/`ts`, or the transcript missing/unreadable => no evidence => stays parked.
 function Get-OriginKind($o) { if ($null -ne $o -and $o.PSObject.Properties['kind']) { [string]$o.kind } else { $null } }
 function Get-Prop($o, [string]$n) { if ($null -ne $o -and $o.PSObject.Properties[$n]) { $o.$n } else { $null } }
-function Test-RotatorPing([string]$t) { $t = $t.Trim(); return ($t.StartsWith('Usage reset:') -or $t -ceq 'resume') }
+# The harness can put <system-reminder> blocks in front of the injected ping; they are not part of it.
+function Test-RotatorPing([string]$t) {
+  $t = ($t -replace '^(?s)(\s*<system-reminder>.*?</system-reminder>)+\s*', '').Trim()
+  return ($t.StartsWith('Usage reset:') -or $t -ceq 'resume')
+}
 function Test-CacheKeeperPrompt([string]$t) {
   $t = $t.Trim()
   return ($t -ceq 'Resume' -or $t -ceq 'Try again' -or $t -eq '/compact' -or
@@ -371,7 +375,11 @@ function Test-ParkedLockAnswered {
         elseif (-not $queued -and $l -notmatch '"isCompactSummary"\s*:\s*true' -and
                 $l -match '"type"\s*:\s*"(user|assistant)"' -and
                 $l -notmatch '"type"\s*:\s*"(attachment|file-history-snapshot)"') {
-          $prevAfter = [string]::CompareOrdinal($key, $sinceKey) -ge 0
+          # Same second as the park: the seconds key cannot say which side, so compare in full.
+          $c = [string]::CompareOrdinal($key, $sinceKey)
+          $prevAfter = if ($c -ne 0) { $c -gt 0 } else {
+            try { ($l -match '.*"timestamp"\s*:\s*"([^"]+)"') -and (ConvertTo-UtcStamp $Matches[1]) -ge $since } catch { $false }
+          }
         }
         if ($l -notmatch '"type"\s*:\s*"(user|attachment)"') { continue }
         if ($queued) { if (-not $readAfter) { continue } }

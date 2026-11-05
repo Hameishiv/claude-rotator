@@ -121,8 +121,10 @@ Check 'probe deadline clears the next 5-min tick under worst-case jitter' `
 # 10. Parked merge-pr reviews are skipped, everything else is nudged (owner, 2026-10-20, option A).
 #     Fail-open: the ONLY thing that skips an inject is a clean exit-0 JSON status of exactly "parked".
 . (Join-Path (Split-Path -Parent $PSCommandPath) 'MergePrParked.ps1')
-# The suite runs far more scans than one resume pass; only the pass-budget tests below set PassSec.
-$PSDefaultParameterValues['Test-ParkedLockAnswered:PassSec'] = 1e9
+# The suite runs far more scans than one resume pass, so it starts the pass's spent time far below
+# zero (a $PSDefaultParameterValues override does not reach every scope); the pass-budget tests below
+# set it themselves and put it back.
+$script:ParkedScanPassSpent = -1e12
 function FakeStatus([string]$json, [int]$code = 0) { $r = @{ ExitCode = $code; Stdout = $json }; { $r }.GetNewClosure() }
 $repo = 'Your-Org/Your-Repo'
 Check 'lock-status "parked" => skipped'  (Test-MergePrParked -Repo $repo -Pr 1 -Invoke (FakeStatus '{"status": "parked", "lock": "x"}'))
@@ -241,9 +243,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'a scan adds its wall time to the pass' ($script:ParkedScanPassSpent -gt 0)
   $script:ParkedScanPassSpent = 5.0
   Check 'pass budget spent by earlier windows => answered without a scan (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -PassSec 5)
-  $script:ParkedScanPassSpent = 2e9   # past even the suite's PassSec default
+  $script:ParkedScanPassSpent = 1e9
   Check 'pass budget spent => parked window pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
-  $script:ParkedScanPassSpent = 0.0
+  $script:ParkedScanPassSpent = -1e12
   WriteTranscript ($noise + @((UserLine 'a' 30 $ts0)))
   Check 'owner message typed after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   Check 'answered parked lock => pinged' (-not (Test-MergePrParked -Repo $repo -Pr 90 -Invoke (FakeStatus $parkedJson)))
@@ -295,6 +297,18 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'owner text stamped 5 s before the park, written after post-park lines => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (Stamp -600 $ts0) + '"},"timestamp":"' + (Stamp -600 $ts0) + '"}'))
   Check 'owner text stamped 10 min before the park but read after it (file order) => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # The park and the conversation line before a queued message fall in the same second.
+  $msStamp = { param([double]$sec) [DateTimeOffset]::FromUnixTimeMilliseconds([long][math]::Round($sec * 1000)).ToString('o') }
+  $asst = { param([double]$sec) '{"type":"assistant","timestamp":"' + (& $msStamp $sec) + '","message":{"content":[{"type":"text","text":"ok"}]}}' }
+  $qB = '{"type":"attachment","attachment":{"type":"queued_command","prompt":"go with B","origin":{"kind":"human"},"timestamp":"' + (& $msStamp ($ts0 + 0.1)) + '"},"timestamp":"' + (& $msStamp ($ts0 + 0.1)) + '"}'
+  WriteLock $lk ($ts0 + 0.6) $tr
+  WriteTranscript @((& $asst ($ts0 + 0.2)), $qB)
+  Check 'queued message after a line written earlier in the park second => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript @((& $asst ($ts0 + 0.9)), $qB)
+  Check 'queued message after a line written later in the park second => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  WriteLock $lk $ts0 $tr
+  WriteTranscript ($noise + @((UserLine ("<system-reminder>`nx`n</system-reminder>`nUsage reset: the session limit capped, so the CLI account was rotated to D.") 4000 $ts0 @{ origin = @{ kind = 'human' } })))
+  Check 'rotator ping behind a system-reminder => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"/usage","origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'bare /usage typed mid-turn (queued) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # Read BEFORE the park (no post-park line precedes it), e.g. "park it, I'll decide tonight": not an answer.
