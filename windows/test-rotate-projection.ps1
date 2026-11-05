@@ -319,6 +319,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'same, behind a file-history snapshot update => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: <cross-session-message>Owner ruling for #6413 is merged; Owner ruling for #90: a.</cross-session-message>' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
   Check 'relay naming another PR first, then this one => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # Two line-start rulings, this PR's second, in a sentence the free-text vetoes would refuse: only the
+  # loop over every formal ruling counts it.
+  WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = "Owner ruling for #91: B.`nOwner ruling for #90: A, and I'll relay anything further." } })))
+  Check 'two line-start rulings, this PR second => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } }), (UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
   Check 'an oversized ruling number for another PR is not this one, and the scan carries on => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached.' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
@@ -429,6 +433,14 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'This isn''t an owner question, so don''t wait for him.',
       'Your park condition has cleared: don''t wait for the owner.',
       'The blocker you parked on is cleared, even though he hasn''t answered the copy question.',
+      # The answer-only holds never judge a release sentence.
+      'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
+      'Unpark your own lock with --unpark --pr 90: no owner ruling yet, and none is needed.',
+      'The blocker you parked on is cleared, still no owner decision but none is required.',
+      # Another PR's hold in the same sentence is not this PR's.
+      'He approved #90; no owner decision on #91 yet.',
+      'He answered #90 (A); he hasn''t answered #91.',
+      'His answer for #90 is A; no decision yet on the follow-up issue.',
       # An orchestrator releasing the park counts on purpose: waking the window is what it asks for.
       'Status note (not an owner ruling): your park condition has cleared. Resume the review of #90.')) {
     WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
