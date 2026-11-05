@@ -440,6 +440,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # A hold ends on a whole word: "needs history" is not "needs his", "the owners" not "the owner".
       '#90: his answer is A; this needs history cleanup.',
       '#90: his answer is A; it needs the owners of CI to rerun.',
+      # A negated hold is not a hold.
+      '#90: he approved option A, so it no longer needs his sign-off.',
+      '#90: his answer is A, and neither follow-up needs the owner''s nod.',
+      '#90: the owner approved the copy, so nothing else needs his sign-off.',
+      # A veto phrase inside his own quoted words is his answer, not a hold.
+      'Relay for #90. His words, verbatim: "A, and leave the second question still open".',
+      'Relay for #90. His words, verbatim: "approve; no answer yet from legal but ship it".',
       # These phrasings are not holds at all (the declared wrong-wake gap), so they neither block a
       # release nor veto this PR's answer, whichever PR they are about.
       'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
