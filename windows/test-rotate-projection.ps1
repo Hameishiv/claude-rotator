@@ -447,6 +447,7 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # A veto phrase inside his own quoted words is his answer, not a hold.
       'Relay for #90. His words, verbatim: "A, and leave the second question still open".',
       'Relay for #90. His words, verbatim: "approve; no answer yet from legal but ship it".',
+      'He approved #90, so it is no longer blocked on the owner.',
       # These phrasings are not holds at all (the declared wrong-wake gap), so they neither block a
       # release nor veto this PR's answer, whichever PR they are about.
       'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
@@ -534,6 +535,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       '#90: no answer yet; his words will follow.',
       # Known gap (missed answer): a hold judges the whole sentence, so another PR's hold vetoes it too.
       'He approved #90; #91 still needs his approval.',
+      # A quoted label or status string is not his words: its hold still vetoes.
+      'Status for #90: its PR body still reads "awaiting owner approval".',
+      'The lock note for #90 says "his answer is still pending".',
+      '#90: the tracker row says "his ruling: stays parked until Gate E".',
       'Never release the park.',
       # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
       # with a closer after the "?".

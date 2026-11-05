@@ -192,6 +192,8 @@ function Test-RulingText([string]$t, $Pr) {
   # this PR's answer ("He approved #N; #M still needs his approval") vetoes it (a missed answer).
   # Negated, it is not a hold: "he approved A, so it no longer needs his sign-off".
   $answerHold = '(?i)\b(?:(?<!\b(?:no longer|not|nothing(?: else| more)?|nobody|no one|neither(?: [\w-]+)?) )needs (?:the owner|his)|no (?:owner )?answer yet)\b'
+  $answerWord = "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b"
+  # Known gap (missed answer): a negated "stays parked" / "still open" ("it no longer stays parked") still vetoes.
   $byRelease = $null -ne $Pr -and $t -notmatch $prRe -and $nums.Count -eq 0 -and $t -match $release
   if ($null -ne $Pr -and ($t -match $prRe -or $byRelease)) {
     $only = @($nums | Where-Object { $_ -ne $prNum }).Count -eq 0
@@ -203,16 +205,18 @@ function Test-RulingText([string]$t, $Pr) {
       # The lookback does not apply to a sentence that names a different PR itself.
       # A plain #N / pull/N / --pr N outside his quoted words (not an issue or comment number), or the
       # PR his quoted reply opens with ("His words "91 A""); a PR mentioned later inside his quote is not one.
-      # His quoted words are his: neither a PR mention below nor a veto (his "leave Q2 still open" is not
-      # the orchestrator's hold).
+      # His quoted words are not a PR mention below. They escape the vetoes only when the answer wording
+      # is OUTSIDE the quotes ("His words: "A, leave Q2 still open""); a quoted label or status string
+      # (#N's body says "awaiting owner approval") is not his words and is judged whole.
       $unquoted = $s -replace '"[^"]*"|\u201C[^\u201D]*\u201D', ''
+      $vetoText = if ($unquoted -match $answerWord) { $unquoted } else { $s }
       $otherHere = @(@([regex]::Matches($unquoted, '(?i)' + $notIssue + '(?:#|pull/|--pr\s+)0*(\d{2,})\b')) +
         @([regex]::Matches($s, '(?i)\b' + $lead + '0*(\d{2,})\b' + $unit)) | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -gt 0
       $named = $only -or $s -match $prRe -or ($prev -match $prRe -and -not $otherHere)
       if (-not $label) { $prev = $s }
       if ($named -and
-          (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $unquoted -notmatch $answerHold -and $s -match "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b")) -and
-          $unquoted -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|unless his answer|to be confirmed by|may revisit|has not come|blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
+          (($s -match $release -and $s -notmatch '\?[)"''\u201D\u2019*\]]*\s*$') -or (-not $byRelease -and $vetoText -notmatch $answerHold -and $s -match $answerWord)) -and
+          $vetoText -notmatch "(?i)\b(stays? parked|still open|will relay|I'll relay|will send|I'll send|when he gives|until he answers|once he answers|(?:until|once|when) he rules|when he answers|after he answers|once he replies|when he replies|the moment he answers|without his answer|(?<!\bno (?:further |more )?|\bnot |n['\u2019]t |\bno longer )(?:a?wait(?:s|ing)? (?:on |for )?(?:the )?owner|(?:approval|decision|answer):? (?:is )?(?:still )?(?:pending|needed))|put(?:ting)? .{0,40}\bto the owner|put (?:this|it) to him|if (?:the owner|he) (?:has )?already answered|relay (?:it|this|his \w+)|send me his|carry it to him|if he says|has he answered|unless his answer|to be confirmed by|may revisit|has not come|(?<!\bno longer |\bnot |n['\u2019]t )blocked on (?:the owner|his)|forward(?:ing)? (?:his|the owner)|pass (?:it|them) on|due (?:tonight|tomorrow|later))\b") {
         return $true
       }
     }
