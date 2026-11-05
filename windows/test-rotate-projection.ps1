@@ -433,16 +433,18 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'This isn''t an owner question, so don''t wait for him.',
       'Your park condition has cleared: don''t wait for the owner.',
       'The blocker you parked on is cleared, even though he hasn''t answered the copy question.',
-      # The answer-only holds never judge a release sentence.
-      'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
-      'Unpark your own lock with --unpark --pr 90: no owner ruling yet, and none is needed.',
-      'The blocker you parked on is cleared, still no owner decision but none is required.',
+      # The answer-only holds ($answerHold) never judge a release sentence.
       'Your park condition has cleared, though #90 still needs the owner''s approval at Gate E later.',
       'Your park condition has cleared, though #90 still needs his approval at Gate E later.',
       'Unpark your own lock with --unpark --pr 90: no owner answer yet, and none is needed.',
-      # A hold's last word is a whole word: "needs ownership" is not "needs the owner".
-      '#90: his answer is A; this needs ownership review by CI.',
-      # Another PR's hold in the same sentence is not this PR's.
+      # A hold ends on a whole word: "needs history" is not "needs his", "the owners" not "the owner".
+      '#90: his answer is A; this needs history cleanup.',
+      '#90: his answer is A; it needs the owners of CI to rerun.',
+      # These phrasings are not holds at all (the declared wrong-wake gap), so they neither block a
+      # release nor veto this PR's answer, whichever PR they are about.
+      'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',
+      'Unpark your own lock with --unpark --pr 90: no owner ruling yet, and none is needed.',
+      'The blocker you parked on is cleared, still no owner decision but none is required.',
       'He approved #90; no owner decision on #91 yet.',
       'He answered #90 (A); he hasn''t answered #91.',
       'His answer for #90 is A; no decision yet on the follow-up issue.',
@@ -521,6 +523,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Without an owner ruling on #90, hold.',
       '#90: his answer needs his approval first.',
       '#90: no owner answer yet; his words will follow.',
+      '#90: his answer needs the owner''s sign-off first.',
+      '#90: no answer yet; his words will follow.',
+      # Known gap (missed answer): a hold judges the whole sentence, so another PR's hold vetoes it too.
+      'He approved #90; #91 still needs his approval.',
       'Never release the park.',
       # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
       # with a closer after the "?".

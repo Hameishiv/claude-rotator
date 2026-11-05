@@ -185,8 +185,10 @@ function Test-RulingText([string]$t, $Pr) {
   $release = '(?i)(?<!\bnot |n[''\u2019]t |\bcannot |\bnever |\bdo not )\b(?:park(?: condition)? (?:has been |is |has )?cleared|blocker you parked on is cleared|unpark your own lock|release the park|(?:not|isn[''\u2019]t) an owner question)\b'
   # Holds that veto answer WORDING only, never a release sentence ("Your park condition has cleared,
   # though #N still needs his approval at Gate E" is a release).
-  # Known gaps: other hold phrasings ("no owner decision yet", "he hasn't answered") are not held (a
-  # wrong wake until re-park); and these holds judge the whole sentence, so another PR's hold beside
+  # Known gaps: other hold phrasings ("no owner decision yet", "he hasn't answered") are not held, and
+  # a release sentence is judged without these holds, so another PR's release beside this PR's hold
+  # ("Unpark ... --pr 91; #N still needs his approval") or a conditional one counts (a wrong wake
+  # until re-park); and these holds judge the whole sentence, so another PR's hold beside
   # this PR's answer ("He approved #N; #M still needs his approval") vetoes it (a missed answer).
   $answerHold = '(?i)\b(?:needs (?:the owner|his)|no (?:owner )?answer yet)\b'
   $byRelease = $null -ne $Pr -and $t -notmatch $prRe -and $nums.Count -eq 0 -and $t -match $release
