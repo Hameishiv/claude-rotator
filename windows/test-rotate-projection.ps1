@@ -422,6 +422,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       # Curly quotes, as the desktop app types them.
       ("Relayed about #91's sibling too. His words: " + [char]0x201C + '90 copy: A' + [char]0x201D + '.'),
       ("Re #91: merged.`nFor #90:`n`nHis words: A."),
+      # Issue numbers in a list, and a quantity opening his quoted reply, are not other PRs.
+      ('Relay for #90.' + "`n" + 'His words: "approve" (also closes issues #5079 and #5080).'),
+      'Relay for #90. His words: "48 hours is fine".',
       # An orchestrator releasing the park counts on purpose: waking the window is what it asks for.
       'Status note (not an owner ruling): your park condition has cleared. Resume the review of #90.')) {
     WriteTranscript ($noise + @((UserLine "Another Claude session sent a message: <cross-session-message>$body</cross-session-message>" 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
@@ -483,6 +486,18 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       ("#90 status:`n**His answer: pending.**"),
       # A prompt quoting the reply format is not his reply.
       'Re #91. To answer, he types "90 A" or "90 B". His answer comes through me.',
+      # "not an owner ruling" is a label on any status note or opinion, not a release.
+      'What I sent earlier is not an owner ruling; he has not answered yet.',
+      'My view (not an owner ruling): option A looks right, but wait for him.',
+      'Status note (not an owner ruling): main went red at 14:00. Nothing for you to do yet.',
+      'Status for #90 (not an owner ruling): CI is red on main, so hold until I tell you.',
+      # Release wording negated with a curly apostrophe, "cannot" or "never", made conditional, or asked
+      # with a closer after the "?".
+      ('Don' + [char]0x2019 + 't release the park yet.'),
+      'You cannot unpark your own lock yet.',
+      'Never release the park until he rules on #90.',
+      'Release the park only once he rules.',
+      'Ask him (has the park cleared?)',
       # The sender's name holding the ruling phrase is not a ruling.
       '<cross-session-message from="x" from-name="Owner ruling for #90 relay">Status: CI green on #91.',
       # The sender's name mentioning the PR is not a mention.
@@ -490,6 +505,8 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
     WriteTranscript ($noise + @((UserLine 'x' 4000 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = $body } })))
     Check "orchestrator park acknowledgement => still parked: $body" (-not (Test-ParkedLockAnswered -LockPath $lk))
   }
+  # The closing wrapper tag is stripped too, so a question in the last sentence stays a question.
+  Check 'wrapped release question => not a release' ((Test-RulingText '<cross-session-message from="x">Quick check: is your park condition cleared?</cross-session-message>' 90) -ne $true)
   WriteTranscript ($noise + @((UserLine "<command-message>merge-pr</command-message>`n<command-name>/merge-pr</command-name>`n<command-args>90 resume</command-args>" 4000 $ts0 @{ origin = @{ kind = 'human' } })))
   Check 'owner typed /merge-pr 90 resume => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine '<ci-monitor-event>"Auto-fix pushed"</ci-monitor-event>' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
