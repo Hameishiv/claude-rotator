@@ -448,6 +448,11 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Relay for #90. His words, verbatim: "A, and leave the second question still open".',
       'Relay for #90. His words, verbatim: "approve; no answer yet from legal but ship it".',
       'He approved #90, so it is no longer blocked on the owner.',
+      'He approved #90; it is not blocked on the owner now.',
+      ("He approved #90; it isn" + [char]0x2019 + "t blocked on the owner now."),
+      # A hold word inside his quote after "he replied/typed/chose" is his answer too.
+      'Relay for #90. He replied "A, and leave the second question still open".',
+      'Relay for #90. He chose "B, keep Q2 still open for now".',
       # These phrasings are not holds at all (the declared wrong-wake gap), so they neither block a
       # release nor veto this PR's answer, whichever PR they are about.
       'Your park condition has cleared, though #90 still needs owner approval at Gate E later.',

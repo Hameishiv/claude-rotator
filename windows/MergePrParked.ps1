@@ -193,7 +193,9 @@ function Test-RulingText([string]$t, $Pr) {
   # Negated, it is not a hold: "he approved A, so it no longer needs his sign-off".
   $answerHold = '(?i)\b(?:(?<!\b(?:no longer|not|nothing(?: else| more)?|nobody|no one|neither(?: [\w-]+)?) )needs (?:the owner|his)|no (?:owner )?answer yet)\b'
   $answerWord = "(?i)\b((?<!\bnot an |n['\u2019]t an |\bwithout (?:an? |the )?)owner(?:'s)? (?:answer|answers|approval|ruling|decision)|the owner (?:answered|said|ok'?ed|approved|picked|chose|decided)|he (?:answered|approved|ok'?ed)|he (?:chose|picked)(?= (?:option [A-D]\b|(?-i:[A-D])\b|[\x22\u201C]))|(?:the owner|he) (?:typed|replied)(?=\W{0,5}[\x22\u201C])|his (?:answer|answers|words|ruling|approval|decision))\b"
-  # Known gap (missed answer): a negated "stays parked" / "still open" ("it no longer stays parked") still vetoes.
+  # Known gaps (missed answer): a negated "stays parked" / "still open" ("it no longer stays parked") still
+  # vetoes; and a quote spanning sentences is split before its quotes are matched, so a hold word in an
+  # early sentence of his multi-sentence quote (His words: "Q2 is still open. Approve A.") vetoes it.
   $byRelease = $null -ne $Pr -and $t -notmatch $prRe -and $nums.Count -eq 0 -and $t -match $release
   if ($null -ne $Pr -and ($t -match $prRe -or $byRelease)) {
     $only = @($nums | Where-Object { $_ -ne $prNum }).Count -eq 0
@@ -205,10 +207,12 @@ function Test-RulingText([string]$t, $Pr) {
       # The lookback does not apply to a sentence that names a different PR itself.
       # A plain #N / pull/N / --pr N outside his quoted words (not an issue or comment number), or the
       # PR his quoted reply opens with ("His words "91 A""); a PR mentioned later inside his quote is not one.
-      # His quoted words are not a PR mention below. They escape the vetoes only when the answer wording
-      # is OUTSIDE the quotes ("His words: "A, leave Q2 still open""); a quoted label or status string
-      # (#N's body says "awaiting owner approval") is not his words and is judged whole.
-      $unquoted = $s -replace '"[^"]*"|\u201C[^\u201D]*\u201D', ''
+      # Quoted text is not a PR mention below. It also escapes the vetoes whenever answer wording appears
+      # outside the quotes ("His words: "A, leave Q2 still open"", He replied "..."). So a quoted label
+      # with no answer wording beside it (#N's body says "awaiting owner approval") is judged whole, but
+      # one beside unquoted answer wording is not (a wrong wake). The quote marks are kept, empty, because
+      # the "he replied/typed/chose" answer wording needs the opening mark after it.
+      $unquoted = $s -replace '"[^"]*"', '""' -replace '\u201C[^\u201D]*\u201D', '""'
       $vetoText = if ($unquoted -match $answerWord) { $unquoted } else { $s }
       $otherHere = @(@([regex]::Matches($unquoted, '(?i)' + $notIssue + '(?:#|pull/|--pr\s+)0*(\d{2,})\b')) +
         @([regex]::Matches($s, '(?i)\b' + $lead + '0*(\d{2,})\b' + $unit)) | Where-Object { $_.Groups[1].Value.TrimStart('0') -ne $prNum }).Count -gt 0
