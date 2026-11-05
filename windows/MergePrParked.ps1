@@ -207,14 +207,18 @@ function Test-RulingText([string]$t, $Pr) {
       # The lookback does not apply to a sentence that names a different PR itself.
       # A plain #N / pull/N / --pr N outside his quoted words (not an issue or comment number), or the
       # PR his quoted reply opens with ("His words "91 A""); a PR mentioned later inside his quote is not one.
-      # Quoted text is not a PR mention below (except that reply-opening number). It also escapes the
-      # vetoes whenever answer wording appears
-      # outside the quotes ("His words: "A, leave Q2 still open"", He replied "..."). So a quoted label
-      # with no answer wording beside it (#N's body says "awaiting owner approval") is judged whole, but
-      # one beside unquoted answer wording is not (a wrong wake). Each quoted span, straight or curly, is
+      # Another PR inside his quote is not a mention for $otherHere (except that reply-opening number,
+      # which is recognised only as a bare number: "#91 is fine" opening his quote is a known wrong wake).
+      # This PR's own #N inside a quote does name it ($prRe reads the whole sentence).
+      # Quoted text also escapes the vetoes whenever answer wording appears outside the quotes
+      # ("His words: "A, leave Q2 still open"", He replied "..."). So a quoted label with no answer
+      # wording beside it (#N's body says "awaiting owner approval") is judged whole, but one beside
+      # unquoted answer wording is not (a wrong wake). Each straight or curly double-quoted span is
       # replaced by an empty straight pair, because the "he replied/typed/chose" answer wording needs a
-      # mark after it; one left-to-right pass, so a stray straight mark inside a curly quote cannot pair
-      # across it. Known gap (missed answer): a mixed pair (curly open, straight close) is not blanked.
+      # mark after it; one left-to-right pass, so a stray straight mark inside a curly quote does not
+      # pair across it unless an unpaired straight mark comes earlier in the sentence.
+      # Known gaps (missed answer): a mixed pair (curly one end, straight the other) and single-quoted,
+      # backtick or blockquoted words are not blanked, so a hold word inside them still vetoes.
       $unquoted = $s -replace '"[^"]*"|\u201C[^\u201D]*\u201D', '""'
       $vetoText = if ($unquoted -match $answerWord) { $unquoted } else { $s }
       $otherHere = @(@([regex]::Matches($unquoted, '(?i)' + $notIssue + '(?:#|pull/|--pr\s+)0*(\d{2,})\b')) +
