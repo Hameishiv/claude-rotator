@@ -180,7 +180,8 @@ function Test-RulingText([string]$t, $Pr) {
   $lead = '(?:(?:his|these|with the|(?:the )?owner''s) words|his answer|answered|said|chose|(?:the owner|he) (?:typed|replied))(?:,? verbatim)?\W{0,5}["\u201C]'
   # A number his quoted reply opens with is a quantity, not a PR, when a unit follows ("48 hours is fine").
   $unit = '(?!\s*(?:%|(?:hours?|hrs?|days?|minutes?|mins?|seconds?|secs?|weeks?|months?|years?|GB|MB|KB)\b))'
-  $prRe = '(?i)(?:#|pull/|--pr\s+)' + $n + '|\b' + $lead + $n + $unit +
+  # An issue or comment reference is not this PR either, as for $numRe below.
+  $prRe = '(?i)' + $notIssue + '(?:#|pull/|--pr\s+)' + $n + '|\b' + $lead + $n + $unit +
     '(?![^"\u201C\u201D\r\n]*["\u201D]\s*,?\s*or\s+["\u201C])'
   # Every PR the message names, in the same forms; "no other PR" and "no PR at all" are judged on these.
   # Two digits or more: "#1" and an option list's "1 B, 2 replace" are not PRs.

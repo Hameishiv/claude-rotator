@@ -536,6 +536,9 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
       'Give me #90''s question so I can put it to the owner. If the owner has already answered it in your window, say so and give his words.',
       # Real broadcast shapes: another PR's answer, a request, a hold (#4904, #6468, #6585, #5986).
       '#91 has the owner''s approval ("A"). Once it''s on main, re-run #90''s halacha-check.',
+      # Another PR's answer beside this number as an issue or comment reference (Codex, c1e3b1b).
+      'The owner answered PR #91; details are recorded on issue #90.',
+      'He approved #91, see comment #90 for the thread.',
       'Here is the #90 question. Please carry it to him; his answer must be given in session.',
       'Do NOT merge #90 until I tell you. The fix is waiting on the owner''s approval.',
       'Brief for the #90 review. Cherry-pick the fix and push only when no Test run is going. Owner ruling D (undo) is #92 and stays out.',
