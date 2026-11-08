@@ -228,7 +228,11 @@ and takes the app down together with the CLI. Detected from the app's live accou
 same ground truth `claude-app-rotator.ps1` uses, and for its reason: that script's `.active`
 pointer drifts whenever you log in or out inside the app by hand, so it is only the fallback.
 The exclusion lives in `Rank-Accounts`, so `--best` honours it too; an explicit
-`--switch <label>` still overrides, deliberately.
+`--switch <label>` still overrides, deliberately. No label is reserved by letter. Profiles kept
+under `~/.claude-cli-accounts/.inactive` are old identities, not candidates, because that
+directory is hidden. A subscription-disabled 403 (`oauth_org_not_allowed`) is a different event:
+the active seat is refused and the watcher rotates. A timeout is not that refusal and does not
+mark every seat disabled.
 
 **After a CAP rotation only, running sessions are pinged** that their quota is back
 (`claude-resume-sessions.ps1 -OwnWindowOnly`, which injects with `WriteConsoleInput` and steals no
@@ -320,9 +324,12 @@ live; the cache is the answer.
    `<label>\usage-cache[-fable].json` files a probe writes, tagged `src=proxy`. The watcher uses a
    proxy reading younger than 2 min instead of probing, and the Fable ladder picks it up as a free
    baseline. This closes the blind spells behind the 09-20/09-22/09-23 caps.
-2. **A quota 429 retries on the next seat.** When a window is `rejected`, the proxy runs
-   `--check-rotate --now --source proxy` and retries the request once on whatever seat that picked.
-   A per-minute burst 429 is passed through untouched; Claude Code retries those itself.
+2. **A quota 429, or an explicit subscription-disabled 403, retries on the next seat.** When a
+   window is `rejected`, or the body is an `oauth_org_not_allowed` / "subscription access disabled"
+   403, the proxy runs `--check-rotate --now --source proxy` and retries the request once on
+   whatever seat that picked. A per-minute burst 429 is passed through untouched. A timeout or any
+   other status is not an access refusal and does not mark seats disabled. No seat letter is
+   reserved; the only seat kept out of automatic targets is the desktop app's current identity.
 
 The proxy never picks an account. It always sends the **active** seat's token, re-read on every
 request, so a running session follows a rotation without restarting. Only requests carrying one of
@@ -345,7 +352,7 @@ So close/rotate/reopen stays for the app.
 | | |
 |---|---|
 | Task | `Claude rotate proxy`: at logon, re-launched every minute. A running instance makes the relaunch a no-op, so a dead proxy is back within a minute. |
-| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` |
+| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` — `ok` is false while the active seat's subscription-disabled cooldown is in force. A live process with a refused seat is not healthy. |
 | Log | `~\.claude-cli-accounts\.proxy-log.txt` (rolls at 1 MB) |
 | Opt out | `$env:CLAUDE_ROTATOR_PROXY = "0"` for the `claude` function; `MERGE_PR_ROTATE_PROXY=0` for review windows |
 | Tests | `claude-rotate-proxy.py --self-test`; `claude-rotate-proxy-test.py` (fake upstream, sandbox seats: quota 429 → rotate → retry, a running session follows, foreign token untouched, no-target returns the original 429) |
@@ -362,10 +369,12 @@ errors, so this usually shows up as a pause, not a failure.
   2 min apart. Checks are serialised by a mutex
   (`Global\claude-rotator-check`), so the task, the hook and the proxy cannot rotate twice off one
   reading.
-- **StopFailure hook.** `C:\Dev\Rotators\stopfailure-rotate.py` is registered in
-  `~\.claude\settings.json`. When any session stops on `rate_limit` / `billing_error`, it launches
-  `--check-rotate --now` hidden and returns at once. This is the backstop for sessions that don't
-  go through the proxy.
+- **StopFailure hook.** `stopfailure-rotate.py` (next to `claude-cli-account.ps1`) is registered in
+  `~\.claude\settings.json`. When any session stops on `rate_limit` / `billing_error`, or on a
+  subscription-disabled 403 (`oauth_org_not_allowed`), it launches `--check-rotate --now` and
+  returns at once. If the hook event has no `error` field, it reads only the transcript's newest
+  API-error token. A normal stop does not fire. This is the backstop for sessions that don't go
+  through the proxy.
 - **Rate cap.** The watcher refuses a 4th rotation inside 10 min (`$RotateCapCount`/
   `$RotateCapWindow`), logs `RATE CAP`, and returns 3. Three rotations that fast mean every seat is
   failing.
