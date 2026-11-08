@@ -3,6 +3,20 @@
 # profile so `claude-rotator`, `claude-account`, claude1/2/3, etc. behave
 # identically in either shell (no drift). Edit here, not in the profiles.
 
+# This file lives in the Rotators directory on both machines. $PSScriptRoot is that
+# directory when the profile dot-sources it, so the same file runs on the laptop and the box.
+$RotatorDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\Dev\Rotators' }
+$ProfileHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { 'C:\Users\User' }
+function Test-AccessCooldownActive([string]$Label) {
+    if (-not $Label) { return $false }
+    $f = Join-Path (Join-Path (Join-Path $ProfileHome '.claude-cli-accounts') $Label) 'access-disabled.json'
+    if (-not (Test-Path -LiteralPath $f)) { return $false }
+    try {
+        $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+        return ([int64]$j.until -gt [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+    } catch { return $false }
+}
+
 # ---- Claude CLI ----------------------------------------------------------
 # The CLI's Anthropic account comes from the Claude desktop-app bridge, NOT from
 # CLAUDE_CONFIG_DIR. Launching claude.exe through a child `pwsh -File` lost the
@@ -16,17 +30,31 @@ function claude {
     # These get inherited when the terminal was itself spawned under a Claude session.
     foreach ($v in 'CLAUDECODE','CLAUDE_CODE_CHILD_SESSION','CLAUDE_CODE_ENTRYPOINT','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_SSE_PORT','CLAUDE_CODE_USE_POWERSHELL_TOOL','CLAUDE_CODE_DISABLE_AUTO_MEMORY','AI_AGENT') { Remove-Item "Env:\$v" -ErrorAction SilentlyContinue }
     # Inject the active CLI account's long-lived setup-token (managed by claude-cli-account).
-    $__act = "C:\Users\User\.claude-cli-accounts\.active"; $__prev = $env:CLAUDE_CODE_OAUTH_TOKEN
+    # No seat letter is reserved. If the active seat is already known subscription-disabled,
+    # move off it before this process's first request. A healthy seat, including A, is used as-is.
+    $__root = Join-Path $ProfileHome '.claude-cli-accounts'
+    $__act = Join-Path $__root '.active'; $__prev = $env:CLAUDE_CODE_OAUTH_TOKEN
     if (Test-Path $__act) {
-        $__tf = "C:\Users\User\.claude-cli-accounts\$((Get-Content $__act -Raw).Trim())\token.txt"
-        if (Test-Path $__tf) { $env:CLAUDE_CODE_OAUTH_TOKEN = (Get-Content $__tf -Raw).Trim() }
+        $__label = (Get-Content $__act -Raw).Trim()
+        if ($__label -and (Test-AccessCooldownActive $__label)) {
+            & pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-cli-account.ps1') --ensure-cli-seat
+            $__label = if (Test-Path $__act) { (Get-Content $__act -Raw).Trim() } else { '' }
+            if ($__label -and (Test-AccessCooldownActive $__label)) {
+                Write-Host "Active seat '$__label' is subscription-disabled and no other eligible seat is available. Not starting Claude Code." -ForegroundColor Red
+                return
+            }
+        }
+        if ($__label) {
+            $__tf = Join-Path (Join-Path $__root $__label) 'token.txt'
+            if (Test-Path $__tf) { $env:CLAUDE_CODE_OAUTH_TOKEN = (Get-Content $__tf -Raw).Trim() }
+        }
     }
     # Route through the local rotate proxy (claude-rotate-proxy.py) when it is up: it follows
-    # rotations mid-session and retries a quota 429 on the next seat. Checked at launch, so a
-    # stopped proxy means a direct session, never a broken one. CLAUDE_ROTATOR_PROXY=0 opts out.
+    # rotations mid-session and retries a quota 429 or a subscription-disabled 403 on the next seat.
+    # Checked at launch, so a stopped proxy means a direct session, never a broken one. CLAUDE_ROTATOR_PROXY=0 opts out.
     $__prevBase = $env:ANTHROPIC_BASE_URL
     if ($env:CLAUDE_ROTATOR_PROXY -ne '0' -and (Test-RotateProxy)) { $env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:18484' }
-    try { & "C:\Users\User\.local\bin\claude.exe" @args }
+    try { & (Join-Path (Join-Path (Join-Path $ProfileHome '.local') 'bin') 'claude.exe') @args }
     finally {
         if ($null -eq $__prev) { Remove-Item Env:\CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue } else { $env:CLAUDE_CODE_OAUTH_TOKEN = $__prev }
         if ($null -eq $__prevBase) { Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue } else { $env:ANTHROPIC_BASE_URL = $__prevBase }
@@ -55,7 +83,7 @@ function claude-both {
 
 # Switch the Claude DESKTOP APP account (swaps %APPDATA%\Claude login state). Does NOT
 # touch the CLI — the CLI has its own login in ~/.claude/.credentials.json. App closed.
-function claude-account { pwsh -NoProfile -File "C:\Dev\Rotators\claude-app-rotator.ps1" @args }
+function claude-account { pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-app-rotator.ps1') @args }
 
 # Kill background CLI processes (NOT the desktop app). Safe to run any time.
 # Spares the desktop app in BOTH install flavours -- WindowsApps\Claude (MSIX) and
@@ -78,7 +106,7 @@ function claude-kill {
 
 # Switch the Claude CODE CLI (terminal + VS Code) between Anthropic accounts via long-lived
 # setup-tokens (CLAUDE_CODE_OAUTH_TOKEN). Commands: --status / --switch <l> / --rotate / --usage.
-function claude-rotator    { pwsh -NoProfile -File "C:\Dev\Rotators\claude-cli-account.ps1" @args }
+function claude-rotator    { pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-cli-account.ps1') @args }
 function claude-cli-account { claude-rotator @args }   # old name kept as an alias
 
 # Session(5h) + weekly(7d) usage for every CLI account (server-authoritative, read live from
@@ -88,10 +116,10 @@ function claude-usage      { claude-rotator --usage @args }   # add --refresh to
 # Backfill the desktop APP's session history with CLI / other-account sessions the app never
 # recorded. The app lists only sessions it has a pointer record for; this creates the missing
 # pointers (idempotent). Run after CLI work, then refresh the app's sessions panel.
-function claude-sync-history { pwsh -NoProfile -File "C:\Users\User\.grok\bin\sync-app-history.ps1" @args }
+function claude-sync-history { pwsh -NoProfile -File (Join-Path (Join-Path (Join-Path $ProfileHome '.grok') 'bin') 'sync-app-history.ps1') @args }
 
 # After rotating seats: resume every running Claude session on the new account. VS Code
 # sessions are exited + relaunched (they're pinned to the seat they started on) and prompted
 # 'resume'; own-window CLI sessions (merge-pr etc.) are just prompted 'resume'. -DryRun to preview.
-function claude-resume { pwsh -NoProfile -File "C:\Dev\Rotators\claude-resume-sessions.ps1" @args }
+function claude-resume { pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-resume-sessions.ps1') @args }
 
