@@ -519,7 +519,14 @@ def prov_spec(pid, seats):
 def latest_of(hist, pid):
     """The newest record carrying provider `pid`, a recorded one in preference to a rebuilt (b) one."""
     rows = [h for h in hist if seats_of(h, pid)]
-    return next((h for h in reversed(rows) if not h.get("b")), rows[-1] if rows else {"t": 0})
+    rec = next((h for h in reversed(rows) if not h.get("b")), rows[-1] if rows else {"t": 0})
+    seats = dict(seats_of(rec, pid))
+    for label, s in seats.items():          # a failed read keeps showing the last good one, with the failure as its note
+        if s.get("ok") is False:
+            good = next((x for x in (seats_of(h, pid).get(label) for h in reversed(rows)) if x and x.get("ok") is not False and x.get("ts")), None)
+            if good:
+                seats[label] = dict(good, note=s.get("note"))
+    return dict(rec, **{"s" if pid == "claude" else pid: seats}) if seats else rec
 
 
 def build_limit(hist, latest, pid, wid, label, now, dflt):
@@ -1157,6 +1164,9 @@ def selftest():
     def rec(t, **seats):
         return {"t": t, "s": {k: {"w": v[0], "wr": v[1]} for k, v in seats.items()}}
 
+    g = [{"t": T, "grok": {"grok": {"ts": T, "w": 0.2}}}, {"t": T + 300, "grok": {"grok": {"ok": False, "note": "expired"}}}]
+    lg = latest_of(g, "grok")["grok"]["grok"]
+    assert lg["w"] == 0.2 and lg["note"] == "expired" and g[1]["grok"]["grok"].get("w") is None, lg   # last good kept, history untouched
     h = [rec(T, A=(0.10, R), B=(0.5, R)), rec(T + 3600, A=(0.20, R), B=(0.5, R))]
     assert abs(burn(h, "w", 3, T + 3600) - 10) < 1e-9
     h = [rec(T, A=(0.90, R)), rec(T + 3600, A=(0.05, R + WEEK))]          # weekly reset in between
