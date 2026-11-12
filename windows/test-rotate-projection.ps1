@@ -329,6 +329,18 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'rotator ping behind a system-reminder => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"/usage","origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'bare /usage typed mid-turn (queued) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # Housekeeping commands queued mid-turn use the same exclusion list as the typed ones; a real queued message still answers.
+  function QueuedHuman([string]$prompt) { WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":' + (ConvertTo-Json $prompt -Compress) + ',"origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}')) }
+  foreach ($q in '/seats', '/seats 3', '/compact', '/ck-board', '/cache-keeper:keepwarm') {
+    QueuedHuman $q
+    Check "queued '$q' after the park => still parked" (-not (Test-ParkedLockAnswered -LockPath $lk))
+  }
+  QueuedHuman '/usage now'
+  Check "queued '/usage now' (a status command with arguments) => answered" (Test-ParkedLockAnswered -LockPath $lk)
+  QueuedHuman '/merge-pr 90 resume'
+  Check "queued '/merge-pr 90 resume' => answered" (Test-ParkedLockAnswered -LockPath $lk)
+  QueuedHuman 'go with B'
+  Check 'queued plain-text owner message after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # Read BEFORE the park (no post-park line precedes it), e.g. "park it, I'll decide tonight": not an answer.
   WriteTranscript (@('{"type":"attachment","attachment":{"type":"queued_command","prompt":"park it, I will decide tonight","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp -30 $ts0) + '"}') + $noise)
   Check 'owner text queued and read before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
@@ -404,7 +416,7 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine "<command-message>usage</command-message>`n<command-name>/usage</command-name>`n<command-args></command-args>" 4000 $ts0)))
   Check 'a slash command he typed to check quota (CLI: no origin) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The desktop app stamps cache-keeper's immediate commands human (seen: /keepwarm while a question waited).
-  foreach ($c in 'keepwarm', 'board', 'cache-keeper:keepwarm') {
+  foreach ($c in 'keepwarm', 'board', 'cache-keeper:keepwarm', 'compact', 'seats') {
     WriteTranscript ($noise + @((UserLine "<command-message>$c</command-message>`n<command-name>/$c</command-name>`n<command-args></command-args>" 4000 $ts0 @{ origin = @{ kind = 'human' } })))
     Check "cache-keeper housekeeping command /$c stamped human => still parked" (-not (Test-ParkedLockAnswered -LockPath $lk))
   }
