@@ -50,6 +50,7 @@ select{background:var(--panel);color:var(--ink);padding:9px 12px}
 .chips button em{font-style:normal;color:var(--muted);margin-left:6px}
 .chips button[aria-pressed="true"]{background:var(--btn);color:var(--ink)}
 .chips button[aria-pressed="true"] em{color:var(--muted)}
+.chip{align-self:center;color:var(--ink2);background:var(--btn);border-radius:999px;padding:4px 12px;font-size:13px}
 .hd{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;align-items:flex-end;margin-top:8px}
 .big{font-size:52px;font-weight:650;line-height:1;font-variant-numeric:tabular-nums}
 .of{font-size:18px;margin-left:8px}
@@ -69,6 +70,7 @@ th{color:var(--muted);font-weight:500}
 td small{display:block;color:var(--muted);font-size:12px}
 li small{color:var(--muted);font-size:12px;margin-left:6px}
 td.w{color:var(--warn)}
+td.bk{white-space:normal;min-width:260px}
 ul.nl{margin:12px 0 0;padding-left:20px;color:var(--muted)}
 @media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}}
 </style>
@@ -203,22 +205,22 @@ function accounts(p) {
   const wl = {}, ids = [];
   for (const a of p.accounts) for (const w of a.windows) if (!wl[w.id]) { wl[w.id] = w.label; ids.push(w.id); }
   ids.sort((a, b) => 'swfm'.indexOf(a) - 'swfm'.indexOf(b));
-  const anyNote = p.accounts.some(a => a.note);
+  const anyNote = p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null;
   const rows = p.accounts.map(a => {
     const cells = ids.map(id => {
       const w = a.windows.find(x => x.id === id);
       if (!w) return '<td>–</td>';
       return `<td>${w.used == null ? '–' : Math.round(w.used * 100) + '%'}${w.reset ? `<small>resets ${esc(fmtWT(w.reset))}</small>` : ''}</td>`;
     }).join('');
-    return `<tr><td>${nm(a)}</td>${cells}<td>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="w">${esc(a.note)}</td>` : ''}</tr>`;
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}</td>` : ''}<td>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="w">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');
-  return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
 }
 
 function panel(p, W) {
-  const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0];
+  const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0], bk = quotaBankedTotal(p);
   let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span></div>`;
-  h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(l.now)}%</em></button>`).join('')}</div></div>`;
+  h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(l.now)}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
   if (p.note) h += `<p class="note">${esc(p.note)}</p>`;
   if (lim) {
     const b = lim.burn ? lim.burn[ui.win] : null;

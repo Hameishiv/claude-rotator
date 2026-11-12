@@ -21,4 +21,21 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
 }
 // A seat's name for a table or list: always its letter, the email under it (muted, smaller) when emails are shown. `esc` escapes HTML.
 function quotaSeat(a, emails, esc) { return esc(a.label) + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : ''); }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat };
+// "17d 23h", "5h 12m", "12m": time left until an expiry.
+function quotaIn(sec) {
+  const m = Math.max(0, Math.floor(sec / 60)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
+  return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m % 60 + 'm' : m + 'm';
+}
+// Banked resets (Codex), as the Codex rotator words them: the count, then a muted line per credit; a count above the list says so.
+function quotaBankedCell(a, now, fmt, esc) {
+  if (a.banked == null) return '–';
+  const l = a.bankedList || [], miss = a.banked - l.length;
+  return a.banked + l.map(c => '<small>' + esc(c.title) + ' · expires ' + esc(fmt(c.expiresAt)) + ' (in ' + quotaIn(c.expiresAt - now) + ')</small>').join('') +
+    (miss > 0 ? '<small>Expiry not supplied for ' + miss + '</small>' : '');
+}
+// Sum of banked resets over a provider's seats, or null when none of them reports any.
+function quotaBankedTotal(p) {
+  const s = p.accounts.filter(a => a.banked != null);
+  return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
+}
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaIn, quotaBankedCell, quotaBankedTotal };

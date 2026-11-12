@@ -117,7 +117,9 @@ def read_claude():
 
 
 def parse_codex(c):
-    """One rate-limits cache -> (seat dict or None, email). 10080 min is the weekly window, 300 the 5-hour."""
+    """One rate-limits cache -> (seat dict or None, email). 10080 min is the weekly window, 300 the 5-hour.
+    Banked resets, when the cache carries them (the statusband caches and rate-limits-survey.json share the shape):
+    availableCount -> seat["banked"], credits [{title, expiresAt}] -> seat["bankedList"] (only those with an expiry; the count can be larger)."""
     seat = {"ts": int((_f(c.get("fetchedAt")) or 0) / 1000)}
     for part in ("primary", "secondary"):
         p = c.get(part)
@@ -127,6 +129,13 @@ def parse_codex(c):
         used, reset = _f(p.get("usedPercent")), _f(p.get("resetsAt"))
         if wid and used is not None:
             seat[wid], seat[wid + "r"], seat[wid + "p"] = used / 100, reset, 604800 if wid == "w" else 18000
+    if len(seat) > 1:
+        n = _f(c.get("availableCount"))
+        if n is not None and n >= 0:
+            seat["banked"] = int(n)
+            cr = c.get("credits")
+            seat["bankedList"] = sorted(({"title": str(x.get("title") or "Reset"), "expiresAt": int(e)} for x in (cr if isinstance(cr, list) else [])
+                                         if isinstance(x, dict) and (e := _f(x.get("expiresAt"))) is not None), key=lambda x: x["expiresAt"])
     return (seat if len(seat) > 1 else None), c.get("accountEmail")
 
 
@@ -555,6 +564,10 @@ def build_provider(hist, pid, emails, now, extra):
             a["windows"].append({"id": wid, "label": wlabel, "used": u,
                                  "reset": None if s.get(wid + "r") is None else int(_roll(s[wid + "r"], period, now))})
         a["ok"] = a["ok"] and bool(a["windows"])
+        bs = next((x for x in (seats_of(h, pid).get(label) or {} for h in reversed(hist)) if x.get("banked") is not None), {})   # imported log records carry no credits
+        if bs:                              # a credit past its expiry is gone, even if the cache is older than that
+            live = [x for x in bs.get("bankedList") or [] if x["expiresAt"] > now]
+            a["banked"], a["bankedList"] = max(bs["banked"] - (len(bs.get("bankedList") or []) - len(live)), len(live)), live
         accounts.append(a)
     dflt = {w: p for w, _, p in wins}
     limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
@@ -1143,6 +1156,19 @@ def selftest():
     assert util_at({"w": 0.7, "wr": R}, "w", R + 1) == 0.0                 # stale reading past its reset
     assert remaining(rec(T, A=(0.25, R), B=(1.0, R)), "w") == (75.0, 2)
 
+    # banked resets: a cache with credits (sorted, those without an expiry left out), one without, a count above the list, an expired credit
+    c = {"fetchedAt": 1793592327005, "primary": {"usedPercent": 13, "windowDurationMins": 10080, "resetsAt": 1794124925}, "secondary": None,
+         "availableCount": 3, "credits": [{"title": "Full reset", "expiresAt": 1796166737}, {"title": "Full reset (Weekly + 5 hr)", "expiresAt": 1794009823}, {"title": "no expiry"}, "junk"]}
+    seat, _ = parse_codex(c)
+    assert seat["banked"] == 3 and seat["bankedList"] == [{"title": "Full reset (Weekly + 5 hr)", "expiresAt": 1794009823}, {"title": "Full reset", "expiresAt": 1796166737}], seat
+    assert "banked" not in parse_codex(dict(c, availableCount=None))[0] and "bankedList" not in parse_codex({k: v for k, v in c.items() if k != "availableCount"})[0]
+    assert parse_codex(dict(c, availableCount=0, credits=None))[0]["bankedList"] == [] and parse_codex({"availableCount": 2, "credits": []})[0] is None
+    bh = [{"t": 1794500000, "codex": {"A": dict(seat, ts=1794500000), "B": {"w": 0.1, "wr": 1794700000, "wp": WEEK, "ts": 1794500000}}},
+          {"t": 1794500300, "codex": {"A": {"w": 0.2, "wr": 1794124925 + WEEK, "wp": WEEK, "ts": 1794500300}, "B": {"w": 0.1, "wr": 1794700000, "wp": WEEK, "ts": 1794500300}}}]       # newer, imported from a log: no credits
+    ba = build(bh, 1794510000, {}, False, {})["providers"][0]["accounts"]
+    assert ba[0]["banked"] == 2 and ba[0]["bankedList"] == [{"title": "Full reset", "expiresAt": 1796166737}], ba[0]    # the expired credit drops out of count and list
+    assert "banked" not in ba[1]
+    assert build([{"t": 1, "codex": {"A": dict(seat, banked=5, bankedList=seat["bankedList"][1:])}}], 1794510000, {}, False, {})["providers"][0]["accounts"][0]["banked"] == 5      # count above the list kept
     # codex cache: weekly only, then weekly + 5 hour, then nothing usable
     c = {"fetchedAt": 1793592327005, "accountEmail": "x@y", "primary": {"usedPercent": 13, "windowDurationMins": 10080, "resetsAt": 1794124925}, "secondary": None}
     seat, email = parse_codex(c)
