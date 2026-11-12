@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -79,21 +80,26 @@ def test_spawn_gate():
     env = dict(os.environ, CLAUDE_ROTATOR_TEST_SINK=sink)
     script = os.path.join(HERE, "stopfailure-rotate.py")
 
-    def run(event):
+    def run(event, expect):
         if os.path.exists(sink):
             os.remove(sink)
         subprocess.run([sys.executable, "-I", script], input=json.dumps(event).encode(),
                        env=env, check=False, timeout=15)
+        # The hook starts a detached child that writes the sink after the hook has returned, so
+        # wait for it (a loaded machine takes seconds); when none is expected, give a stray one time to land.
+        deadline = time.time() + (15 if expect else 2)
+        while time.time() < deadline and not os.path.exists(sink):
+            time.sleep(0.05)
         return os.path.exists(sink)
 
-    check("hook spawns on oauth_org_not_allowed", run({"error": "oauth_org_not_allowed"}))
-    check("hook does not spawn on a normal stop", not run({"stop_hook_active": False}))
+    check("hook spawns on oauth_org_not_allowed", run({"error": "oauth_org_not_allowed"}, True))
+    check("hook does not spawn on a normal stop", not run({"stop_hook_active": False}, False))
     path = os.path.join(tempfile.mkdtemp(prefix="sf-tr-"), "t.jsonl")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(json.dumps({"type": "user", "message": {"content": "oauth_org_not_allowed"}}) + "\n")
         handle.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
                                   "message": {"content": [{"type": "text", "text": "limit"}]}}) + "\n")
-    check("hook spawns from the transcript when error is absent", run({"transcript_path": path}))
+    check("hook spawns from the transcript when error is absent", run({"transcript_path": path}, True))
 
 
 def test_seat_dirs_not_letters():
