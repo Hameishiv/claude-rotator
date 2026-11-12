@@ -416,7 +416,7 @@ function Test-MergePrParked {
   param(
     [Parameter(Mandatory)][string]$Repo,
     [Parameter(Mandatory)][int]$Pr,
-    [int]$TimeoutSec = 10,
+    [int]$TimeoutSec = 30,   # the real launcher takes ~3 s; 10 s raced it on a loaded machine and failed open
     [string]$Launcher,
     [string]$Python,
     # Test seam: scriptblock taking (@arguments) and returning @{ ExitCode; Stdout }.

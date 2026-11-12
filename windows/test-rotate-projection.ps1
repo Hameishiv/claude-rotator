@@ -694,6 +694,10 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'hung launcher => pinged, within the timeout cap' ((-not $r) -and $sw.Elapsed.TotalSeconds -lt 8) "took $([int]$sw.Elapsed.TotalSeconds)s"
 } finally { Remove-Item -LiteralPath $sd -Recurse -Force -ErrorAction SilentlyContinue }
 
+# 10f. production calls Test-MergePrParked with no -TimeoutSec (claude-resume-sessions.ps1), so the default is the production cap.
+Check 'Test-MergePrParked default -TimeoutSec is 30 s (10 s raced the launcher and failed open)' `
+  ((Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'MergePrParked.ps1') -Raw) -match '\[int\]\$TimeoutSec = 30,') 'the launcher call needs headroom under load'
+
 # 11. the summary counts skipped separately from pinged/failed (wiring present in both scripts).
 $resSrc = Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'claude-resume-sessions.ps1') -Raw
 Check 'resume script emits the line Ping-ActiveSessions counts' ($resSrc -match 'Skipped parked review \$\(\$mp\.Repo\)#') 'wording drifted between the two scripts'
