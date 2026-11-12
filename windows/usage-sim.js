@@ -19,4 +19,6 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
   }
   return { pts, empty };
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject };
+// A seat's name for a table or list: always its letter, the email under it (muted, smaller) when emails are shown. `esc` escapes HTML.
+function quotaSeat(a, emails, esc) { return esc(a.label) + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : ''); }
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat };

@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject } = require('./usage-sim.js');
+const { quotaProject, quotaSeat } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -34,5 +34,13 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 {
   const r = quotaProject([{ used: 0, reset: null, period: 0 }], 100, now, 7200);
   assert.strictEqual(r.empty, now + 3600);
+}
+// seat name: the letter always, the email under it only when shown and known
+{
+  const esc = s => String(s).replace(/</g, '&lt;');
+  assert.strictEqual(quotaSeat({ label: 'A', email: 'a@x.org' }, false, esc), 'A');
+  assert.strictEqual(quotaSeat({ label: 'A', email: 'a@x.org' }, true, esc), 'A<small>a@x.org</small>');
+  assert.strictEqual(quotaSeat({ label: 'B', email: null }, true, esc), 'B');
+  assert.strictEqual(quotaSeat({ label: '<', email: '<e>' }, true, esc), '&lt;<small>&lt;e></small>');
 }
 console.log('usage-sim tests passed');
