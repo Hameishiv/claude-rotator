@@ -569,8 +569,10 @@ def build_provider(hist, pid, emails, now, extra):
             if u is None:
                 continue
             period = s.get(wid + "p") or dp
-            a["windows"].append({"id": wid, "label": wlabel, "used": u,
-                                 "reset": None if s.get(wid + "r") is None else int(_roll(s[wid + "r"], period, now))})
+            w = {"id": wid, "label": wlabel, "used": u, "reset": None if s.get(wid + "r") is None else int(_roll(s[wid + "r"], period, now))}
+            if s.get(wid + "r") and now >= s[wid + "r"] > (s.get("ts") or 0):
+                w["assumed"] = True         # the reset passed and nothing has been read since: 0 is rolled forward, not measured
+            a["windows"].append(w)
         a["ok"] = a["ok"] and bool(a["windows"])
         bs = next((x for x in (seats_of(h, pid).get(label) or {} for h in reversed(hist)) if x.get("banked") is not None), {})   # imported log records carry no credits
         if bs:                              # a credit past its expiry is gone, even if the cache is older than that
@@ -1471,7 +1473,9 @@ def selftest():
     assert gk["name"] == "xAI" and gk["note"] == PROVIDER_NOTE["grok"] and "note" not in cl
     # a window whose reset passed counts as 0 used and its reset rolls forward
     stale = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L - 10, "ts": L - 99}}}], L, {}, False)["providers"][0]
-    assert stale["limits"][0]["now"] == 100.0 and stale["accounts"][0]["windows"][0] == {"id": "w", "label": "Weekly", "used": 0.0, "reset": L - 10 + WEEK}
+    assert stale["limits"][0]["now"] == 100.0 and stale["accounts"][0]["windows"][0] == {"id": "w", "label": "Weekly", "used": 0.0, "reset": L - 10 + WEEK, "assumed": True}
+    fresh = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L + 10, "ts": L - 99}, "B": {"w": 0.3, "wr": L - 10, "ts": L - 5}}}], L, {}, False)["providers"][0]["accounts"]
+    assert "assumed" not in fresh[0]["windows"][0] and "assumed" not in fresh[1]["windows"][0]      # reset still ahead / read after the reset: a real value
     assert stale["limits"][0]["burn"] == {"1": None, "3": None, "6": None, "24": None} and stale["limits"][0]["drain"]["1"] == []
     assert build([], L)["providers"] == [] and build([], L)["first"] is None
     # the page keeps both placeholders from being re-scanned and escapes </
