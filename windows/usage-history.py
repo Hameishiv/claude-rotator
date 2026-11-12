@@ -1,0 +1,1462 @@
+"""usage-history - record AI-seat usage over time and serve a local quota dashboard.
+
+Each sample reads Claude seats' usage-cache[-fable].json (written by claude-rotate-proxy.py and the
+rotator's own probes - sampling never probes a Claude seat), the Codex per-account rate-limit caches,
+and, rarely, Grok (every 15 min, Cursor's Grok usage is the same xAI quota) over HTTPS. One line per sample goes to
+.usage-history.jsonl and usage-dashboard.html is rewritten with the data inlined, so the page opens
+from file:// with no server. The 'Claude usage dashboard' scheduled task runs --serve.
+
+  usage-history.py             sample + render
+  usage-history.py --render    render only
+  usage-history.py --backfill [--days N]   rebuild past Claude history from .rotate-log.txt (default 7 days)
+  usage-history.py --serve [--port 8787]   local app: page, /api/data, POST /api/refresh, sampler thread
+  usage-history.py --make-icons            write the app icons into <state dir>\\usage-app\\
+  usage-history.py --selftest              run the checks
+
+QUOTA_STATE_DIR, when set, redirects everything this script WRITES to that folder (seat caches are still
+read from their real places).
+
+shortcut: a seat that is used elsewhere (the desktop app, the VM) only updates when something
+probes it (a rotation, /seats, --status), so its line moves in steps; add probing only if the
+steps hide real burn.
+"""
+import bisect
+import glob
+import json
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".claude-cli-accounts")
+STATE = os.environ.get("QUOTA_STATE_DIR") or ROOT
+HIST = os.path.join(STATE, ".usage-history.jsonl")
+EMAILS = os.path.join(STATE, ".usage-emails.json")
+PCACHE = os.path.join(STATE, ".usage-providers.json")     # grok/gemini last result, provider emails and notes
+APPLOG = os.path.join(STATE, ".usage-app-log.txt")
+OUT = os.path.join(STATE, "usage-dashboard.html")
+ICONS = os.path.join(STATE, "usage-app")
+HERE = os.path.dirname(os.path.abspath(__file__))
+KEEP_DAYS = 35
+WEEK = 7 * 86400
+WINDOWS = (1, 3, 6, 24)     # hours of history a burn rate is measured over
+BUCKET = 900                # hist is thinned to one point per 15 minutes
+DRIFT_EVERY = 6 * 3600      # rotator-sync --check runs at most this often
+PY = ["py", "-3"]
+BUCKET5 = 300               # imported history keeps one point per 5 minutes
+GROK_EVERY, SAMPLE_EVERY = 900, 300
+
+# provider id -> (name, [(window id, window label, default period s)], [(limit window id, limit label)])
+PROVIDERS = {
+    "claude": ("Claude", [("s", "5-hour", 18000), ("w", "Weekly", WEEK), ("f", "Fable weekly", WEEK)],
+               [("w", "All models"), ("f", "Fable")]),
+    "codex": ("Codex", [("s", "5-hour", 18000), ("w", "Weekly", WEEK)], [("w", "Weekly")]),
+    "grok": ("Grok / Cursor", [("w", "Weekly", WEEK)], [("w", "Weekly credits")]),
+    "gemini": ("Gemini (Antigravity)", None, None),      # its windows are whatever the language server reports
+}
+PROVIDER_NOTE = {"grok": "Cursor's Grok usage counts against this same xAI quota."}
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def say(*a):
+    if sys.stdout:          # pythonw has no stdout
+        print(*a)
+
+
+def seats_of(rec, pid):
+    """One record's per-account windows for a provider (Claude lives under the v1 key "s")."""
+    return rec.get("s" if pid == "claude" else pid) or {}
+
+
+# ---------------------------------------------------------------- readers
+
+def read_seat(label):
+    """Latest usage for one seat from its cache files, or None when it has no good reading."""
+    rows = []
+    for suf in ("", "-fable"):
+        try:
+            with open(os.path.join(ROOT, label, "usage-cache%s.json" % suf), encoding="utf-8-sig") as fh:
+                c = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        d = c.get("data") or {}
+        if d.get("ok") and d.get("access", "ok") == "ok":
+            rows.append((c.get("ts") or 0, d))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[0])
+    ts, d = rows[-1]  # the newest read wins for the windows both files carry
+    fab = next((r[1] for r in reversed(rows) if _f(r[1].get("oi7_util")) is not None), {})
+    return {"ts": ts, "s": _f(d.get("s5_util")), "sr": _f(d.get("s5_reset")),
+            "w": _f(d.get("w7_util")), "wr": _f(d.get("w7_reset")),
+            "f": _f(fab.get("oi7_util")), "fr": _f(fab.get("oi7_reset"))}
+
+
+def read_claude():
+    seats = {}
+    for name in sorted(os.listdir(ROOT)):
+        d = os.path.join(ROOT, name)
+        if name[:1] in "._" or not os.path.isdir(d) or not glob.glob(os.path.join(d, "usage-cache*.json")):
+            continue    # only a folder that holds a usage cache is a seat
+        seats[name] = read_seat(name) or {"ok": False, "note": "no usable reading"}
+    return seats
+
+
+def parse_codex(c):
+    """One rate-limits cache -> (seat dict or None, email). 10080 min is the weekly window, 300 the 5-hour."""
+    seat = {"ts": int((_f(c.get("fetchedAt")) or 0) / 1000)}
+    for part in ("primary", "secondary"):
+        p = c.get(part)
+        if not isinstance(p, dict):
+            continue
+        wid = {10080: "w", 300: "s"}.get(int(_f(p.get("windowDurationMins")) or 0))
+        used, reset = _f(p.get("usedPercent")), _f(p.get("resetsAt"))
+        if wid and used is not None:
+            seat[wid], seat[wid + "r"], seat[wid + "p"] = used / 100, reset, 604800 if wid == "w" else 18000
+    return (seat if len(seat) > 1 else None), c.get("accountEmail")
+
+
+def _codex_caches(d):
+    for fn in glob.glob(os.path.join(d, "cache-statusband-codex", "rate-limits*.json")):
+        try:
+            with open(fn, encoding="utf-8-sig") as fh:
+                c = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(c, dict):
+            yield c
+
+
+def _newer(c, old):
+    return old is None or (_f(c.get("fetchedAt")) or 0) > (_f(old.get("fetchedAt")) or 0)
+
+
+def read_codex(cdir=None, sink=None):
+    """({label: seat}, {label: email}) from the local caches only; never runs node or the network.
+    `sink`, when given, collects (label, cache) for every cache that got a label, the older ones too.
+    A home with no auth.json and no reading from any source reads "no saved login on this PC".
+    Each home's own caches, plus the active login's (<cdir>/cache-statusband-codex), whose label is X of its
+    identityKey "seat:X" when X is a home, else the home whose caches carry the same accountEmail. Newest fetchedAt wins."""
+    cdir = cdir or os.path.join(HOME, ".codex")
+    best, by_email = {}, {}
+    login = {}
+    for d in sorted(glob.glob(os.path.join(cdir, "homes", "*"))):
+        label = os.path.basename(d)
+        login[label] = os.path.isfile(os.path.join(d, "auth.json"))    # existence only: auth.json is never read
+        best[label] = None
+        for c in _codex_caches(d):
+            if sink is not None:
+                sink.append((label, c))
+            if c.get("accountEmail"):
+                by_email.setdefault(c["accountEmail"], label)
+            if _newer(c, best[label]):
+                best[label] = c
+    for c in _codex_caches(cdir):
+        m = re.fullmatch(r"seat:(.+)", str(c.get("identityKey") or ""))
+        label = m.group(1) if m and m.group(1) in best else by_email.get(c.get("accountEmail"))
+        if label and sink is not None:
+            sink.append((label, c))
+        if label and _newer(c, best[label]):
+            best[label] = c
+    seats, emails = {}, {}
+    for label, c in best.items():
+        seat, email = parse_codex(c) if c else (None, None)
+        seats[label] = seat or {"ok": False, "note": "no usage cached yet" if login[label] else "no saved login on this PC"}
+        if email:
+            emails[label] = email
+    return seats, emails
+
+
+def parse_grok(j):
+    """Billing response -> seat dict, or None when the shape is not the expected one."""
+    from datetime import datetime
+    try:
+        cfg = j["config"]
+        cp = cfg["currentPeriod"]
+        start, end = (datetime.fromisoformat(cp[k]).timestamp() for k in ("start", "end"))
+        used = float(cfg["creditUsagePercent"]) / 100
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"w": used, "wr": int(end), "wp": int(end - start)}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def http_json(req):
+    """(status, parsed json or None). Redirects are not followed; the caller's headers never leave the host."""
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, str(type(e).__name__)
+
+
+def _bad(code, what):
+    return "HTTP %s" % code if code else "network error (%s)" % what
+
+
+def fetch_grok(now):
+    """-> (seat, email) from one live GET. Never logs or returns the key."""
+    try:
+        with open(os.path.join(HOME, ".grok", "auth.json"), encoding="utf-8-sig") as fh:
+            a = next(iter(json.load(fh).values()))
+        key, email = a["key"], a.get("email")
+    except (OSError, ValueError, KeyError, StopIteration, AttributeError):
+        return {"ok": False, "note": "not signed in to Grok: run grok to sign in"}, None
+    req = urllib.request.Request("https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+                                 headers={"Authorization": "Bearer " + key})
+    code, j = http_json(req)
+    if code in (401, 403):
+        return {"ok": False, "note": "sign-in expired: run grok to sign in again"}, email
+    seat = parse_grok(j) if code == 200 else None
+    if not seat:
+        return {"ok": False, "note": "Grok usage unavailable (%s)" % (_bad(code, j) if code != 200 else "unexpected response")}, email
+    seat["ts"] = int(now)
+    return seat, email
+
+
+LS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+LS_BODY = json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en"}}).encode()
+LS_PS = ("$ErrorActionPreference='SilentlyContinue';"
+         "$r=@(foreach($p in @(Get-CimInstance Win32_Process -Filter \"Name='language_server_windows_x64.exe'\")){"
+         "[pscustomobject]@{ProcessId=$p.ProcessId;CommandLine=$p.CommandLine;"
+         "Ports=@(Get-NetTCPConnection -OwningProcess $p.ProcessId -State Listen | ForEach-Object{$_.LocalPort})}});"
+         "ConvertTo-Json -InputObject $r -Compress -Depth 3")
+
+
+def parse_ls_procs(text):
+    """The probe's JSON -> [(csrf token, [listening ports])]; a process with no token or no port is dropped. Tokens are never logged."""
+    try:
+        j = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for p in [j] if isinstance(j, dict) else j if isinstance(j, list) else []:
+        m = re.search(r"--csrf_token[=\s]+(\S+)", str(p.get("CommandLine") or "")) if isinstance(p, dict) else None
+        ports = p.get("Ports") if isinstance(p, dict) else None
+        ports = [x for x in (ports if isinstance(ports, list) else [ports]) if isinstance(x, int)]
+        if m and ports:
+            out.append((m.group(1).strip("\"'"), ports))
+    return out
+
+
+def ls_probe():
+    """The one PowerShell call: Antigravity's language-server processes with their csrf token and listening ports."""
+    if os.name != "nt":
+        return []
+    import base64
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                            base64.b64encode(LS_PS.encode("utf-16-le")).decode()],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30, creationflags=0x08000000)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return parse_ls_procs(r.stdout.decode("utf-8", "replace"))
+
+
+def query_ls(port, csrf):
+    """GetUserStatus on 127.0.0.1:<port>, https (self-signed, so unverified: loopback only) then http; the parsed 200 body or None."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+    for scheme in ("https", "http"):
+        req = urllib.request.Request("%s://127.0.0.1:%d%s" % (scheme, int(port), LS_PATH), data=LS_BODY, method="POST",
+                                     headers={"Content-Type": "application/json", "Connect-Protocol-Version": "1",
+                                              "X-Codeium-Csrf-Token": csrf})
+        try:
+            with opener.open(req, timeout=5) as r:
+                if r.status == 200:
+                    return json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    return None
+
+
+def gemini_slug(label):
+    """A short stable window id for a limit label; the crc suffix keeps two long labels with one prefix apart."""
+    return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:20] + "-%04x" % (zlib.crc32(label.encode("utf-8")) & 0xffff)
+
+
+def parse_gemini(j, now):
+    """GetUserStatus -> seat dict with one window per (remainingFraction, resetTime) group, or None when the shape is not the expected one.
+    Window id = slug of the label (the distinct model families in the group); seat["n"] maps id -> label."""
+    from datetime import datetime
+    try:
+        cfgs = j["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"]
+        groups = {}
+        for c in cfgs:
+            q = c.get("quotaInfo") if isinstance(c, dict) else None
+            if not isinstance(q, dict) or not q.get("resetTime"):
+                continue                # no quota on this model
+            frac = round(float(q.get("remainingFraction") or 0), 4)     # proto3 JSON leaves a zero out
+            reset = int(datetime.fromisoformat(q["resetTime"]).timestamp())
+            fam = re.sub(r"\s*\((?:Low|Medium|High|XHigh)\)\s*$", "", str(c["label"])).strip()
+            fams = groups.setdefault((frac, reset), [])
+            if fam not in fams:
+                fams.append(fam)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if not groups:
+        return None
+    seat = {"ts": int(now), "n": {}}
+    for (frac, reset), fams in groups.items():
+        label = " + ".join(fams)
+        wid = gemini_slug(label)
+        if wid in seat["n"] and seat[wid] >= 1 - frac:
+            continue                    # two groups with one label: keep the more used
+        seat["n"][wid], seat[wid], seat[wid + "r"], seat[wid + "p"] = label, round(1 - frac, 4), reset, 18000
+    try:
+        plan = j["userStatus"]["planStatus"]["planInfo"]["planName"]
+        if isinstance(plan, str) and plan:
+            seat["plan"] = plan
+    except (KeyError, TypeError):
+        pass
+    return seat
+
+
+def read_gemini(now, probe=ls_probe, query=query_ls):
+    """The seat from the running Antigravity language server, or None when none is running or no port answers."""
+    for csrf, ports in probe():
+        for port in ports:
+            seat = parse_gemini(query(port, csrf), now)
+            if seat:
+                return seat
+    return None
+
+
+def gemini_email():
+    try:
+        with open(os.path.join(HOME, ".gemini", "google_accounts.json"), encoding="utf-8-sig") as fh:
+            e = json.load(fh).get("active")
+        return e if isinstance(e, str) and e else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def gemini_note(last):
+    return "Antigravity isn't running" + ("; last reading " + time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "")
+
+
+def load_pcache():
+    try:
+        with open(PCACHE, encoding="utf-8") as fh:
+            c = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(c, dict):
+        return {}
+    c.pop("cursor", None)                                   # Cursor folded into Grok
+    (c.get("emails") or {}).pop("cursor", None)
+    return c
+
+
+def save_pcache(c):
+    tmp = PCACHE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(c, fh, separators=(",", ":"))
+    os.replace(tmp, PCACHE)
+
+
+def read_live(pid, label, fetch, every, now, force, cache):
+    """A rate-limited live provider: reuse the last result inside `every` seconds unless forced."""
+    c = cache.get(pid) or {}
+    if not force and c.get("at") and now - c["at"] < every:
+        return c.get("seat")
+    seat, email = fetch(now)
+    cache[pid] = {"at": int(now), "seat": seat}
+    if email:
+        cache.setdefault("emails", {}).setdefault(pid, {})[label] = email
+    return seat
+
+
+def sample(now, force=False):
+    rec = {"t": int(now), "s": read_claude()}
+    cache = load_pcache()
+    codex, cemails = read_codex()
+    if codex:
+        rec["codex"] = codex
+        cache.setdefault("emails", {})["codex"] = cemails
+    seat = read_live("grok", "grok", fetch_grok, GROK_EVERY, now, force, cache)
+    if seat:
+        rec["grok"] = {"grok": seat}
+    seat = read_gemini(now)             # local call: read on every sample
+    if seat:
+        cache["gemini_last"], cache.setdefault("notes", {})["gemini"] = int(now), {}
+        rec["gemini"] = {"antigravity": seat}
+        if seat.get("plan"):
+            cache.setdefault("pnote", {})["gemini"] = "Plan: " + seat["plan"]
+    else:                               # not running: the last recorded reading stays on show, with a note
+        note = gemini_note(cache.get("gemini_last"))
+        cache.setdefault("notes", {})["gemini"] = {"antigravity": note}
+        if not cache.get("gemini_last"):
+            rec["gemini"] = {"antigravity": {"ok": False, "note": note}}
+    email = gemini_email()
+    if email:
+        cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
+    save_pcache(cache)
+    return rec
+
+
+# ---------------------------------------------------------------- history maths
+
+def util_at(seat, key, t):
+    """Fraction used at time t; 0 once the window's reset has passed, even if the reading is older."""
+    u = seat.get(key)
+    if u is None:
+        return None
+    r = seat.get(key + "r")
+    if r and t >= r:
+        return 0.0
+    return min(max(u, 0.0), 1.0)
+
+
+def remaining(rec, key, t=None, pid="claude"):
+    """(pooled % left, seat count) for one history record; each seat counts as 100%."""
+    t = rec["t"] if t is None else t
+    us = [u for u in (util_at(s, key, t) for s in seats_of(rec, pid).values()) if u is not None]
+    return sum(1 - u for u in us) * 100, len(us)
+
+
+def _step(sa_all, sb_all, key):
+    """Fraction of one account used between two consecutive records, summed over accounts."""
+    total = 0.0
+    for label, sb in sb_all.items():
+        sa = sa_all.get(label)
+        if not sa or sa.get(key) is None or sb.get(key) is None:
+            continue
+        ra, rb = sa.get(key + "r") or 0, sb.get(key + "r") or 0
+        if rb > ra + 3600:          # the window reset between the two readings
+            total += sb[key]
+        else:
+            total += max(0.0, sb[key] - sa[key])
+    return total
+
+
+def prep(hist, key, pid="claude"):
+    """Times and a running total of use, so a burn rate over any span is two lookups."""
+    ts, cum = [h["t"] for h in hist], [0.0]
+    for a, b in zip(hist, hist[1:]):
+        cum.append(cum[-1] + _step(seats_of(a, pid), seats_of(b, pid), key))
+    return ts, cum
+
+
+def burn_p(p, hours, now):
+    """% of one account used per hour over the last `hours` up to `now`, or None with under 15 min of history."""
+    ts, cum = p
+    hi = bisect.bisect_right(ts, now) - 1
+    lo = bisect.bisect_left(ts, now - hours * 3600)
+    if lo > 0:
+        lo -= 1                      # the record just before the span anchors its start
+    if hi - lo < 1:
+        return None
+    span = (ts[hi] - ts[lo]) / 3600
+    if span < 0.25:
+        return None
+    return (cum[hi] - cum[lo]) * 100 / span
+
+
+def burn(hist, key, hours, now, pid="claude"):
+    return burn_p(prep(hist, key, pid), hours, now)
+
+
+def _roll(r, period, now):
+    """The next reset after `now`, moving a stale one forward by whole periods."""
+    if r and period and r <= now:
+        r += period * math.ceil((now - r + 1) / period)
+    return r
+
+
+def _num(x, nd=1):
+    return None if x is None else round(x, nd)
+
+
+def prov_spec(pid, seats):
+    """(name, [(window id, label, default period s)], [(limit window id, limit label)]); Gemini's windows are whatever its seat reports."""
+    name, wins, lims = PROVIDERS[pid]
+    if wins is None:
+        wins = [(w, lbl, 18000) for s in seats.values() for w, lbl in (s.get("n") or {}).items()]
+        lims = [(w, lbl) for w, lbl, _ in wins]
+    return name, wins, lims
+
+
+def latest_of(hist, pid):
+    """The newest record carrying provider `pid`, a recorded one in preference to a rebuilt (b) one."""
+    rows = [h for h in hist if seats_of(h, pid)]
+    return next((h for h in reversed(rows) if not h.get("b")), rows[-1] if rows else {"t": 0})
+
+
+def build_limit(hist, latest, pid, wid, label, now, dflt):
+    seats = [s for s in seats_of(latest, pid).values() if util_at(s, wid, now) is not None]
+    if not seats:
+        return None
+    rem, n = remaining(latest, wid, now, pid)
+    last, rows = {}, []
+    for h in hist:                   # last record in each 15-minute bucket that has this window
+        r, cnt = remaining(h, wid, pid=pid)
+        if cnt:
+            rows.append(h)
+            last[h["t"] // BUCKET] = [h["t"], round(r, 1), 1 if h.get("b") else 0]
+    p = prep(rows, wid, pid)         # burn only over records that carry this window, so a young provider reads null
+    first = rows[0]["t"]
+    lim = {"id": wid, "label": label, "cap": n * 100, "now": round(rem, 1), "hist": [last[k] for k in sorted(last)],
+           "burn": {}, "drain": {}, "seats": []}
+    for w in WINDOWS:
+        lim["burn"][str(w)] = _num(burn_p(p, w, now))
+        pts = []
+        for t in range(int(now), int(first) - 1, -3600):
+            b = burn_p(p, w, t)
+            if b is not None:
+                pts.append([t, round(b, 1)])
+        lim["drain"][str(w)] = pts[::-1]
+    for s in seats:
+        period = s.get(wid + "p") or dflt[wid]
+        r = s.get(wid + "r")
+        lim["seats"].append({"used": util_at(s, wid, now), "reset": None if r is None else int(_roll(r, period, now)),
+                             "period": int(period)})
+    return lim
+
+
+def build_provider(hist, pid, emails, now, extra):
+    latest = latest_of(hist, pid)
+    seats = seats_of(latest, pid)
+    if not seats:
+        return None
+    name, wins, lims = prov_spec(pid, seats)
+    accounts = []
+    for label in sorted(seats):
+        s = seats[label]
+        a = {"label": label, "email": (emails.get(pid) or {}).get(label), "ok": s.get("ok") is not False,
+             "note": s.get("note") or ((extra.get("notes") or {}).get(pid) or {}).get(label) or "", "readAt": int(s["ts"]) if s.get("ts") else None, "windows": []}
+        for wid, wlabel, dp in wins:
+            u = util_at(s, wid, now)
+            if u is None:
+                continue
+            period = s.get(wid + "p") or dp
+            a["windows"].append({"id": wid, "label": wlabel, "used": u,
+                                 "reset": None if s.get(wid + "r") is None else int(_roll(s[wid + "r"], period, now))})
+        a["ok"] = a["ok"] and bool(a["windows"])
+        accounts.append(a)
+    dflt = {w: p for w, _, p in wins}
+    limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
+    out = {"id": pid, "name": name, "total": len(accounts), "loaded": sum(a["ok"] for a in accounts),
+           "accounts": accounts, "limits": limits}
+    note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
+    if note:
+        out["note"] = note
+    return out
+
+
+def build(hist, now, emails=None, app=False, extra=None):
+    extra = extra or {}
+    provs = [p for p in (build_provider(hist, pid, emails or {}, now, extra) for pid in PROVIDERS) if p]
+    out = {"now": int(now), "app": app, "first": hist[0]["t"] if hist else None, "providers": provs}
+    d = extra.get("drift")
+    if d and d.get("differing"):
+        out["drift"] = {"n": len(d["differing"]), "names": [str(x) for x in d["differing"]]}
+    return out
+
+
+def seat_emails(root, fallback):
+    """{label: email} for Claude: each seat folder's email.txt (trimmed), else the backfill map's. token.txt is never read."""
+    out = dict(fallback)
+    for d in glob.glob(os.path.join(root, "*", "email.txt")):
+        try:
+            with open(d, encoding="utf-8-sig") as fh:
+                e = fh.read().strip()
+        except OSError:
+            continue
+        if e:
+            out[os.path.basename(os.path.dirname(d))] = e
+    return out
+
+
+def load_emails():
+    """{provider: {label: email}}: Claude's from the seat folders (backfill map as fallback), the others from their own readers."""
+    out = dict(load_pcache().get("emails") or {})
+    try:
+        with open(EMAILS, encoding="utf-8") as fh:
+            fb = json.load(fh)
+    except (OSError, ValueError):
+        fb = {}
+    out["claude"] = seat_emails(ROOT, fb if isinstance(fb, dict) else {})
+    return out
+
+
+# ---------------------------------------------------------------- storage and rendering
+
+def load_extra():
+    """What build() takes besides history and emails: account/provider notes from the provider cache, the rotator drift file."""
+    c, drift = load_pcache(), None
+    try:
+        with open(os.path.join(ROOT, ".rotator-drift.json"), encoding="utf-8-sig") as fh:
+            drift = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None}
+
+
+def load():
+    """The history, oldest first (imported points are appended out of order). Cursor's retired key is stripped, once, on disk too."""
+    hist = []
+    try:
+        with open(HIST, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    hist.append(json.loads(line))
+                except ValueError:
+                    pass  # a torn last line from a run that was killed mid-write
+    except OSError:
+        pass
+    old = [h for h in hist if "cursor" in h]
+    for h in old:
+        del h["cursor"]
+    hist.sort(key=lambda h: h["t"])
+    if old:
+        write_all(hist)
+    return hist
+
+
+def write_all(hist):
+    tmp = HIST + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(h, separators=(",", ":")) + "\n" for h in hist)
+    os.replace(tmp, HIST)
+
+
+def save(hist, rec, now):
+    """Append rec; once a day, rewrite the file without lines older than KEEP_DAYS."""
+    if hist and hist[0]["t"] < now - (KEEP_DAYS + 1) * 86400:
+        keep = [h for h in hist if h["t"] >= now - KEEP_DAYS * 86400] + [rec]
+        write_all(keep)
+        return keep
+    with open(HIST, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    return hist + [rec]
+
+
+def page_html(data):
+    def read(name):
+        try:
+            with open(os.path.join(HERE, name), encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    sim = read("usage-sim.js")
+    # one pass, so neither inserted text can be re-scanned for the other placeholder
+    return re.sub(r"__DATA__|__SIM__", lambda m: blob if m.group() == "__DATA__" else sim, read("usage-dashboard.template.html"))
+
+
+def render(data):
+    tmp = OUT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(page_html(data))
+    os.replace(tmp, OUT)
+
+
+# ---------------------------------------------------------------- codex history from session logs
+
+CODEX_WIN = {10080: ("w", WEEK), 300: ("s", 18000)}     # window_minutes -> (window id, period s), as parse_codex does
+SLOP = 120                                              # s: how far apart two resets_at may be and still be the same window
+DAY = 86400
+
+
+def rollout_files(cdir, now, since):
+    """[(path, seat or None)]: rollout logs modified in the last KEEP_DAYS and after `since`. A home's log belongs to that seat; the active login's to None."""
+    out = []
+    for pat, home in ((os.path.join(cdir, "homes", "*", "sessions", "**", "rollout-*.jsonl"), True),
+                      (os.path.join(cdir, "sessions", "**", "rollout-*.jsonl"), False)):
+        for f in glob.glob(pat, recursive=True):
+            try:
+                mt = os.path.getmtime(f)
+            except OSError:
+                continue
+            if mt >= now - KEEP_DAYS * DAY and mt > since:
+                out.append((f, os.path.relpath(f, os.path.join(cdir, "homes")).split(os.sep)[0] if home else None))
+    return out
+
+
+def rollout_events(path):
+    """(t, {window id: (used fraction, reset, period)}) for each usable token_count line, read streaming; bad lines are skipped."""
+    from datetime import datetime
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    j = json.loads(line)
+                    p = j["payload"]
+                    rl = p["rate_limits"] if p["type"] == "token_count" else None
+                    t = datetime.fromisoformat(j["timestamp"]).timestamp()
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
+                    continue            # another limit family (e.g. "premium") is not the plan's quota
+                wins = {}
+                for part in ("primary", "secondary"):
+                    x = rl.get(part)
+                    w = CODEX_WIN.get(int(_f(x.get("window_minutes")) or 0)) if isinstance(x, dict) else None
+                    used, reset = (_f(x.get("used_percent")), _f(x.get("resets_at"))) if w else (None, None)
+                    if used is not None and reset:
+                        wins[w[0]] = (used / 100, int(reset), w[1])
+                if wins:
+                    yield int(t), wins
+    except OSError:
+        return
+
+
+def codex_events(cdir, now, since, known):
+    """[(t, seat, wins)] oldest first. `known` {window id: {reset: {seats}}} is seeded from the labelled caches; each home's own events add to it,
+    and an active-login event goes to the one seat whose known reset for that window is within SLOP s (no match, or several seats: skipped)."""
+    own, act = [], []
+    for f, seat in rollout_files(cdir, now, since):
+        (own if seat else act).extend((t, seat, w) for t, w in rollout_events(f))
+    for _, seat, wins in own:
+        for w, (_, r, _) in wins.items():
+            known.setdefault(w, {}).setdefault(r, set()).add(seat)
+    for t, _, wins in act:
+        seats = {x for w, (_, r, _) in wins.items() for kr, ss in known.get(w, {}).items() if abs(kr - r) <= SLOP for x in ss}
+        if len(seats) == 1:
+            own.append((t, seats.pop(), wins))
+    return sorted((e for e in own if e[0] >= now - KEEP_DAYS * DAY), key=lambda e: e[0])
+
+
+def rollout_records(events, taken, rebuilt):
+    """History records from attributed events: one per 5 minutes, each carrying every seat seen so far at its newest state;
+    none in a 5-minute bucket listed in `taken` (a recorded point is never overwritten). `rebuilt` flags them b like the Claude backfill."""
+    state, recs = {}, []
+    for t, seat, wins in events:
+        st = state.setdefault(seat, {})
+        for w, (used, reset, period) in wins.items():
+            st[w], st[w + "r"], st[w + "p"] = used, reset, period
+        st["ts"] = t
+        k = t // BUCKET5
+        if k in taken:
+            continue
+        snap = {a: dict(b) for a, b in state.items()}
+        if recs and recs[-1]["t"] // BUCKET5 == k:
+            recs[-1]["codex"] = snap
+        else:
+            recs.append(dict({"t": t, "codex": snap}, **({"b": 1} if rebuilt else {})))
+    return recs
+
+
+def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
+    """-> (new records, {seat: (events, earliest t)}) from the Codex rollout logs; buckets `hist` already has a codex point in are left alone."""
+    cdir = cdir or os.path.join(HOME, ".codex")
+    sink, known = [], {}
+    read_codex(cdir, sink)
+    for label, c in sink:
+        seat, _ = parse_codex(c)
+        for w in "sw":
+            if seat and seat.get(w + "r"):
+                known.setdefault(w, {}).setdefault(int(seat[w + "r"]), set()).add(label)
+    ev = codex_events(cdir, now, since, known)
+    per = {}
+    for t, seat, _ in ev:
+        n, first = per.get(seat, (0, t))
+        per[seat] = (n + 1, min(first, t))
+    return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt), per
+
+
+# ---------------------------------------------------------------- backfill from .rotate-log.txt
+
+LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+(.*)$")
+LOG_EMAIL = re.compile(r"-> (\w) \(([^)\s]+@[^)\s]+)\)")
+
+
+def _pct(m, i=1):
+    return min(max(int(m.group(i)), 0), 100) / 100
+
+
+def parse_log_line(msg):
+    """-> {label: {"w": x, "f": y}} (fractions, only the keys this line carries)."""
+    m = re.match(r"ROTATED '\w' -> (\w) \(.*?\) session \d+%, weekly (\d+)%(?:, fable (\d+)%)?", msg)
+    if m:
+        v = {"w": _pct(m, 2)}
+        if m.group(3) is not None:
+            v["f"] = _pct(m, 3)
+        return {m.group(1): v}
+    if msg.startswith("NO USABLE TARGET"):
+        return {lab: {"w": min(int(w), 100) / 100} for lab, w in re.findall(r"\b(\w)=s\d+%/w(\d+)%", msg)}
+    m = re.match(r"TRIGGER: active account '(\w)'", msg)
+    if m:
+        v = {}
+        c = re.search(r"(FABLE|WEEKLY) window CAPPED at (\d+)%", msg)
+        if c:
+            v["f" if c.group(1) == "FABLE" else "w"] = _pct(c, 2)
+        c = re.search(r"\bweekly (\d+)%", msg)
+        if c:
+            v["w"] = _pct(c)
+        return {m.group(1): v} if v else {}
+    return {}
+
+
+def backfill_records(log_text, latest_seats, start, end):
+    """-> (records, {label: email}). Records cover [start, end) and carry each label's weekly (w) and Fable (f)
+    value forward until its reset grid says it went back to 0."""
+    grids = {(lab, k): s[k + "r"] for lab, s in latest_seats.items() for k in ("w", "f") if _f(s.get(k + "r"))}
+    events, emails = [], {}
+    for line in log_text.splitlines():
+        m = LOG_LINE.match(line)
+        if not m:
+            continue
+        t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        e = LOG_EMAIL.search(m.group(2))
+        if e and e.group(1) in latest_seats and re.match(r"(ROTATED|DRY RUN)", m.group(2)):
+            emails[e.group(1)] = e.group(2)        # the log is chronological, so the newest wins
+        if start <= t < end:
+            vals = {lab: v for lab, v in parse_log_line(m.group(2)).items() if lab in latest_seats}
+            if vals:
+                events.append((int(t), vals))
+
+    def nxt(lab, k, t):
+        r = grids.get((lab, k))
+        return None if r is None else r - ((r - t - 1) // WEEK) * WEEK      # the first grid reset after t
+
+    state, recs = {}, []
+    for t, vals in sorted(events, key=lambda e: e[0]):
+        for lab, v in vals.items():
+            for k, x in v.items():
+                if (lab, k) in grids:
+                    state[(lab, k)] = (x, nxt(lab, k, t))
+        seats = {}
+        for (lab, k), (x, rst) in state.items():
+            seats.setdefault(lab, {}).update({k: x if t < rst else 0.0, k + "r": nxt(lab, k, t)})
+        rec = {"t": t, "s": seats, "b": 1}
+        if recs and t - recs[-1]["t"] < 300:
+            recs[-1]["s"] = seats                   # at most one record per 5 minutes
+        else:
+            recs.append(rec)
+    return recs, emails
+
+
+def when(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+
+def backfill_claude(real, days, now):
+    """Rebuilt Claude records from the rotate log (None when it cannot run), written emails included."""
+    seated = [h for h in real if "s" in h]
+    if not seated:
+        say("backfill: no real Claude history yet, nothing to anchor the reset grid to")
+        return None
+    try:
+        with open(os.path.join(ROOT, ".rotate-log.txt"), encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as e:
+        say("backfill: cannot read the rotate log (%s)" % type(e).__name__)
+        return None
+    recs, emails = backfill_records(text, seated[-1]["s"], now - days * 86400, seated[0]["t"])
+    if emails:
+        with open(EMAILS + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(emails, fh)
+        os.replace(EMAILS + ".tmp", EMAILS)
+    labels = sorted({lab for r in recs for lab in r["s"]})
+    say("backfill: claude %d records (labels %s, %s), %d emails" % (len(recs), ",".join(labels) or "-",
+                                                                   "%s .. %s" % (when(recs[0]["t"]), when(recs[-1]["t"])) if recs else "none", len(emails)))
+    return recs
+
+
+def backfill(days):
+    """Rebuild past history (flagged b): Claude from the rotate log, Codex from the session logs. Recorded points are never touched."""
+    hist = load()
+    real, now = [h for h in hist if not h.get("b")], time.time()
+    claude = backfill_claude(real, days, now)
+    if claude is None:                  # keep what an earlier backfill rebuilt
+        claude = [h for h in hist if h.get("b") and "s" in h]
+    codex, per = import_rollouts(real, now, True)
+    write_all(sorted(real + claude + codex, key=lambda h: h["t"]))
+    say("backfill: codex %d records, %s" % (len(codex), "; ".join("%s %d events from %s" % (k, n, when(f)) for k, (n, f) in sorted(per.items())) or "no events"))
+
+
+# ---------------------------------------------------------------- local app
+
+def applog(msg):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(APPLOG, "a", encoding="utf-8") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        if os.path.getsize(APPLOG) > 200_000:
+            with open(APPLOG, "rb") as fh:
+                data = fh.read()
+            data = data[len(data) // 2:]
+            with open(APPLOG, "wb") as fh:
+                fh.write(data[data.find(b"\n") + 1:])
+    except OSError:
+        pass
+
+
+def host_ok(host, port):
+    """DNS-rebinding guard: only the literal loopback names on our own port."""
+    return (host or "").lower() in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+
+
+def manifest():
+    return {"name": "Quota", "short_name": "Quota", "start_url": "/", "display": "standalone",
+            "background_color": "#0c0a09", "theme_color": "#0c0a09",
+            "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                      {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                      {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]}
+
+
+class Store:
+    """The in-memory history and the last built blob, shared by the sampler thread and the request threads."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.hist = load()
+        self.refreshing = threading.Lock()
+        self.blob = build(self.hist, time.time(), load_emails(), True, load_extra())
+
+    def import_codex(self, now, cdir=None):
+        """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
+        cache = load_pcache()
+        since = cache.get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
+        try:
+            new, _ = import_rollouts(self.hist, now, False, since, cdir)
+        except Exception as e:   # shortcut: a log we cannot read must not stop the sample
+            applog("codex import error: %s: %s" % (type(e).__name__, e))
+            return
+        cache["codex_import"] = int(now)
+        save_pcache(cache)
+        if new:
+            with open(HIST, "a", encoding="utf-8") as fh:
+                fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in new)
+            self.hist = sorted(self.hist + new, key=lambda h: h["t"])
+
+    def drift_check(self, now, here=None, py=None):
+        """rotator-sync.py --check --quiet at most every DRIFT_EVERY, when the script sits next to this one. It writes .rotator-drift.json; its exit code and output are ignored."""
+        script = os.path.join(here or HERE, "rotator-sync.py")
+        with self.lock:
+            cache = load_pcache()
+            if not os.path.isfile(script) or now - (cache.get("drift_run") or 0) < DRIFT_EVERY:
+                return False
+            cache["drift_run"] = int(now)           # first, so a hang or crash is not retried every sample
+            save_pcache(cache)
+        try:
+            subprocess.run((py or PY) + [script, "--check", "--quiet"], stdin=subprocess.DEVNULL, capture_output=True, timeout=120,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return True
+
+    def take(self, force=False):
+        with self.lock:
+            now = time.time()
+            self.hist = save(self.hist, sample(now, force), now)
+            self.import_codex(now)
+            self.blob = build(self.hist, now, load_emails(), True, load_extra())
+            render(dict(self.blob, app=False))
+            return self.blob
+
+
+def probe_claude():
+    """The one live Claude read: the rotator's own --status, with no console window."""
+    script = os.path.join(HERE, "claude-cli-account.ps1")
+    r = subprocess.run(["pwsh", "-NoProfile", "-File", script, "--status"], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=180, creationflags=0x08000000 if os.name == "nt" else 0)
+    return r.returncode
+
+
+def serve(port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    store = Store()
+    ctype = {"/icon.svg": ("icon.svg", "image/svg+xml"), "/icon-192.png": ("icon-192.png", "image/png"),
+             "/icon-512.png": ("icon-512.png", "image/png")}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass                                   # pythonw has no stderr
+
+        def send(self, code, body=b"", ct="text/plain; charset=utf-8"):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def js(self, code, obj):
+            self.send(code, json.dumps(obj, separators=(",", ":")), "application/json")
+
+        def do_GET(self):
+            if not host_ok(self.headers.get("Host"), port):
+                return self.send(403, "forbidden")
+            path = self.path.split("?")[0]
+            if path == "/":
+                return self.send(200, page_html(store.blob), "text/html; charset=utf-8")
+            if path == "/api/data":
+                return self.js(200, store.blob)
+            if path == "/manifest.webmanifest":
+                return self.send(200, json.dumps(manifest()), "application/manifest+json")
+            if path in ctype:
+                try:
+                    with open(os.path.join(ICONS, ctype[path][0]), "rb") as fh:
+                        return self.send(200, fh.read(), ctype[path][1])
+                except OSError:
+                    pass
+            self.send(404, "not found")
+
+        def do_POST(self):
+            if not host_ok(self.headers.get("Host"), port):
+                return self.send(403, "forbidden")
+            if self.path.split("?")[0] != "/api/refresh":
+                return self.send(404, "not found")
+            if self.headers.get("X-Quota-App") != "1":
+                return self.send(403, "forbidden")
+            if not store.refreshing.acquire(blocking=False):
+                return self.send(409, "a refresh is already running")
+            try:
+                try:
+                    rc = probe_claude()
+                except (OSError, subprocess.SubprocessError) as e:
+                    rc = type(e).__name__
+                blob = store.take(force=True)
+                applog("refresh: claude probe -> %s, %d providers" % (rc, len(blob["providers"])))
+                self.js(200, blob)
+            except Exception as e:   # shortcut: broad catch so one bad request never kills the server thread
+                applog("refresh error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"error": type(e).__name__})
+            finally:
+                store.refreshing.release()
+
+    def sampler():
+        while True:
+            try:
+                store.drift_check(time.time())
+                store.take()
+            except Exception as e:   # shortcut: same, the loop must keep sampling
+                applog("sample error: %s: %s" % (type(e).__name__, e))
+            time.sleep(SAMPLE_EVERY)
+
+    if not os.path.isfile(os.path.join(ICONS, "icon-512.png")):
+        make_icons()
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    except OSError as e:
+        applog("cannot listen on 127.0.0.1:%d (%s)" % (port, e))
+        return 1
+    threading.Thread(target=sampler, daemon=True).start()
+    applog("serving on 127.0.0.1:%d" % port)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- icons (pure python, no PIL)
+
+BG, ORANGE, TRACK = (23, 20, 18), (251, 146, 60), (41, 37, 36)
+
+
+def icon_pixels(size):
+    """RGBA rows: a rounded dark square with an orange ring gauge about 3/4 full, 2x2 supersampled."""
+    rows, c, rad = [], size / 2, size * 0.2
+    r_out, r_in = size * 0.34, size * 0.24
+    sub = (0.25, 0.75)
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            acc = [0, 0, 0, 0]
+            for oy in sub:
+                for ox in sub:
+                    px, py = x + ox, y + oy
+                    qx, qy = abs(px - c) - (c - rad), abs(py - c) - (c - rad)
+                    if math.hypot(max(qx, 0), max(qy, 0)) > rad:
+                        continue                    # outside the rounded corner
+                    col = BG
+                    dx, dy = px - c, py - c
+                    if r_in <= math.hypot(dx, dy) <= r_out:
+                        col = ORANGE if math.atan2(dx, -dy) % (2 * math.pi) < 1.5 * math.pi else TRACK
+                    acc[0] += col[0]; acc[1] += col[1]; acc[2] += col[2]; acc[3] += 255
+            n = acc[3] // 255
+            row += bytes((acc[0] // n, acc[1] // n, acc[2] // n, acc[3] // 4)) if n else b"\0\0\0\0"
+        rows.append(bytes(row))
+    return rows
+
+
+def png(size):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    raw = b"".join(b"\0" + r for r in icon_pixels(size))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def ico(png_bytes):
+    """A one-image .ico holding a 256 px PNG (width/height 0 means 256)."""
+    return struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png_bytes), 22) + png_bytes
+
+
+SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="102" fill="#171412"/>'
+       '<circle cx="256" cy="256" r="148" fill="none" stroke="#292524" stroke-width="51"/>'
+       '<path d="M256 108 A148 148 0 1 1 108 256" fill="none" stroke="#fb923c" stroke-width="51"/></svg>')
+
+
+def make_icons():
+    os.makedirs(ICONS, exist_ok=True)
+    for name, data in (("icon-192.png", png(192)), ("icon-512.png", png(512)), ("icon.ico", ico(png(256))),
+                       ("icon.svg", SVG.encode("utf-8"))):
+        with open(os.path.join(ICONS, name), "wb") as fh:
+            fh.write(data)
+    say("icons written to " + ICONS)
+
+
+# ---------------------------------------------------------------- selftest
+
+def selftest():
+    T, R = 1_800_000_000, 1_800_000_000 + 3 * 86400
+
+    def rec(t, **seats):
+        return {"t": t, "s": {k: {"w": v[0], "wr": v[1]} for k, v in seats.items()}}
+
+    h = [rec(T, A=(0.10, R), B=(0.5, R)), rec(T + 3600, A=(0.20, R), B=(0.5, R))]
+    assert abs(burn(h, "w", 3, T + 3600) - 10) < 1e-9
+    h = [rec(T, A=(0.90, R)), rec(T + 3600, A=(0.05, R + WEEK))]          # weekly reset in between
+    assert abs(burn(h, "w", 3, T + 3600) - 5) < 1e-9
+    assert burn(h[:1], "w", 3, T) is None
+    assert burn(h, "w", 3, T + 100) is None                                # records after `now` are not used
+    assert util_at({"w": 0.7, "wr": R}, "w", R + 1) == 0.0                 # stale reading past its reset
+    assert remaining(rec(T, A=(0.25, R), B=(1.0, R)), "w") == (75.0, 2)
+
+    # codex cache: weekly only, then weekly + 5 hour, then nothing usable
+    c = {"fetchedAt": 1793592327005, "accountEmail": "x@y", "primary": {"usedPercent": 13, "windowDurationMins": 10080, "resetsAt": 1794124925}, "secondary": None}
+    seat, email = parse_codex(c)
+    assert seat == {"ts": 1793592327, "w": 0.13, "wr": 1794124925, "wp": 604800} and email == "x@y", seat
+    c["primary"], c["secondary"] = ({"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 5}, {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 9})
+    seat, _ = parse_codex(c)
+    assert seat["s"] == 0.4 and seat["sp"] == 18000 and seat["w"] == 0.07 and seat["wr"] == 9
+    c["primary"], c["secondary"] = {"usedPercent": 1, "windowDurationMins": 60, "resetsAt": 5}, None
+    assert parse_codex(c)[0] is None                                       # an unknown window is ignored
+
+    # read_codex: homes' own caches + the active login's, on a synthetic ~/.codex
+    import tempfile
+    def cx(ms, used, key=None, email=None):
+        return {"fetchedAt": ms, "identityKey": key, "accountEmail": email,
+                "primary": {"usedPercent": used, "windowDurationMins": 10080, "resetsAt": 9}, "secondary": None}
+    def put(d, name, obj):
+        os.makedirs(os.path.join(d, "cache-statusband-codex"), exist_ok=True)
+        with open(os.path.join(d, "cache-statusband-codex", name), "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+    with tempfile.TemporaryDirectory() as td:
+        for lab in "ABCD":
+            os.makedirs(os.path.join(td, "homes", lab))
+            open(os.path.join(td, "homes", lab, "auth.json"), "w").close()          # existence only: never read
+        for lab in "EF":
+            os.makedirs(os.path.join(td, "homes", lab))                              # C: empty folders, no saved login
+        put(os.path.join(td, "homes", "B"), "rate-limits-1.json", cx(2_000_000, 10, "seat:B", "b@x"))
+        put(os.path.join(td, "homes", "D"), "rate-limits-1.json", cx(2_000_000, 20, None, "d@x"))
+        put(td, "rate-limits.json", cx(1_000_000, 50, "seat:C", "c@x"))              # seat:X, X a home -> C
+        put(td, "rate-limits-b.json", cx(3_000_000, 60, "seat:B", "b@x"))            # newer than B's own -> wins
+        put(td, "rate-limits-d.json", cx(4_000_000, 70, "other", "d@x"))             # email match -> D, newer -> wins
+        put(td, "rate-limits-c2.json", cx(500_000, 99, "seat:C", "c@x"))            # older than C's other reading -> loses
+        put(td, "rate-limits-z.json", cx(9_000_000, 80, "seat:Z", "z@x"))            # unknown seat and email -> skipped
+        put(td, "rate-limits-f.json", cx(5_000_000, 30, "seat:F", "f@x"))            # no auth.json but a reading -> shown
+        seats, em = read_codex(td)
+    assert list(seats) == ["A", "B", "C", "D", "E", "F"] and seats["A"] == {"ok": False, "note": "no usage cached yet"}, seats
+    assert seats["E"] == {"ok": False, "note": "no saved login on this PC"} and seats["F"]["w"] == 0.3, seats      # C
+    assert seats["B"]["w"] == 0.6 and seats["C"]["w"] == 0.5 and seats["D"]["w"] == 0.7, seats
+    assert em == {"B": "b@x", "C": "c@x", "D": "d@x", "F": "f@x"}, em
+
+    # Claude emails: email.txt wins (trimmed), the backfill map fills in only when the file is missing or empty
+    with tempfile.TemporaryDirectory() as td:
+        for lab, txt in (("A", " new-a@x.org " + os.linesep), ("B", "  " + os.linesep), ("C", None), ("D", "d@x.org")):
+            os.makedirs(os.path.join(td, lab))
+            open(os.path.join(td, lab, "token.txt"), "w").write("SECRET")
+            if txt is not None:
+                open(os.path.join(td, lab, "email.txt"), "w", encoding="utf-8", newline="").write(txt)
+        assert seat_emails(td, {"A": "old-a@x.org", "B": "b@x.org", "C": "c@x.org"}) == {"A": "new-a@x.org", "B": "b@x.org", "C": "c@x.org", "D": "d@x.org"}
+        assert seat_emails(os.path.join(td, "nope"), {"A": "a"}) == {"A": "a"}
+
+    # grok and cursor responses
+    g = parse_grok({"config": {"currentPeriod": {"type": "X", "start": "2026-11-09T22:57:09.651+00:00", "end": "2026-11-16T22:57:09.651+00:00"}, "creditUsagePercent": 22.0}})
+    assert g["w"] == 0.22 and g["wp"] == WEEK and g["wr"] - 1_700_000_000 > 0, g
+    assert parse_grok({"error": 1}) is None and parse_grok(None) is None
+    assert "cursor" not in PROVIDERS and not any(n in globals() for n in ("fetch_cursor", "parse_cursor"))     # A: Cursor is gone
+    assert PROVIDERS["grok"][0] == "Grok / Cursor" and "same xAI quota" in PROVIDER_NOTE["grok"]
+
+    # A: history lines and the provider cache lose the retired cursor key, on disk
+    global HIST, PCACHE
+    with tempfile.TemporaryDirectory() as td:
+        HIST, PCACHE, keep = os.path.join(td, "h.jsonl"), os.path.join(td, "p.json"), (HIST, PCACHE)
+        try:
+            with open(HIST, "w", encoding="utf-8") as fh:
+                fh.write('{"t":9,"cursor":{"cursor":{"m":1}}}' + chr(10) + '{"t":5,"grok":{"grok":{"w":0.1}}}' + chr(10) + 'not json' + chr(10))
+            with open(PCACHE, "w", encoding="utf-8") as fh:
+                json.dump({"cursor": {"at": 1}, "emails": {"cursor": {"cursor": "c@x"}, "grok": {"grok": "g@x"}}}, fh)
+            assert [h["t"] for h in load()] == [5, 9] and "cursor" not in open(HIST, encoding="utf-8").read()
+            assert load_pcache() == {"emails": {"grok": {"grok": "g@x"}}}
+        finally:
+            HIST, PCACHE = keep
+
+    # B: Gemini (Antigravity) from synthetic language-server JSON
+    def cfg(label, frac, reset="2026-11-12T20:15:30Z"):
+        q = {"resetTime": reset}
+        if frac is not None:
+            q["remainingFraction"] = frac
+        return {"label": label, "quotaInfo": q}
+    gj = {"userStatus": {"planStatus": {"planInfo": {"planName": "Pro"}}, "cascadeModelConfigData": {"clientModelConfigs": [
+        cfg("Gemini 3.8 Flash (High)", 1.0), cfg("Gemini 3.8 Flash (Low)", 1.0),
+        cfg("Claude Opus 5.5 (High)", 0.9), cfg("Claude Sonnet 5.5 (Medium)", 0.9), cfg("GPT-OSS 120B (Medium)", 0.9),
+        {"label": "Some Model (no quota)"}, cfg("Gemini Drained", None), cfg("Claude Opus 5.5 (XHigh)", 0.9)]}}}
+    g = parse_gemini(gj, 1000)
+    rst = 1_794_514_530                                                     # 2026-11-12T20:15:30Z
+    assert [g["n"][w] for w in g["n"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"], g["n"]
+    f_id, c_id, d_id = g["n"]
+    assert (g[f_id], g[c_id], g[d_id]) == (0.0, 0.1, 1.0) and g[c_id + "r"] == g[f_id + "r"] and g[c_id + "p"] == 18000, g
+    assert g["plan"] == "Pro" and g["ts"] == 1000 and f_id == gemini_slug("Gemini 3.8 Flash") and len(c_id) < 30
+    assert abs(g[c_id + "r"] - __import__("datetime").datetime(2026, 11, 12, 20, 15, 30, tzinfo=__import__("datetime").timezone.utc).timestamp()) == 0
+    gj["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"][2]["quotaInfo"]["resetTime"] = "2026-11-12T21:00:00Z"
+    assert len(parse_gemini(gj, 1)["n"]) == 4                                 # a different reset is its own limit
+    assert parse_gemini({"userStatus": {}}, 1) is None and parse_gemini(None, 1) is None and parse_gemini({"userStatus": {"cascadeModelConfigData": {"clientModelConfigs": []}}}, 1) is None
+    procs = '[{"ProcessId":1,"CommandLine":"x.exe --a b --csrf_token tok1 --c","Ports":[4000,4001]},{"ProcessId":2,"CommandLine":"x.exe","Ports":[5]},{"ProcessId":3,"CommandLine":"--csrf_token t3","Ports":9},{"ProcessId":4,"CommandLine":"--csrf_token=t4","Ports":[7]}]'
+    assert parse_ls_procs(procs) == [("tok1", [4000, 4001]), ("t3", [9]), ("t4", [7])] and parse_ls_procs("") == [] and parse_ls_procs("null") == []
+    tried = []
+    def fq(port, csrf):
+        tried.append((port, csrf))
+        return gj if port == 4001 else None
+    assert read_gemini(7, lambda: parse_ls_procs(procs), fq)["ts"] == 7 and tried == [(4000, "tok1"), (4001, "tok1")]
+    assert read_gemini(7, lambda: [], fq) is None and read_gemini(7, lambda: [("t", [1])], lambda p, c: None) is None     # not running / no port answers
+    assert gemini_note(None) == "Antigravity isn't running" and gemini_note(1_800_000_000).startswith("Antigravity isn't running; last reading 20")
+    gh = [{"t": 1000 + 300 * i, "gemini": {"antigravity": dict(g, ts=1000 + 300 * i)}} for i in range(4)]
+    gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": gemini_note(2000)}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
+    assert gb["id"] == "gemini" and gb["name"] == "Gemini (Antigravity)" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
+    assert [x["label"] for x in gb["limits"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"]
+    assert gb["accounts"][0]["email"] == "me@x" and gb["accounts"][0]["note"].startswith("Antigravity isn't running; last reading")
+    assert gb["limits"][1]["seats"][0]["period"] == 18000 and gb["limits"][1]["now"] == 90.0
+    gh = [dict(h, t=rst - 3600 + 300 * i) for i, h in enumerate(gh)]
+    gb = build(gh, rst - 2000, {}, True, {})["providers"][0]
+    assert gb["limits"][1]["now"] == 90.0 and gb["limits"][1]["seats"][0]["reset"] == rst and gb["accounts"][0]["note"] == ""
+    nr = build([{"t": 5, "gemini": {"antigravity": {"ok": False, "note": gemini_note(None)}}}], 9, {}, False, {})["providers"][0]
+    assert nr["loaded"] == 0 and nr["limits"] == [] and nr["accounts"][0]["note"] == "Antigravity isn't running"
+
+    # D: Codex history from rollout logs (synthetic ~/.codex)
+    from datetime import datetime, timezone
+    N = 1_800_000_000
+    def iso(t):
+        return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123Z")
+    def tc(t, wk=None, h5=None, lid="codex"):
+        rl = {"limit_id": lid, "primary": None, "secondary": None}
+        if h5:
+            rl["primary"] = {"used_percent": h5[0], "window_minutes": 300, "resets_at": h5[1]}
+        if wk:
+            rl["secondary" if h5 else "primary"] = {"used_percent": wk[0], "window_minutes": 10080, "resets_at": wk[1]}
+        return json.dumps({"timestamp": iso(t), "type": "event_msg", "payload": {"type": "token_count", "rate_limits": rl}})
+    def roll(path, lines, mtime):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(chr(10).join(lines) + chr(10))
+        os.utime(path, (mtime, mtime))
+    WA, WB = N + 400_000, N + 500_000                                   # A's and B's weekly resets
+    with tempfile.TemporaryDirectory() as td:
+        for lab in "AB":
+            os.makedirs(os.path.join(td, "homes", lab))
+        roll(os.path.join(td, "homes", "A", "sessions", "2026", "11", "rollout-a.jsonl"), [
+            tc(N - 7200, wk=(10, WA)), "not json {", json.dumps({"timestamp": iso(N), "payload": {"type": "agent_message"}}),
+            tc(N - 7200 + 100, wk=(11, WA)),                              # same 5-minute bucket: one record
+            tc(N - 3600, wk=(20, WA), h5=(5, N - 3000)), tc(N - 1800, wk=(21, WA), h5=(9, N - 3000), lid="premium")], N - 100)
+        roll(os.path.join(td, "homes", "B", "sessions", "rollout-b.jsonl"), [tc(N - 3000, wk=(40, WB))], N - 100)
+        roll(os.path.join(td, "homes", "B", "sessions", "rollout-old.jsonl"), [tc(N - 40 * 86400, wk=(1, 5))], N - 40 * 86400)
+        roll(os.path.join(td, "sessions", "2026", "11", "rollout-act.jsonl"), [
+            tc(N - 2500, wk=(25, WA + 60)),                               # within 120 s of A's reset -> A
+            tc(N - 2400, wk=(45, WB - 119)),                              # -> B
+            tc(N - 2300, wk=(1, N + 123_456)),                            # matches nobody: skipped
+            tc(N - 2200, wk=(99, WA + 500)),                              # 500 s off: skipped
+            tc(N - 2100, wk=(26, WA + 90_000 - 40), h5=(3, N - 2000))], N - 100)    # matches only the active-login cache for seat A below
+        put(td, "rate-limits-1.json", {"fetchedAt": 1, "identityKey": "seat:A", "accountEmail": "a@x",
+                                       "primary": {"usedPercent": 1, "windowDurationMins": 10080, "resetsAt": WA + 90_000}})
+        ev = codex_events(td, N, 0, {"w": {WA + 90_000: {"A"}}})
+        got = [(t - N, s_) for t, s_, _ in ev]
+        assert got == [(-7200, "A"), (-7100, "A"), (-3600, "A"), (-3000, "B"), (-2500, "A"), (-2400, "B"), (-2100, "A")], got
+        assert all(t >= N - 35 * 86400 for t, _, _ in ev)                  # the 40-day-old file was never read
+        assert ev[0][2] == {"w": (0.10, WA, WEEK)} and ev[2][2]["s"] == (0.05, N - 3000, 18000) and "premium" not in str(ev)
+        recs, per = import_rollouts([], N, True, 0, td)
+        assert per == {"A": (5, N - 7200), "B": (2, N - 3000)}, per
+        assert all(r["b"] == 1 for r in recs) and [r["t"] for r in recs] == sorted(r["t"] for r in recs)
+        assert len({r["t"] // 300 for r in recs}) == len(recs)                  # one record per 5 minutes
+        assert recs[0]["codex"] == {"A": {"w": 0.11, "wr": WA, "wp": WEEK, "ts": N - 7100}}, recs[0]   # the later of the two in the bucket
+        last = recs[-1]["codex"]
+        assert last["B"]["w"] == 0.45 and last["A"]["w"] == 0.26 and last["A"]["s"] == 0.03 and last["A"]["wr"] == WA + 90_000 - 40, last   # carried forward, per seat
+        b2 = next(r for r in recs if r["t"] // 300 == (N - 3000) // 300)
+        assert set(b2["codex"]) == {"A", "B"} and b2["codex"]["A"]["w"] == 0.2
+        # a recorded point is never overwritten; sampler imports are recorded, not rebuilt; the mtime watermark skips old files
+        taken = [{"t": N - 3600, "codex": {"A": {"w": 0.5}}}]
+        recs2, _ = import_rollouts(taken, N, False, 0, td)
+        assert len(recs2) == len(recs) - 1 and all("b" not in r and r["t"] // 300 != (N - 3600) // 300 for r in recs2)
+        assert import_rollouts([], N, False, N - 50, td)[0] == [] and import_rollouts([], N, False, N - 200, td)[1]["B"][0] == 2
+        # imported records feed the dashboard: pooled weekly history per seat, and a codex-only newest record does not hide Claude
+        hh = sorted([{"t": N - 9000, "s": {"X": {"w": 0.1, "wr": N + 9999}}}] + recs, key=lambda h: h["t"])
+        cb = build(hh, N, {}, False, {})
+        assert [p["id"] for p in cb["providers"]] == ["claude", "codex"] and cb["providers"][1]["limits"][0]["hist"][0][2] == 1
+        # the sampler's import: nothing on the first run (sets the watermark), then only files modified since, recorded (not b), merged in time order
+        keep, HIST, PCACHE = (HIST, PCACHE), os.path.join(td, "h.jsonl"), os.path.join(td, "p.json")
+        try:
+            st = Store.__new__(Store)
+            st.hist = [{"t": N - 5000, "s": {}}, {"t": N, "s": {}}]
+            st.import_codex(N + 20, td)
+            assert st.hist == [{"t": N - 5000, "s": {}}, {"t": N, "s": {}}] and load_pcache()["codex_import"] == N + 20 and not os.path.exists(HIST)
+            roll(os.path.join(td, "homes", "A", "sessions", "rollout-new.jsonl"), [tc(N + 5, wk=(30, WA))], N + 30)
+            st.import_codex(N + 40, td)
+            assert [h["t"] for h in st.hist] == [N - 5000, N, N + 5] and "b" not in st.hist[2] and st.hist[2]["codex"]["A"]["w"] == 0.3
+            assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [N + 5] and load_pcache()["codex_import"] == N + 40
+            st.import_codex(N + 60, td)
+            assert len(st.hist) == 3
+        finally:
+            HIST, PCACHE = keep
+        # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
+        roll(os.path.join(td, "sessions", "rollout-amb.jsonl"), [tc(N - 100, wk=(7, WA + 25))], N - 50)
+        def amb(known):
+            return [(t, s_) for t, s_, _ in codex_events(td, N, N - 60, known) if t == N - 100]
+        assert amb({"w": {WA: {"A"}, WA + 50: {"B"}}}) == [] and amb({"w": {WA: {"A"}, WA + 500: {"B"}}}) == [(N - 100, "A")]
+
+    # E: the drift file shows in the blob only when it lists differing files; the 6-hourly check runs the script once per interval
+    assert "drift" not in build([], 5, {}, False, {"drift": None}) and "drift" not in build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": []}})
+    assert build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": ["a.ps1", "b.py"]}})["drift"] == {"n": 2, "names": ["a.ps1", "b.py"]}
+    with tempfile.TemporaryDirectory() as td:
+        keep, PCACHE = PCACHE, os.path.join(td, "p.json")
+        try:
+            mark = os.path.join(td, "ran.txt")
+            st = Store.__new__(Store)
+            st.lock = threading.RLock()
+            assert not st.drift_check(1000 * DRIFT_EVERY, td, [sys.executable])                       # no rotator-sync.py next to us: nothing runs
+            open(os.path.join(td, "rotator-sync.py"), "w").write("import sys;open(%r,'a').write(' '.join(sys.argv[1:]) + chr(10))" % mark)
+            assert st.drift_check(1000 * DRIFT_EVERY, td, [sys.executable]) and open(mark).read() == "--check --quiet" + chr(10)
+            assert not st.drift_check(1000 * DRIFT_EVERY + DRIFT_EVERY - 1, td, [sys.executable]) and open(mark).read().count("--check") == 1
+            assert st.drift_check(1000 * DRIFT_EVERY + DRIFT_EVERY, td, [sys.executable]) and open(mark).read().count("--check") == 2
+        finally:
+            PCACHE = keep
+
+    # Host guard
+    assert host_ok("127.0.0.1:8787", 8787) and host_ok("localhost:8787", 8787)
+    assert not host_ok("evil.example:8787", 8787) and not host_ok("127.0.0.1:8788", 8787)
+    assert not host_ok("127.0.0.1", 8787) and not host_ok(None, 8787) and not host_ok("127.0.0.1:8787.evil.com", 8787)
+
+    # backfill: every line type, a reset boundary, the 5-minute dedupe, idempotence
+    L = 1_800_000_000
+    wr = L + 3 * 86400                           # A's weekly reset grid: wr - k * 7 days
+    latest = {"A": {"w": 0.5, "wr": wr, "f": 0.1, "fr": wr}, "B": {"w": 0.2, "wr": wr + 7200}, "F": {"w": 0.3, "wr": wr}}
+
+    def ts(t):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    log = "\n".join([
+        ts(L - 9 * 86400) + "  ROTATED 'F' -> A (a@x.org) session 0%, weekly 41%, fable 14%",                  # before the window
+        ts(L - 5 * 86400) + "  NO USABLE TARGET - staying on 'C'. B=s0%/w80% (capped)",                         # B w .8, resets at L-4d+2h
+        ts(L - 4 * 86400) + "  ROTATED 'F' -> A (a@x.org) session 0%, weekly 41%, fable 14%",                  # A w .41 f .14
+        ts(L - 4 * 86400 + 100) + "  TRIGGER: active account 'A' FABLE window CAPPED at 100% (Gate C cannot run) [via StopFailure]",  # within 5 min
+        ts(L - 3 * 86400) + "  NO USABLE TARGET - staying on 'C'. A=s0%/w77% F=s0%/w99% Z=s0%/w5% C=s100%/w61% E=s102%/w34% (note)",
+        ts(L - 2 * 86400) + "  TRIGGER: active account 'B' WEEKLY window CAPPED at 100% (session 20%) [via proxy]",
+        ts(L - 2 * 86400 + 600) + "  TRIGGER: active account 'F' session at 83% burning 0.4%/min -> 85% by the next probe, bar 85% (weekly 78%, left to burn)",
+        ts(L - 86400) + "  TRIGGER: active account 'B' at 49% (session 49%, weekly 49%) >= 1%",
+        ts(L - 86400 + 5) + "  TRIGGER: active account 'F' SESSION window CAPPED at 100% (weekly 61%) [via StopFailure]",
+        ts(L - 86000) + "  DRY RUN: would rotate 'B' -> E (b@x.org) worst 0%, fable 0%",
+        ts(L - 85000) + "  DRY RUN: would rotate 'F' -> B (new-b@x.org) worst 0%, fable 0%",
+        ts(L - 80000) + "  something else entirely",
+    ])
+    recs, em = backfill_records(log, latest, L - 8 * 86400, L)
+    assert em == {"A": "a@x.org", "B": "new-b@x.org"}, em                  # newest email per label, only labels we know
+    assert all(r.get("b") == 1 and all("s" not in s for s in r["s"].values()) for r in recs)
+    ts_ = [r["t"] for r in recs]
+    assert ts_ == sorted(ts_) and all(b - a >= 300 for a, b in zip(ts_, ts_[1:])), ts_   # 5-minute dedupe
+    assert recs[0]["t"] == int(L - 5 * 86400) and recs[0]["s"] == {"B": {"w": 0.8, "wr": wr + 7200 - 7 * 86400}}, recs[0]
+    first = recs[1]["s"]
+    assert first["A"] == {"w": 0.41, "wr": wr, "f": 1.0, "fr": wr}, first          # the capped f (100 s later) folded in
+    assert first["B"]["w"] == 0.8 and "F" not in first
+    nut = next(r for r in recs if r["t"] == int(L - 3 * 86400))
+    assert nut["s"]["A"]["w"] == 0.77 and nut["s"]["F"]["w"] == 0.99 and "Z" not in nut["s"]
+    assert nut["s"]["A"]["f"] == 1.0                                          # carried: no reset before wr
+    assert nut["s"]["B"] == {"w": 0.0, "wr": wr + 7200}, nut["s"]["B"]        # carried across B's reset grid line => 0
+    wk = next(r for r in recs if r["t"] == int(L - 2 * 86400))
+    assert wk["s"]["B"]["w"] == 1.0                                           # WEEKLY capped
+    assert wk["s"]["A"]["w"] == 0.77                                          # carried forward (same grid week)
+    last = recs[-1]["s"]
+    assert last["F"]["w"] == 0.61 and last["B"]["w"] == 0.49, last        # (weekly N%) and the "at 49%" forms
+    # idempotent: dropping the old "b" records and re-merging gives the same list
+    real = [{"t": L, "s": latest}]
+    merged = sorted(real + recs, key=lambda h: h["t"])
+    again = sorted([h for h in merged if not h.get("b")] + backfill_records(log, latest, L - 8 * 86400, L)[0], key=lambda h: h["t"])
+    assert again == merged
+
+    # build: 15-minute downsample, generic windows, drain
+    now = L + 5 * 3600
+    hist = []
+    for i in range(0, 6 * 3600, 300):           # a record every 5 min, 6 hours, claude A used 0.01 more each step
+        hist.append({"t": L + i, "s": {"A": {"w": 0.01 * (i // 300) / 10, "wr": L + 90000, "ts": L + i}},
+                     "grok": {"grok": {"w": 0.2, "wr": L + 40000, "wp": 604800, "ts": L}}})
+    hist[3]["b"] = 1
+    blob = build(hist, now, {"claude": {"A": "a@x.org"}}, True)
+    assert [p["id"] for p in blob["providers"]] == ["claude", "grok"] and blob["app"] is True and blob["first"] == L
+    cl, gk = blob["providers"]
+    assert cl["accounts"][0]["email"] == "a@x.org" and cl["total"] == cl["loaded"] == 1
+    lim = next(x for x in cl["limits"] if x["id"] == "w")
+    assert [x["id"] for x in cl["limits"]] == ["w"] and lim["cap"] == 100       # no Fable data -> no f limit
+    stamps = [p[0] for p in lim["hist"]]
+    assert all(b - a >= 1 for a, b in zip(stamps, stamps[1:])) and len({t // 900 for t in stamps}) == len(stamps)
+    assert len(lim["hist"]) == 24 and lim["hist"][0][2] == 0
+    assert lim["hist"][1][0] == L + 1500 and lim["hist"][1][2] == 0            # last record of bucket 0 is t=L+600
+    bf = next(p for p in lim["hist"] if p[0] // 900 == (L + 900) // 900)
+    assert bf[2] == 0                                                          # hist[3] was the first of its bucket, not the last
+    assert abs(lim["burn"]["1"] - 1.2) < 0.06 and lim["burn"]["24"] is not None
+    dr = lim["drain"]["1"]
+    assert dr and all(b[0] - a[0] == 3600 for a, b in zip(dr, dr[1:])) and dr[-1][0] == now, dr[-2:]
+    assert lim["seats"] == [{"used": 0.01 * 71 / 10, "reset": L + 90000, "period": WEEK}], lim["seats"]
+    assert gk["limits"][0]["label"] == "Weekly credits" and gk["limits"][0]["burn"]["1"] == 0.0
+    assert gk["accounts"][0]["windows"][0]["reset"] == L + 40000
+    assert gk["name"] == "Grok / Cursor" and gk["note"] == PROVIDER_NOTE["grok"] and "note" not in cl
+    # a window whose reset passed counts as 0 used and its reset rolls forward
+    stale = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L - 10, "ts": L - 99}}}], L, {}, False)["providers"][0]
+    assert stale["limits"][0]["now"] == 100.0 and stale["accounts"][0]["windows"][0] == {"id": "w", "label": "Weekly", "used": 0.0, "reset": L - 10 + WEEK}
+    assert stale["limits"][0]["burn"] == {"1": None, "3": None, "6": None, "24": None} and stale["limits"][0]["drain"]["1"] == []
+    assert build([], L)["providers"] == [] and build([], L)["first"] is None
+    # the page keeps both placeholders from being re-scanned and escapes </
+    assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
+    # icons: a valid PNG signature and an ICO header
+    assert png(16)[:8] == b"\x89PNG\r\n\x1a\n" and ico(png(16))[:6] == b"\0\0\1\0\1\0"
+    say("usage-history selftest: ok")
+
+
+def main():
+    if "--selftest" in sys.argv:
+        return selftest()
+    if "--make-icons" in sys.argv:
+        return make_icons()
+    os.makedirs(STATE, exist_ok=True)
+
+    def arg(flag, default):
+        return int(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
+    if "--backfill" in sys.argv:
+        return backfill(arg("--days", 7))
+    if "--serve" in sys.argv:
+        return serve(arg("--port", 8787))
+    now = time.time()
+    hist = load()
+    if "--render" not in sys.argv:
+        hist = save(hist, sample(now), now)
+    render(build(hist, now, load_emails(), extra=load_extra()))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
