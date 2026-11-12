@@ -1,0 +1,37 @@
+[
+  {
+    "status": 403,
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Your organization has disabled Claude subscription access for Claude Code\"},\"error_code\":\"oauth_org_not_allowed\"}",
+    "disabled": true
+  },
+  {
+    "status": 403,
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}",
+    "disabled": true
+  },
+  {
+    "status": 403,
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Request not allowed\"}}",
+    "disabled": false
+  },
+  {
+    "status": 403,
+    "body": "",
+    "disabled": false
+  },
+  {
+    "status": 429,
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"oauth_org_not_allowed\"}}",
+    "disabled": false
+  },
+  {
+    "status": 500,
+    "body": "disabled Claude subscription access",
+    "disabled": false
+  },
+  {
+    "status": 200,
+    "body": "{\"ok\":true}",
+    "disabled": false
+  }
+]
