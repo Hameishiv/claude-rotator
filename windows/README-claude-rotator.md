@@ -622,7 +622,6 @@ Consequently these four now match **both** paths, so they keep working on either
   The app's main process carries no `--type=` switch, so with only the `WindowsApps` test it
   passed every other filter and would have been killed and "resumed" as if it were a CLI TUI.
 
-
 ## Notes
 
 - **Tokens are secrets.** Never commit `~/.claude-cli-accounts`. They are stored locally
@@ -685,3 +684,28 @@ pooled weekly quota left (all models or Fable), the burn rate over 1/3/6/24 h, a
 when the pool runs out, with each seat refilled at its weekly reset. It reloads itself every 5 min.
 `--render` re-renders without sampling; `--selftest` runs the checks.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
+
+## Keeping the install in sync (`rotator-sync`)
+
+The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:
+**edit on a repo branch, merge it, then run `rotator-sync --pull`.** For a hot-fix made directly in the live
+folder, run `rotator-sync --push <branch>` and open a PR from that branch; the next `--pull` then changes
+nothing.
+
+Machine-specific values stay out of the scripts so the same file runs live and sits in the repo. Copy
+`rotator.local.example.json` to `rotator.local.json` (git-ignored) in the live folder and fill it in:
+`heartbeatRepo` and `hostId` (used by `app-seat-publish.ps1` and `claude-cli-account.ps1`; they default to
+the example placeholders), `repoClone` (a local clone of this repo, used by `rotator-sync`) and, only if
+the live folder is not where `rotator-sync.py` sits, `liveDir`. Extra shell functions that must not be in
+the repo go in `rotator-functions.local.ps1` (git-ignored), which `rotator-functions.ps1` dot-sources if it
+exists.
+
+| Command | What it does |
+|---|---|
+| `rotator-sync --check [--quiet]` | Fetches the clone (at most every 6 h), then compares every file under `windows/` at `origin/main` with the live folder, ignoring CRLF/LF and a UTF-8 BOM. Lists `differing` and `missing-live` files; files only in the live folder and `rotator.local.json` / `*.local.*` are ignored. Exit 1 if anything differs. Writes `~/.claude-cli-accounts/.rotator-drift.json`. |
+| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. |
+| `rotator-sync --push <branch>` | Makes a new worktree of the clone at the ref (`--worktree <path>` to choose where), copies every differing live file into its `windows/`, commits on `<branch>` and prints the worktree path. It never pushes and never opens a PR. |
+| `rotator-sync --selftest` | Runs the built-in checks in a temporary repo. |
+
+Options: `--repo <clone>`, `--live <folder>`, `--ref <ref>` (default `origin/main`). The usage dashboard shows a
+warning line when `.rotator-drift.json` lists any file, so a live folder that drifted from the repo is visible.
