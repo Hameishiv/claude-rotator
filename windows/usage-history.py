@@ -245,27 +245,37 @@ def fetch_grok(now):
 
 LS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
 LS_BODY = json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en"}}).encode()
-LS_PS = ("$ErrorActionPreference='SilentlyContinue';"
-         "$r=@(foreach($p in @(Get-CimInstance Win32_Process -Filter \"Name='language_server_windows_x64.exe'\")){"
+LS_PS = ("$ErrorActionPreference='SilentlyContinue';"       # the IDE's language server, or the CLI (agy.exe), which embeds one
+         "$r=@(foreach($p in @(Get-CimInstance Win32_Process -Filter \"Name='language_server_windows_x64.exe' OR Name='agy.exe'\")){"
          "[pscustomobject]@{ProcessId=$p.ProcessId;CommandLine=$p.CommandLine;"
          "Ports=@(Get-NetTCPConnection -OwningProcess $p.ProcessId -State Listen | ForEach-Object{$_.LocalPort})}});"
          "ConvertTo-Json -InputObject $r -Compress -Depth 3")
 
 
+LS_ADMIN = "Antigravity is running as administrator, so its quota can't be read. Start it from a normal (non-admin) window."
+LS_OFF = "Antigravity isn't running — open it to update"
+
+
 def parse_ls_procs(text):
-    """The probe's JSON -> [(csrf token, [listening ports])]; a process with no token or no port is dropped. Tokens are never logged."""
+    """The probe's JSON -> [(csrf token, [listening ports])]; a process with a command line but no token or no port is dropped.
+    A process whose command line is empty (Windows hides it from a normal process when the target runs as administrator)
+    comes back as (None, []), once. Tokens are never logged."""
     try:
         j = json.loads(text)
     except (TypeError, ValueError):
         return []
-    out = []
+    out, hidden = [], False
     for p in [j] if isinstance(j, dict) else j if isinstance(j, list) else []:
-        m = re.search(r"--csrf_token[=\s]+(\S+)", str(p.get("CommandLine") or "")) if isinstance(p, dict) else None
-        ports = p.get("Ports") if isinstance(p, dict) else None
+        if not isinstance(p, dict):
+            continue
+        cmd = str(p.get("CommandLine") or "").strip()
+        hidden = hidden or not cmd
+        m = re.search(r"--csrf_token[=\s]+(\S+)", cmd)
+        ports = p.get("Ports")
         ports = [x for x in (ports if isinstance(ports, list) else [ports]) if isinstance(x, int)]
         if m and ports:
             out.append((m.group(1).strip("\"'"), ports))
-    return out
+    return out + [(None, [])] if hidden else out
 
 
 def ls_probe():
@@ -344,13 +354,16 @@ def parse_gemini(j, now):
 
 
 def read_gemini(now, probe=ls_probe, query=query_ls):
-    """The seat from the running Antigravity language server, or None when none is running or no port answers."""
+    """(seat, note): the seat from the running Antigravity language server, else None with why - LS_ADMIN when a process exists
+    whose command line cannot be read, LS_OFF when none is running or no port answers."""
+    hidden = False
     for csrf, ports in probe():
-        for port in ports:
+        hidden = hidden or csrf is None
+        for port in ports if csrf else []:
             seat = parse_gemini(query(port, csrf), now)
             if seat:
-                return seat
-    return None
+                return seat, ""
+    return None, LS_ADMIN if hidden else LS_OFF
 
 
 def gemini_email():
@@ -360,10 +373,6 @@ def gemini_email():
         return e if isinstance(e, str) and e else None
     except (OSError, ValueError, AttributeError):
         return None
-
-
-def gemini_note(last):
-    return "Antigravity isn't running" + ("; last reading " + time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "")
 
 
 def load_pcache():
@@ -408,17 +417,16 @@ def sample(now, force=False):
     seat = read_live("grok", "grok", fetch_grok, GROK_EVERY, now, force, cache)
     if seat:
         rec["grok"] = {"grok": seat}
-    seat = read_gemini(now)             # local call: read on every sample
+    seat, why = read_gemini(now)        # local call: read on every sample
     if seat:
         cache["gemini_last"], cache.setdefault("notes", {})["gemini"] = int(now), {}
         rec["gemini"] = {"antigravity": seat}
         if seat.get("plan"):
             cache.setdefault("pnote", {})["gemini"] = "Plan: " + seat["plan"]
-    else:                               # not running: the last recorded reading stays on show, with a note
-        note = gemini_note(cache.get("gemini_last"))
-        cache.setdefault("notes", {})["gemini"] = {"antigravity": note}
+    else:                               # not readable: the last recorded reading stays on show (its age is the Read column), with the reason
+        cache.setdefault("notes", {})["gemini"] = {"antigravity": why}
         if not cache.get("gemini_last"):
-            rec["gemini"] = {"antigravity": {"ok": False, "note": note}}
+            rec["gemini"] = {"antigravity": {"ok": False, "note": why}}
     email = gemini_email()
     if email:
         cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
@@ -1265,20 +1273,28 @@ def selftest():
     def fq(port, csrf):
         tried.append((port, csrf))
         return gj if port == 4001 else None
-    assert read_gemini(7, lambda: parse_ls_procs(procs), fq)["ts"] == 7 and tried == [(4000, "tok1"), (4001, "tok1")]
-    assert read_gemini(7, lambda: [], fq) is None and read_gemini(7, lambda: [("t", [1])], lambda p, c: None) is None     # not running / no port answers
-    assert gemini_note(None) == "Antigravity isn't running" and gemini_note(1_800_000_000).startswith("Antigravity isn't running; last reading 20")
+    assert read_gemini(7, lambda: parse_ls_procs(procs), fq)[0]["ts"] == 7 and tried == [(4000, "tok1"), (4001, "tok1")]
+    assert read_gemini(7, lambda: [], fq) == (None, LS_OFF) and read_gemini(7, lambda: [("t", [1])], lambda p, c: None) == (None, LS_OFF)     # not running / no port answers
+    # 4: a process (the IDE server or agy.exe) whose command line is empty/unreadable means it runs as administrator; nothing else is tried to read its token
+    adm = '[{"ProcessId":9,"CommandLine":null,"Ports":[3]},{"ProcessId":10,"CommandLine":"","Ports":[]}]'
+    assert parse_ls_procs(adm) == [(None, [])] and parse_ls_procs('{"ProcessId":9,"CommandLine":"  ","Ports":[3]}') == [(None, [])]
+    assert parse_ls_procs('[{"ProcessId":9,"CommandLine":"agy.exe --hub","Ports":[3]}]') == []                      # readable but no token: nothing to ask
+    tried.clear()
+    assert read_gemini(7, lambda: parse_ls_procs(adm), fq) == (None, LS_ADMIN) and tried == []
+    assert read_gemini(7, lambda: parse_ls_procs('[' + adm[1:-1] + ',{"CommandLine":"x --csrf_token=t5","Ports":[4001]}]'), fq)[0]["ts"] == 7      # a readable server still wins
+    assert LS_ADMIN == "Antigravity is running as administrator, so its quota can't be read. Start it from a normal (non-admin) window."
+    assert LS_OFF == "Antigravity isn't running — open it to update" and "agy.exe" in LS_PS and "language_server_windows_x64.exe" in LS_PS and "Start-Process" not in LS_PS and "RunAs" not in LS_PS
     gh = [{"t": 1000 + 300 * i, "gemini": {"antigravity": dict(g, ts=1000 + 300 * i)}} for i in range(4)]
-    gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": gemini_note(2000)}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
+    gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": LS_OFF}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
     assert gb["id"] == "gemini" and gb["name"] == "Gemini" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
     assert [x["label"] for x in gb["limits"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"]
-    assert gb["accounts"][0]["email"] == "me@x" and gb["accounts"][0]["note"].startswith("Antigravity isn't running; last reading")
+    assert gb["accounts"][0]["email"] == "me@x" and gb["accounts"][0]["note"] == LS_OFF and gb["accounts"][0]["readAt"] == 1900
     assert gb["limits"][1]["seats"][0]["period"] == 18000 and gb["limits"][1]["now"] == 90.0
     gh = [dict(h, t=rst - 3600 + 300 * i) for i, h in enumerate(gh)]
     gb = build(gh, rst - 2000, {}, True, {})["providers"][0]
     assert gb["limits"][1]["now"] == 90.0 and gb["limits"][1]["seats"][0]["reset"] == rst and gb["accounts"][0]["note"] == ""
-    nr = build([{"t": 5, "gemini": {"antigravity": {"ok": False, "note": gemini_note(None)}}}], 9, {}, False, {})["providers"][0]
-    assert nr["loaded"] == 0 and nr["limits"] == [] and nr["accounts"][0]["note"] == "Antigravity isn't running"
+    nr = build([{"t": 5, "gemini": {"antigravity": {"ok": False, "note": LS_ADMIN}}}], 9, {}, False, {})["providers"][0]
+    assert nr["loaded"] == 0 and nr["limits"] == [] and nr["accounts"][0]["note"] == LS_ADMIN
 
     # D: Codex history from rollout logs (synthetic ~/.codex)
     from datetime import datetime, timezone
