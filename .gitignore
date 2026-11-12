@@ -1,0 +1,5 @@
+windows/rotator.local.json
+windows/rotator-functions.local.ps1
+*.bak*
+__pycache__/
+*.log

@@ -123,3 +123,10 @@ function claude-sync-history { pwsh -NoProfile -File (Join-Path (Join-Path (Join
 # 'resume'; own-window CLI sessions (merge-pr etc.) are just prompted 'resume'. -DryRun to preview.
 function claude-resume { pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-resume-sessions.ps1') @args }
 
+
+# rotator-sync: keep this folder identical to the repo (see README-claude-rotator.md, "Keeping the install in sync").
+function rotator-sync { py -3 (Join-Path $RotatorDir 'rotator-sync.py') @args }
+
+# Machine-local functions (e.g. other tools' wrappers) live in a git-ignored file so this one can match the repo.
+$RotatorLocalFunctions = Join-Path $RotatorDir 'rotator-functions.local.ps1'
+if (Test-Path -LiteralPath $RotatorLocalFunctions) { . $RotatorLocalFunctions }

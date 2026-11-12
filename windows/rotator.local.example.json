@@ -1,0 +1,5 @@
+{
+  "heartbeatRepo": "your-org/claude-config-backup",
+  "hostId": "my-laptop",
+  "repoClone": "C:\\path\\to\\your\\claude-rotator-clone"
+}

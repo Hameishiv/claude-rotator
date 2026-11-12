@@ -273,9 +273,12 @@ function Probe-Usage {
   if (-not (Test-Path $tf)) { return (New-ProbeUnknownResult $Label 'no token') }
   $tok = (Get-Content $tf -Raw).Trim()
   if (-not $tok) { return (New-ProbeUnknownResult $Label 'empty token') }
+  # The fable gate rejects UAs older than its minimum, so track the installed CLI; the fallback is only for when `claude` is not runnable.
+  $cliVer = try { ((& claude --version 2>$null | Out-String) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() } catch { '' }
+  if ($cliVer -notmatch '^\d+\.\d+\.\d+$') { $cliVer = '2.1.322' }
   $hdr  = @{ Authorization = "Bearer $tok"; 'anthropic-version' = '2023-06-01'
              'anthropic-beta' = 'oauth-2025-04-20,claude-code-20250219'
-             'User-Agent' = 'claude-cli/2.1.287 (external, cli)' }   # ponytail: hardcoded; the fable gate rejects UAs older than its minimum (2.1.251 on 2026-10-02) -- bump to `claude --version` when fable reads n/a with http 400
+             'User-Agent' = "claude-cli/$cliVer (external, cli)" }
   # Live discovery precedes the one-token usage probe; failure spends nothing.
   # -SkipHttpErrorCheck keeps the status and body. Invoke-RestMethod used to throw them
   # away as "model discovery failed", so a 403 oauth_org_not_allowed looked like a blip
@@ -526,7 +529,7 @@ function Show-Usage {
 # LINUX-PORT (owner ruling 2026-10-20): the box must never use the seat the laptop's Claude desktop
 # app is on AT THAT MOMENT. The box has no desktop app and cannot poll the laptop, so the laptop
 # PUSHES its live app seat (app-seat-publish.ps1, every 5 min + on every claude-app-rotator switch)
-# into the body of one heartbeat issue in Maon-Noam-Inc/claude-config-backup. This reads it and
+# into the body of one heartbeat issue in the heartbeat repo (rotator.local.json heartbeatRepo, default your-org/claude-config-backup). This reads it and
 # refreshes ~/.claude-app-seats/.active, which Get-AppSeatLabel below already falls back to.
 # FAIL-SAFE: freshness is judged on GitHub's own updated_at (server clock, so laptop clock skew
 # cannot fake it). Record older than StaleMin, unreadable, or gh down -> .active is left as the
@@ -539,7 +542,9 @@ function Sync-AppSeatFromLaptop {
   $appRoot = Join-Path $env:USERPROFILE '.claude-app-seats'
   $act  = Join-Path $appRoot '.active'
   $conf = Join-Path $appRoot '.laptop-sync.json'
-  $c = [ordered]@{ repo = 'Maon-Noam-Inc/claude-config-backup'; issue = 0; staleMin = 15; lastSeen = ''; lastUpdated = ''; staleLogged = $false; unconfLogged = $false }
+  $local = try { Get-Content (Join-Path $PSScriptRoot 'rotator.local.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+  $hbRepo = if ($local -and $local.heartbeatRepo) { [string]$local.heartbeatRepo } else { 'your-org/claude-config-backup' }
+  $c = [ordered]@{ repo = $hbRepo; issue = 0; staleMin = 15; lastSeen = ''; lastUpdated = ''; staleLogged = $false; unconfLogged = $false }
   if (Test-Path $conf) { try { $j = Get-Content $conf -Raw | ConvertFrom-Json; foreach ($k in @($c.Keys)) { if ($null -ne $j.$k) { $c[$k] = $j.$k } } } catch {} }
   $save = { try { $c | ConvertTo-Json | Set-Content -LiteralPath $conf -Encoding UTF8 } catch {} }
   $known = if (Test-Path $act) { (Get-Content $act -Raw).Trim() } else { '' }

@@ -532,6 +532,26 @@ points at the transcript's last assistant turn and copies its session state (`la
 turn. Originals are copied to `~/.claude-app-seats\.reconcile-backups\<timestamp>\`. Records
 whose uuid isn't in the transcript, and sessions touched in the last 10 minutes, are left alone.
 
+**Archives, pins and groups follow you across seats (2026-11-03).** Each seat keeps its own record
+per session, with its own `isArchived` and `isStarred` (a sidebar pin). Every sync compares each
+record's flags with what it saw last run (`~/.claude-app-seats\.flag-state.json`): a changed flag
+(archive/un-archive, pin/unpin) is copied to every seat's record of that session, and "on" wins if two
+seats changed opposite ways. The first run, and any session never seen before, use "on for any seat →
+on for all". Originals backed up under `~/.claude-app-seats\.flag-sync-backups\<timestamp>\`.
+
+The shared pin list and each seat's sidebar groups live in `%APPDATA%\Claude\claude_desktop_config.json`
+(`preferences.epitaxyPrefs`: `starred-local-code-sessions`, `dframe-group-scopes`,
+`dframe-code-sections`), keyed by each seat's own record ids. The sync rebuilds the pin list from the
+records' `isStarred` and copies every group, its sidebar section and its sessions to every seat
+(sessions matched across seats by `cliSessionId`). A group created, renamed or deleted, or a session
+moved in or out of one, on any seat since the last run (`.sidebar-state.json`) is applied to all.
+**This step runs only while the app is closed** (the live app rewrites that file from memory), so in
+practice at a `claude-account --switch`/`--rotate`; the 30-minute task skips it and says so. The file
+is backed up to `~/.claude-app-seats\.sidebar-sync-backups\<timestamp>\` before each write. A seat
+shows only the group members it has a record for, so sessions pruned from a seat's history (older
+than `-MaxAgeDays`) don't appear in its groups. This uses the app's undocumented internal format: an
+app update that renames these keys makes the step silently do nothing until it is updated.
+
 **The app reads its index at launch** — after a sync, new records appear when the app is
 restarted (or the workspace reopened), not in an already-open window.
 
@@ -654,3 +674,14 @@ A Claude Code mod at `mods/seats/ (installed via --plugin-dir or a plugin folder
 adds `/seats` (runs `claude-cli-account.ps1 --status`). A `command.run` hook answers the command itself, so it costs
 no model turn; the status run itself is the usual live read (~5s, tiny probes). Built 2026-11-01,
 tested headless with `claude -p --plugin-dir <mod folder> "/seats"`. Needs Claude Code 2.1.287+.
+
+## Usage dashboard (`usage-history.py`)
+
+The `Claude usage history` scheduled task runs `usage-history.py` every 5 minutes. It reads each
+seat's `usage-cache[-fable].json` (it never probes), appends a line to
+`~/.claude-cli-accounts/.usage-history.jsonl` (35 days kept), and rewrites
+`~/.claude-cli-accounts/usage-dashboard.html` from `usage-dashboard.template.html`. The page shows
+pooled weekly quota left (all models or Fable), the burn rate over 1/3/6/24 h, and a projection of
+when the pool runs out, with each seat refilled at its weekly reset. It reloads itself every 5 min.
+`--render` re-renders without sampling; `--selftest` runs the checks.
+Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
