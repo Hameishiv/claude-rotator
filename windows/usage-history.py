@@ -593,7 +593,7 @@ def build(hist, now, emails=None, app=False, extra=None):
     out = {"now": int(now), "app": app, "first": hist[0]["t"] if hist else None, "providers": provs}
     d = extra.get("drift")
     if d and d.get("differing"):
-        out["drift"] = {"n": len(d["differing"]), "names": [str(x) for x in d["differing"]]}
+        out["drift"] = {"n": len(d["differing"]), "names": [str(x) for x in d["differing"]], "checked": int(_f(d.get("checked")) or 0) or None}
     return out
 
 
@@ -1377,7 +1377,8 @@ def selftest():
 
     # E: the drift file shows in the blob only when it lists differing files; the 6-hourly check runs the script once per interval
     assert "drift" not in build([], 5, {}, False, {"drift": None}) and "drift" not in build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": []}})
-    assert build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": ["a.ps1", "b.py"]}})["drift"] == {"n": 2, "names": ["a.ps1", "b.py"]}
+    assert build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": ["a.ps1", "b.py"]}})["drift"] == {"n": 2, "names": ["a.ps1", "b.py"], "checked": 1}
+    assert build([], 5, {}, False, {"drift": {"ref": "r", "differing": ["a"]}})["drift"]["checked"] is None
     with tempfile.TemporaryDirectory() as td:
         keep, PCACHE = PCACHE, os.path.join(td, "p.json")
         try:

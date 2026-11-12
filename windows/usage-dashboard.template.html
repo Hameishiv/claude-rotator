@@ -40,7 +40,17 @@ select{background:var(--panel);color:var(--ink);padding:9px 12px}
 .range button{background:var(--panel);padding:8px 14px}
 .range button.i{padding:8px 10px;background:none}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--acc);display:inline-block;flex:none}
-.drift{margin:8px 0 0;font-size:13px;color:var(--warn)}
+.drift{margin-top:12px;background:var(--panel);border-radius:12px;padding:6px 14px;font-size:14px}
+.drift summary{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;list-style:none;color:var(--ink2);padding:4px 0}
+.drift summary::-webkit-details-marker{display:none}
+.drift summary svg{width:18px;height:18px;fill:none;stroke:var(--warn);stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.drift .dl{margin-left:auto;display:inline-flex;gap:10px;align-items:center;color:var(--muted)}
+.drift .dl b{font-weight:500;color:var(--ink2);text-decoration:underline;text-underline-offset:3px}
+.drift .dd{padding:2px 0 10px;color:var(--ink2)}
+.drift .dd p{margin:8px 0}
+.drift ul{list-style:none;margin:8px 0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.drift li{background:var(--btn);border-radius:6px;padding:2px 8px;font-size:13px}
+.drift code{font:13px ui-monospace,Consolas,monospace;background:var(--btn);border-radius:4px;padding:1px 5px}
 .msg{margin-top:12px;color:var(--warn);min-height:0}
 .panel{background:var(--panel);border-radius:16px;padding:20px;margin-top:16px}
 .ph{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between}
@@ -116,9 +126,18 @@ const ICON = {
   moon: '<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>',
   auto: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
   left: '<path d="M15 5l-7 7 7 7"/>', right: '<path d="M9 5l7 7-7 7"/>',
+  warn: '<path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5"/>',
   grid: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>'
 };
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
+
+function driftRow(d) {
+  return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Rotator files out of sync with GitHub (${d.n})</span>` +
+    `<span class="dl">${d.checked ? `<span>Checked ${esc(ago(d.checked))}</span>` : ''}<b>Details</b></span></summary><div class="dd">` +
+    `<p>The rotator scripts running on this PC differ from the published repo. Until they match, a fix made in one place is missing from the other.</p>` +
+    `<ul>${d.names.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` +
+    `<p>Run <code>rotator-sync --check</code> to see the differences; <code>rotator-sync --pull</code> takes the repo's version, <code>rotator-sync --push &lt;branch&gt;</code> sends yours.</p></div></details>`;
+}
 
 function applyTheme() {
   const r = document.documentElement;
@@ -252,7 +271,7 @@ function render() {
     `<div class="row t"><h1>Quota Management</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails" aria-pressed="${ui.emails}">${ico('eye')}Show emails</button>` +
     (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh all credentials'}</button>` : '') +
-    `</div></div>` + (D.drift ? `<p class="drift">Live rotator files differ from the repo (${D.drift.n}): ${esc(D.drift.names.join(', '))}. Run rotator-sync --check.</p>` : '') +
+    `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
     `<div class="msg" role="status">${esc(msg)}</div>` +
     `<div class="row tabs" role="group" aria-label="Provider"><button data-a="tab" data-v="all" aria-pressed="${ui.tab === 'all'}">${ico('grid')}All <span class="n">${tot}</span></button>` +
     ps.map(p => `<button data-a="tab" data-v="${esc(p.id)}" aria-pressed="${ui.tab === p.id}" style="--acc:var(--c-${esc(p.id)})"><span class="dot"></span>${esc(p.name)} <span class="n">${p.total}</span></button>`).join('') + `</div>` +
