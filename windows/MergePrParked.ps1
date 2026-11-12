@@ -333,7 +333,9 @@ function Test-ParkedLockAnswered {
   # process, one after another, inside the rotation mutex, so the scans' wall time is summed across
   # calls in this process ($script:ParkedScanPassSpent). Once the pass has spent PassSec, each further
   # parked window counts as answered without a scan (fail-open, pinged).
-  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60, [double]$PassSec = 60)
+  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60, [double]$PassSec = 60,
+    # Test seam: returns this process's CPU seconds. A throw (or $null) leaves only the wall clock bounding the scan.
+    [scriptblock]$CpuProbe = { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds })
   if ($null -eq $script:ParkedScanPassSpent) { $script:ParkedScanPassSpent = 0.0 }
   $left = $PassSec - $script:ParkedScanPassSpent
   if ($left -le 0) { return $true }
@@ -359,7 +361,7 @@ function Test-ParkedLockAnswered {
     # boundary resets the test, the compaction summary does not set it, and the copied history's old
     # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
-    $cpuNow = { try { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds } catch { $null } }
+    $cpuNow = { try { & $CpuProbe } catch { $null } }
     $cpu0 = & $cpuNow
     $n = 0
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')

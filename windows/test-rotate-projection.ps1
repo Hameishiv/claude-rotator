@@ -254,6 +254,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript @(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 })
   Check 'over budget among 512+ pre-park lines (no parse reached) => answered' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   Check 'same 512+ pre-park lines within budget => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # The CPU arm of the every-512-lines check, alone: the wall clock is far away and no line reaches a parse.
+  Check 'CPU budget spent among 512+ pre-park lines (wall clock far off) => answered' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0 -WallSec 1e9)
+  # A CPU time that cannot be read leaves only the wall clock; the scan must still find a post-park answer.
+  WriteTranscript (@(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 }) + @((UserLine 'go with B' 30 $ts0)))
+  Check 'CPU probe throws => scan still finds the post-park answer' (Test-ParkedLockAnswered -LockPath $lk -CpuProbe { throw 'no cpu time' })
+  WriteTranscript @(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 })
+  Check 'CPU probe throws, nothing after the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk -CpuProbe { throw 'no cpu time' }))
   WriteTranscript $noise
   Check 'transcript scan over its wall-clock backstop => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
