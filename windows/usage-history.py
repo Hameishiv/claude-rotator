@@ -59,8 +59,8 @@ PROVIDERS = {
     "claude": ("Claude", [("s", "5-hour", 18000), ("w", "Weekly", WEEK), ("f", "Fable weekly", WEEK)],
                [("w", "All models"), ("f", "Fable")]),
     "codex": ("Codex", [("s", "5-hour", 18000), ("w", "Weekly", WEEK)], [("w", "Weekly")]),
-    "grok": ("Grok / Cursor", [("w", "Weekly", WEEK)], [("w", "Weekly credits")]),
-    "gemini": ("Gemini (Antigravity)", None, None),      # its windows are whatever the language server reports
+    "grok": ("xAI", [("w", "Weekly", WEEK)], [("w", "Weekly credits")]),
+    "gemini": ("Gemini", None, None),      # its windows are whatever the language server reports
 }
 PROVIDER_NOTE = {"grok": "Cursor's Grok usage counts against this same xAI quota."}
 
@@ -914,7 +914,7 @@ def host_ok(host, port):
 
 
 def manifest():
-    return {"name": "Quota", "short_name": "Quota", "start_url": "/", "display": "standalone",
+    return {"name": "Quota Management", "short_name": "Quota Management", "start_url": "/", "display": "standalone",
             "background_color": "#0c0a09", "theme_color": "#0c0a09",
             "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
                       {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
@@ -1197,7 +1197,7 @@ def selftest():
     assert g["w"] == 0.22 and g["wp"] == WEEK and g["wr"] - 1_700_000_000 > 0, g
     assert parse_grok({"error": 1}) is None and parse_grok(None) is None
     assert "cursor" not in PROVIDERS and not any(n in globals() for n in ("fetch_cursor", "parse_cursor"))     # A: Cursor is gone
-    assert PROVIDERS["grok"][0] == "Grok / Cursor" and "same xAI quota" in PROVIDER_NOTE["grok"]
+    assert PROVIDERS["grok"][0] == "xAI" and PROVIDERS["gemini"][0] == "Gemini" and manifest()["name"] == "Quota Management" and "same xAI quota" in PROVIDER_NOTE["grok"]
 
     # A: history lines and the provider cache lose the retired cursor key, on disk
     global HIST, PCACHE
@@ -1244,7 +1244,7 @@ def selftest():
     assert gemini_note(None) == "Antigravity isn't running" and gemini_note(1_800_000_000).startswith("Antigravity isn't running; last reading 20")
     gh = [{"t": 1000 + 300 * i, "gemini": {"antigravity": dict(g, ts=1000 + 300 * i)}} for i in range(4)]
     gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": gemini_note(2000)}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
-    assert gb["id"] == "gemini" and gb["name"] == "Gemini (Antigravity)" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
+    assert gb["id"] == "gemini" and gb["name"] == "Gemini" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
     assert [x["label"] for x in gb["limits"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"]
     assert gb["accounts"][0]["email"] == "me@x" and gb["accounts"][0]["note"].startswith("Antigravity isn't running; last reading")
     assert gb["limits"][1]["seats"][0]["period"] == 18000 and gb["limits"][1]["now"] == 90.0
@@ -1425,7 +1425,7 @@ def selftest():
     assert lim["seats"] == [{"used": 0.01 * 71 / 10, "reset": L + 90000, "period": WEEK}], lim["seats"]
     assert gk["limits"][0]["label"] == "Weekly credits" and gk["limits"][0]["burn"]["1"] == 0.0
     assert gk["accounts"][0]["windows"][0]["reset"] == L + 40000
-    assert gk["name"] == "Grok / Cursor" and gk["note"] == PROVIDER_NOTE["grok"] and "note" not in cl
+    assert gk["name"] == "xAI" and gk["note"] == PROVIDER_NOTE["grok"] and "note" not in cl
     # a window whose reset passed counts as 0 used and its reset rolls forward
     stale = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L - 10, "ts": L - 99}}}], L, {}, False)["providers"][0]
     assert stale["limits"][0]["now"] == 100.0 and stale["accounts"][0]["windows"][0] == {"id": "w", "label": "Weekly", "used": 0.0, "reset": L - 10 + WEEK}

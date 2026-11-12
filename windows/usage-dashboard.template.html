@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="300">
-<title>Quota</title>
+<title>Quota Management</title>
 <style>
 :root{color-scheme:dark;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa}
 @media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}}
@@ -246,7 +246,7 @@ function render() {
   app.innerHTML =
     `<div class="top"><button data-a="reload" aria-label="Reload data" title="Reload data (updated ${esc(fmtDT(D.now))})">${ico('reload')}</button>` +
     `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
-    `<div class="row t"><h1>Quota</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
+    `<div class="row t"><h1>Quota Management</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails" aria-pressed="${ui.emails}">${ico('eye')}Show emails</button>` +
     (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh all credentials'}</button>` : '') +
     `</div></div>` + (D.drift ? `<p class="drift">Live rotator files differ from the repo (${D.drift.n}): ${esc(D.drift.names.join(', '))}. Run rotator-sync --check.</p>` : '') +
