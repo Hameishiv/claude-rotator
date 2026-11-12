@@ -374,6 +374,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'two line-start rulings, this PR second => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } }), (UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
   Check 'an oversized ruling number for another PR is not this one, and the scan carries on => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # Twins without the later human line: the oversized number alone must not answer this PR. The first is
+  # the same peer line as above; the second carries the ruling at a line start (origin.body, as a relay
+  # does), which is the form the formal-ruling match reads.
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'an oversized ruling number for another PR, no later human line => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine 'x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #99999999999999999999: x' } })))
+  Check 'an oversized ruling number at a line start, no later human line => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached.' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'CLI usage-reset continuation resubmitted by cache-keeper => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Usage reset: the 5-hour limit capped this window"' }) 4000 $ts0)))
