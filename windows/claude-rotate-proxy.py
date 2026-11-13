@@ -374,15 +374,16 @@ class Handler(BaseHTTPRequestHandler):
                 rec = usage_record(label, r.status, model, hdrs)
                 if rec:
                     write_cache(label, rec)
-            if attempt == 0 and ours and r.status == 403:
+            if ours and r.status == 403:
                 spent = r.read()
                 self._release(conn, r)
                 if is_subscription_disabled(r.status, spent):
+                    # Recorded on either attempt (the retry's seat can be the refused one); only the rotation and retry are limited to the first.
                     code = access_code(spent) or "subscription_disabled"
                     write_access_disabled(label, code)
                     write_health(False, label, "subscription_disabled")
                     log("403 subscription disabled on '%s' (%s)" % (label, code))
-                    after = ask_rotator(label, "403 subscription disabled")
+                    after = ask_rotator(label, "403 subscription disabled") if attempt == 0 else None
                     if after and after != label and after in by_label and not access_disabled_fresh(after):
                         log("retrying %s on '%s'" % (self.path.split("?")[0], after))
                         continue

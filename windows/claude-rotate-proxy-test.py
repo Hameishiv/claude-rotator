@@ -41,7 +41,7 @@ class Fake(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if tok == SECRET:  # explicit subscription-disabled 403, not a quota 429
+        if tok in (SECRET, "tok-D"):  # explicit subscription-disabled 403, not a quota 429
             body = (b'{"type":"error","error":{"type":"permission_error","message":'
                     b'"Your organization has disabled Claude subscription access for Claude Code"},'
                     b'"error_code":"oauth_org_not_allowed"}')
@@ -85,9 +85,10 @@ def main():
     with open(os.path.join(root, ".active"), "w") as f:
         f.write("A")
     rot = os.path.join(root, "fake_rotator.py")
-    with open(rot, "w") as f:   # rotates A -> B unless told not to
+    with open(rot, "w") as f:   # rotates to B (or the seat named in .next) unless told not to
         f.write("import os\nr=%r\nif not os.path.exists(os.path.join(r,'.no-rotate')):\n"
-                "    open(os.path.join(r,'.active'),'w').write('B')\n" % root)
+                "    n=os.path.join(r,'.next')\n"
+                "    open(os.path.join(r,'.active'),'w').write(open(n).read() if os.path.exists(n) else 'B')\n" % root)
 
     up = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     threading.Thread(target=up.serve_forever, daemon=True).start()
@@ -192,6 +193,23 @@ def main():
         assert h["ok"] is False and h["reason"] == "subscription_disabled" and h["active"] == "C", h
         assert SECRET not in json.dumps(h)
         print("ok  health reports the access failure, not mere process liveness")
+
+        # 9. A's quota 429 rotates onto D, and D refuses with a subscription-disabled 403: D is marked too. The retry is not retried again.
+        os.makedirs(os.path.join(root, "D"))
+        with open(os.path.join(root, "D", "token.txt"), "w") as f:
+            f.write("tok-D")
+        os.remove(os.path.join(root, ".no-rotate"))
+        with open(os.path.join(root, ".next"), "w") as f:
+            f.write("D")
+        with open(os.path.join(root, ".active"), "w") as f:
+            f.write("A")
+        time.sleep(21)
+        seen.clear()
+        status, body = call(port, "tok-A")
+        assert status == 403 and b"oauth_org_not_allowed" in body and seen == ["tok-A", "tok-D"], (status, body, seen)
+        md = os.path.join(root, "D", "access-disabled.json")
+        assert os.path.exists(md) and json.load(open(md))["code"] == "oauth_org_not_allowed"
+        print("ok  a refusal on the retry seat is recorded too")
         print("ALL PASSED")
     finally:
         proxy.terminate()
