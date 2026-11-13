@@ -266,4 +266,12 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(driftRow({ n: 1, names: ['a.ps1'] }).includes('(1 file differs)'));
   assert.ok(!/--push|--check/.test(tpl.slice(tpl.indexOf('function driftRow(d) {'), tpl.indexOf('\nfunction applyTheme('))));
 }
+// the emails button names what a click does: Show while hidden, Hide while shown
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const i = tpl.indexOf('`<button data-a="emails"'), j = tpl.indexOf('</button>`', i) + '</button>`'.length;
+  const btn = new Function('ui', 'ico', 'return ' + tpl.slice(i, j));
+  assert.strictEqual(btn({ emails: false }, () => ''), '<button data-a="emails">Show emails</button>');
+  assert.strictEqual(btn({ emails: true }, () => ''), '<button data-a="emails">Hide emails</button>');
+}
 console.log('usage-sim tests passed');
