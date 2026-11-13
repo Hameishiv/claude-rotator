@@ -361,10 +361,21 @@ Copy-Item (Join-Path $PSScriptRoot 'rotator-functions.ps1') $gd
 Set-Content -LiteralPath (Join-Path $gd 'claude-cli-account.ps1') -Value '# stand-in: --ensure-cli-seat finds nothing'
 Set-Content -LiteralPath (Join-Path $ga '.active') -Value 'B' -NoNewline
 @{ until = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ga 'B\access-disabled.json')
-$gate = { param($a) & pwsh -NoProfile -NonInteractive -Command "`$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; . '$gd\rotator-functions.ps1'; claude $a" 2>&1 | Out-String }
+# the stand-in claude.exe is a copy of the py launcher: `claude <name>` runs the script <name> here, which prints the token it was handed
+$gb = Join-Path $gh '.local\bin'; New-Item -ItemType Directory -Force -Path $gb | Out-Null
+$pyl = (Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if ($pyl) { Copy-Item $pyl (Join-Path $gb 'claude.exe') }
+foreach ($n in 'setup-token', 'run') { Set-Content -LiteralPath (Join-Path $gd $n) -Value 'import os; print("TOKEN=" + os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "-"))' }
+Set-Content -LiteralPath (Join-Path $ga 'B\token.txt') -Value 'sk-ant-oat01-SEATB-TOKENVALUE' -NoNewline
+# (the wrapper's paths come from USERPROFILE at dot-source time; the py shim then needs the real one back to find Python)
+$gate = { param($a) & pwsh -NoProfile -NonInteractive -Command "Set-Location '$gd'; `$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; `$env:CLAUDE_CODE_OAUTH_TOKEN = 'inherited'; . '$gd\rotator-functions.ps1'; `$env:USERPROFILE = '$($envKeep['USERPROFILE'])'; claude $a" 2>&1 | Out-String }
 Check 'a refused seat still stops a normal start' ((& $gate '--version') -match 'Not starting Claude Code')
-Check 'setup-token is never gated' ((& $gate 'setup-token') -notmatch 'Not starting Claude Code')
+Check 'a credential word that is not the first argument is still gated' ((& $gate '-p login') -match 'Not starting Claude Code')
 Check '/login is never gated' ((& $gate '/login') -notmatch 'Not starting Claude Code')
+$st_ = & $gate 'setup-token'
+Check 'setup-token is never gated, and is handed no token at all' ($st_ -notmatch 'Not starting Claude Code' -and (-not $pyl -or $st_ -match 'TOKEN=-')) $st_
+Remove-Item -LiteralPath (Join-Path $ga 'B\access-disabled.json')
+Check 'a normal start on a healthy seat gets that seat token' (-not $pyl -or (& $gate 'run') -match 'TOKEN=sk-ant-oat01-SEATB-TOKENVALUE')
 
 # --- the mocks took every machine-wide effect: the rotations above wrote nothing to HKCU and pinged no real session ---
 Check 'rotations persisted the token through the mock only' (@($script:envWrites | Where-Object { $_[0] -eq $EnvName }).Count -ge 1) ("writes=$($script:envWrites.Count)")

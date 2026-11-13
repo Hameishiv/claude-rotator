@@ -34,10 +34,12 @@ function claude {
     # move off it before this process's first request. A healthy seat, including A, is used as-is.
     $__root = Join-Path $ProfileHome '.claude-cli-accounts'
     $__act = Join-Path $__root '.active'; $__prev = $env:CLAUDE_CODE_OAUTH_TOKEN
+    # A credential command (claude setup-token / login / /login, as the FIRST argument) must run even when every seat is refused: no gate,
+    # and no seat token handed to it (it makes its own credential), not even an inherited one.
+    $__cred = @($args).Count -gt 0 -and "$(@($args)[0])" -in 'setup-token', 'login', '/login'
+    if ($__cred) { Remove-Item Env:\CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue }
     if (Test-Path $__act) {
         $__label = (Get-Content $__act -Raw).Trim()
-        # A credential command (adding a seat's token, a login) must run even when every seat is refused: no gate for it.
-        $__cred = [bool](@($args) | Where-Object { "$_" -in 'setup-token', 'login', '/login' })
         if (-not $__cred -and $__label -and (Test-AccessCooldownActive $__label)) {
             & pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-cli-account.ps1') --ensure-cli-seat
             $__label = if (Test-Path $__act) { (Get-Content $__act -Raw).Trim() } else { '' }
@@ -46,7 +48,7 @@ function claude {
                 return
             }
         }
-        if ($__label) {
+        if ($__label -and -not $__cred) {
             $__tf = Join-Path (Join-Path $__root $__label) 'token.txt'
             if (Test-Path $__tf) { $env:CLAUDE_CODE_OAUTH_TOKEN = (Get-Content $__tf -Raw).Trim() }
         }
