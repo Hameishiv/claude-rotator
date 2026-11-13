@@ -680,7 +680,7 @@ The `Claude usage history` scheduled task runs `usage-history.py` every 5 minute
 seat's `usage-cache[-fable].json` (it never probes), appends a line to
 `~/.claude-cli-accounts/.usage-history.jsonl` (35 days kept), and rewrites
 `~/.claude-cli-accounts/usage-dashboard.html` from `usage-dashboard.template.html`. The page shows
-pooled weekly quota left (all models or Fable), the burn rate over 1/3/6/24 h, and a projection of
+the weekly quota left (all models or Fable) as a share of the whole pool (100 % = every seat full; the headline says how many seats), the usage rate in % of the whole pool per hour, and a projection of
 when the pool runs out, with each seat refilled at its weekly reset. It reloads itself every 5 min.
 `--render` re-renders without sampling; `--selftest` runs the checks.
 
@@ -689,12 +689,13 @@ each local hour of the day, built from the limit's whole history (up to 35 days)
 extrapolated at the daytime rate. `1h`/`3h`/`6h`/`24h` hold that recent rate flat instead. `--backtest` replays the
 history, projecting 24 h ahead from every 6 h point with each method (the profile built only from data before that
 point), and prints each method's mean absolute error; run it again once more history has accumulated.
-Account tables badge the seat each tool is on (`CLI`, `App`; Codex's app and CLI share one login, so `App`) and colour
+Account tables badge the seat each tool is on with a blue `CLI` or violet `App` pill (Codex's app and CLI share one login, so `App`; the provider header repeats them with the seat letter) and colour
 each cell: for Claude from the API's own status for that window (`allowed`, `allowed_warning`, `rejected`), for Codex,
 xAI and Gemini green below 85 %, yellow from 85 %, red and `capped` at 100 %. A Codex seat with a banked reset gets an
 `Apply reset` button (app only; it asks first) that runs `codexRedeemScript` (`rotator.local.json`, default
 `~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py`) with `--account X --confirm`; with no such file the button is
 not shown. Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
+A reading over 3 h old is shown in a muted warning colour in the `Read` column, over 24 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
 
 ## Keeping the install in sync (`rotator-sync`)
