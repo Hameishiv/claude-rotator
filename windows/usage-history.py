@@ -1641,11 +1641,13 @@ def codex_events(cdir, now, since, known):
     return sorted((e for e in own if e[0] >= now - KEEP_DAYS * DAY), key=lambda e: e[0])
 
 
-def rollout_records(events, taken, rebuilt, hist=()):
+def rollout_records(events, taken, rebuilt, hist=(), carry=False):
     """History records from attributed events: one per 5 minutes, each carrying every seat seen so far at its newest state;
     none in a 5-minute bucket listed in `taken` (a recorded point is never overwritten). `rebuilt` flags them b like the Claude backfill.
     A seat's state starts from (and is refreshed by) the latest earlier `hist` record when that reading is newer, so a seat idle in the logs
-    stays in records that build_limit reads as the whole pool."""
+    stays in records that build_limit reads as the whole pool.
+    With `carry`, when the last event falls in a taken bucket (so no record holds it), one more record flagged "carry" is added with every
+    seat's newest state: never saved (append_rollouts and take drop it), only for newest_codex, so the current sample still gets that reading."""
     prior = sorted((h for h in hist if isinstance(h.get("codex"), dict)), key=lambda h: h["t"])
     state, recs, i = {}, [], 0
     for t, seat, wins in events:
@@ -1666,6 +1668,8 @@ def rollout_records(events, taken, rebuilt, hist=()):
             recs[-1]["codex"] = snap
         else:
             recs.append(dict({"t": t, "codex": snap}, **({"b": 1} if rebuilt else {})))
+    if carry and events and events[-1][0] // BUCKET5 in taken:
+        recs.append({"t": events[-1][0], "codex": {a: dict(b) for a, b in state.items()}, "carry": 1})
     return recs
 
 
@@ -1689,7 +1693,7 @@ def newest_codex(rec, hist, new=()):
     return rec
 
 
-def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
+def import_rollouts(hist, now, rebuilt, since=0, cdir=None, carry=False):
     """-> (new records, {seat: (events, earliest t)}) from the Codex rollout logs; buckets `hist` already has a codex point in are left alone."""
     cdir = cdir or os.path.join(HOME, ".codex")
     sink, known = [], {}
@@ -1704,7 +1708,7 @@ def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
     for t, seat, _ in ev:
         n, first = per.get(seat, (0, t))
         per[seat] = (n + 1, min(first, t))
-    return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt, hist), per
+    return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt, hist, carry), per
 
 
 _ROLL = {}      # rollout path -> ((mtime, size), parsed events): a log is parsed again only when it changed
@@ -2225,7 +2229,7 @@ class Store:
         """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it."""
         since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
-            new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir)
+            new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
             applog("codex import error: %s: %s" % (type(e).__name__, e))
             return []
@@ -2237,6 +2241,7 @@ class Store:
         return new
 
     def append_rollouts(self, new):
+        new = [r for r in new if not r.get("carry")]      # a carry record only feeds newest_codex
         if new:
             with hist_lock():
                 stale = hist_sig() != _SIG      # someone else wrote since: take the file as it now is
@@ -2334,7 +2339,7 @@ class Store:
             rec = sample(now, force)
             new = self.read_rollouts(now)                   # first, and every point of them, so the sample is merged with all the logs saw
             self.hist = save(self.hist, newest_codex(rec, self.hist, new), now)
-            self.append_rollouts([r for r in new if r["t"] // BUCKET5 != rec["t"] // BUCKET5])     # the sample now holds its own bucket
+            self.append_rollouts([r for r in new if r["t"] // BUCKET5 != rec["t"] // BUCKET5])     # the sample now holds its own bucket (carry records are dropped there)
             return self.rebuild(now)
 
     def codex_reset(self, seat, script, popen=subprocess.Popen):
@@ -3138,6 +3143,15 @@ def selftest():
         pr = rollout_records([(N, "A", {"w": (0.2, N + 99, WEEK)}), (N + 400, "A", {"w": (0.3, N + 99, WEEK)})], set(), False, ph)
         assert [r["t"] for r in pr] == [N, N + 400] and [set(r["codex"]) for r in pr] == [{"A", "B"}] * 2
         assert [r["codex"]["B"]["w"] for r in pr] == [0.4, 0.5] and [r["codex"]["A"]["w"] for r in pr] == [0.2, 0.3]
+        # the newest event lands in a bucket a sample already holds: no record for it, but with carry the current sample still gets it
+        ev_ = [(N, "A", {"w": (0.1, N + 99, WEEK)}), (N + 120, "A", {"w": (0.2, N + 99, WEEK)})]
+        tk_ = {(N + 120) // BUCKET5}
+        assert all(r["codex"]["A"]["w"] != 0.2 for r in rollout_records(ev_, tk_, False))
+        cr_ = rollout_records(ev_, tk_, False, carry=True)
+        assert cr_[-1].get("carry") and cr_[-1]["codex"]["A"]["w"] == 0.2 and not any(r.get("carry") for r in cr_[:-1])
+        got_ = newest_codex({"t": N + 400, "codex": {"A": {"ts": N + 10, "w": 0.1}}}, [], cr_)["codex"]["A"]
+        assert got_["w"] == 0.2 and got_["ts"] == N + 120, got_
+        assert rollout_records(ev_, set(), False, carry=True)[-1].get("carry") is None      # nothing to carry when the bucket is free
         pz = [r for r in import_rollouts([{"t": N - 3600, "codex": {"Z": {"w": 0.7, "ts": N - 3600}}}], N, False, 0, td)[0] if r["t"] > N - 3600]
         assert pz and all(r["codex"]["Z"] == {"w": 0.7, "ts": N - 3600} for r in pz)                     # the import passes the history in
         # imported records feed the dashboard: pooled weekly history per seat, and a codex-only newest record does not hide Claude

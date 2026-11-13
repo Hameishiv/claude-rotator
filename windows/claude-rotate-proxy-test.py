@@ -196,6 +196,27 @@ def main():
         assert SECRET not in json.dumps(h)
         print("ok  health reports the access failure, not mere process liveness")
 
+        # 8b. saved negative health does not outlive its evidence: an expired refusal marker, an old "exhausted"
+        def health():
+            hc = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            hc.request("GET", "/__proxy/health")
+            return json.loads(hc.getresponse().read())
+        mc = os.path.join(root, "C", "access-disabled.json")
+        m_ = json.load(open(mc))
+        m_["until"] = time.time() - 1
+        with open(mc, "w") as f:
+            json.dump(m_, f)
+        h = health()
+        assert h["ok"] is True and h["reason"] == "ready", h        # the saved subscription_disabled health was not believed past the cooldown
+        hp = os.path.join(root, ".seat-health.json")
+        with open(hp, "w") as f:
+            json.dump({"ok": False, "active": "C", "reason": "exhausted", "ts": int(time.time())}, f)
+        assert health()["reason"] == "exhausted"
+        with open(hp, "w") as f:
+            json.dump({"ok": False, "active": "C", "reason": "exhausted", "ts": int(time.time()) - 7200}, f)
+        assert health()["ok"] is True
+        print("ok  saved negative health expires with its evidence")
+
         # 9. A's quota 429 rotates onto D, and D refuses with a subscription-disabled 403: D is marked too. The retry is not retried again.
         os.makedirs(os.path.join(root, "D"))
         with open(os.path.join(root, "D", "token.txt"), "w") as f:

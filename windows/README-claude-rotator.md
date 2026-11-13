@@ -27,8 +27,8 @@ the Codex CLI, the Grok CLI, the Antigravity app (Gemini).
 4. **Add your accounts.** For each Claude account, sign in to it in a browser, run `claude setup-token`, and store the token
    under a label of your choice (`A`, `B`, ...): `claude-rotator --capture A`. Put the account's address in
    `%USERPROFILE%\.claude-cli-accounts\A\email.txt`. Details: *Add a new account / seat* below.
-5. **First run.** `claude-rotator --status` probes every seat and shows its usage; `claude-rotator --best` switches to the
-   seat with the most headroom.
+5. **First run.** `claude-rotator --status` probes every seat and shows its usage; `claude-rotator --switch best` switches to the
+   seat with the most headroom (`--best` only ranks them).
 6. **Automatic rotation (optional).** Register the 5-minute watcher (run once; adjust the path):
    ```
    $a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"C:\path\to\rotator-folder\check-rotate-hidden.vbs"'
@@ -378,7 +378,7 @@ So close/rotate/reopen stays for the app.
 | | |
 |---|---|
 | Task | `Claude rotate proxy`: at logon, re-launched every minute. A running instance makes the relaunch a no-op, so a dead proxy is back within a minute. |
-| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` — `ok` is false while the active seat's subscription-disabled cooldown is in force. A live process with a refused seat is not healthy. |
+| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` — `ok` is false while the active seat's subscription-disabled cooldown is in force (or for 30 minutes after the watcher found every seat exhausted). A live process with a refused seat is not healthy. |
 | Log | `~\.claude-cli-accounts\.proxy-log.txt` (rolls at 1 MB) |
 | Opt out | `$env:CLAUDE_ROTATOR_PROXY = "0"` for the `claude` function; `MERGE_PR_ROTATE_PROXY=0` for review windows |
 | Tests | `claude-rotate-proxy.py --self-test`; `claude-rotate-proxy-test.py` (fake upstream, sandbox seats: quota 429 → rotate → retry, a running session follows, foreign token untouched, no-target returns the original 429) |

@@ -209,16 +209,18 @@ def write_health(ok, label, reason):
 
 
 def health_state():
-    """Process liveness is not health. A fresh access refusal on the active seat is not ok."""
+    """Process liveness is not health. A fresh access refusal on the active seat is not ok. The saved health file is believed only as long as
+    its evidence: a saved "subscription_disabled" only while the seat's refusal marker is fresh (checked first), a saved "exhausted" only for
+    ACCESS_COOLDOWN after it was written, so a recovered seat is not reported unhealthy for ever when no watcher rewrites the file."""
     label = active_label()
     if label and access_disabled_fresh(label):
         return False, label, "subscription_disabled"
     try:
         with open(os.path.join(ROOT, ".seat-health.json"), encoding="utf-8") as handle:
             data = json.load(handle)
-        if (data.get("active") == label and data.get("ok") is False
-                and data.get("reason") in ("subscription_disabled", "exhausted")):
-            return False, label, data.get("reason") or "subscription_disabled"
+        if (data.get("active") == label and data.get("ok") is False and data.get("reason") == "exhausted"
+                and time.time() - float(data.get("ts") or 0) < ACCESS_COOLDOWN):
+            return False, label, "exhausted"
     except (OSError, ValueError, TypeError):
         pass
     return True, label, "ready"
