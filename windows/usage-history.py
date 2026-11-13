@@ -1455,6 +1455,27 @@ def rollout_records(events, taken, rebuilt, hist=()):
     return recs
 
 
+def newest_codex(rec, hist, new=()):
+    """Each Codex seat in sample `rec` keeps the newest measurement (by its own ts) among this sample's cache reading, the rollout points just read
+    (`new`) and the newest earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
+    so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note) is left as it is."""
+    cur = rec.get("codex")
+    if not isinstance(cur, dict):
+        return rec
+    seen = set()
+    for h in list(reversed(new)) + list(reversed(hist)):
+        for seat, v in (h.get("codex") or {}).items():
+            c = cur.get(seat)
+            if seat in seen or not isinstance(c, dict) or not isinstance(v, dict):
+                continue
+            seen.add(seat)
+            if c.get("ts") and (v.get("ts") or 0) > c["ts"]:
+                cur[seat] = dict(v)
+        if seen >= set(cur):
+            break
+    return rec
+
+
 def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
     """-> (new records, {seat: (events, earliest t)}) from the Codex rollout logs; buckets `hist` already has a codex point in are left alone."""
     cdir = cdir or os.path.join(HOME, ".codex")
@@ -1986,14 +2007,21 @@ class Store:
 
     def import_codex(self, now, cdir=None):
         """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
+        self.append_rollouts(self.read_rollouts(now, cdir))
+
+    def read_rollouts(self, now, cdir=None, rec=None):
+        """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it."""
         since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
-            new, _ = import_rollouts(self.hist, now, False, since, cdir)
+            new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
             applog("codex import error: %s: %s" % (type(e).__name__, e))
-            return
+            return []
         with pcache_txn() as cache:
             cache["codex_import"] = int(now)
+        return new
+
+    def append_rollouts(self, new):
         if new:
             with hist_lock():
                 stale = hist_sig() != _SIG      # someone else wrote since: take the file as it now is
@@ -2057,8 +2085,10 @@ class Store:
     def take(self, force=False):
         with self.lock:
             now = time.time()
-            self.hist = save(self.hist, sample(now, force), now)
-            self.import_codex(now)
+            rec = sample(now, force)
+            new = self.read_rollouts(now, None, rec)        # first, so the sample can be merged with what the logs saw
+            self.hist = save(self.hist, newest_codex(rec, self.hist, new), now)
+            self.append_rollouts(new)
             return self.rebuild(now)
 
     def codex_reset(self, seat, script, popen=subprocess.Popen):
@@ -2793,6 +2823,13 @@ def selftest():
         hh = sorted([{"t": N - 9000, "s": {"X": {"w": 0.1, "wr": N + 9999}}}] + recs, key=lambda h: h["t"])
         cb = build(hh, N, {}, False, {})
         assert [p["id"] for p in cb["providers"]] == ["claude", "codex"] and cb["providers"][1]["limits"][0]["hist"][0][2] == 1
+        # newest_codex: a seat keeps its newest measurement; a stale cache value never wins over the logs or an earlier sample
+        rec_ = {"t": N + 9, "codex": {"A": {"ts": N - 100, "w": 0.1}, "B": {"ts": N - 10, "w": 0.5}, "C": {"ok": False, "note": "no usage cached yet"}}}
+        hist_ = [{"t": N - 50, "codex": {"A": {"ts": N - 60, "w": 0.6}, "B": {"ts": N - 40, "w": 0.4}, "C": {"ts": N - 40, "w": 0.3}}}]
+        new_ = [{"t": N - 30, "codex": {"A": {"ts": N - 30, "w": 0.7}}}]
+        got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, new_)["codex"]
+        assert got_["A"] == {"ts": N - 30, "w": 0.7} and got_["B"] == {"ts": N - 10, "w": 0.5} and got_["C"] == rec_["codex"]["C"], got_
+        assert newest_codex({"t": 1}, hist_, new_) == {"t": 1}
         # the sampler's import: nothing on the first run (sets the watermark), then only files modified since, recorded (not b), merged in time order
         keep, HIST, PCACHE = (HIST, PCACHE), os.path.join(td, "h.jsonl"), os.path.join(td, "p.json")
         try:
@@ -2811,6 +2848,21 @@ def selftest():
             roll(os.path.join(td, "homes", "A", "sessions", "rollout-new2.jsonl"), [tc(N + 400, wk=(40, WA))], N + 500)
             st.import_codex(N + 600, td)
             assert [h["t"] for h in st.hist] == [N - 9000, N + 5, N + 400]
+            # take(): the logs' newer reading wins over this tick's stale cache value, and no imported point lands on the sample's bucket
+            roll(os.path.join(td, "homes", "A", "sessions", "rollout-take.jsonl"), [tc(N + 700, wk=(70, WA))], N + 710)
+            keep_s, real_time = sample, time.time
+            orig_rr = st.read_rollouts
+            st.lock, st.rebuild = threading.RLock(), lambda now: None
+            st.read_rollouts = lambda now, cdir=None, rec=None: orig_rr(now, td, rec)
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": {"ts": N - 7000, "w": 0.1, "wr": WA, "wp": WEEK}}}
+                time.time = lambda: N + 1000
+                st.take()
+            finally:
+                globals()["sample"], time.time = keep_s, real_time
+            zs = [h for h in st.hist if "codex" in h]
+            assert zs[-1]["t"] == N + 1000 and zs[-1]["codex"]["A"]["w"] == 0.7, zs[-2:]
+            assert len({h["t"] // BUCKET5 for h in zs}) == len(zs)
         finally:
             HIST, PCACHE = keep
         # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
