@@ -36,7 +36,9 @@ function claude {
     $__act = Join-Path $__root '.active'; $__prev = $env:CLAUDE_CODE_OAUTH_TOKEN
     if (Test-Path $__act) {
         $__label = (Get-Content $__act -Raw).Trim()
-        if ($__label -and (Test-AccessCooldownActive $__label)) {
+        # A credential command (adding a seat's token, a login) must run even when every seat is refused: no gate for it.
+        $__cred = [bool](@($args) | Where-Object { "$_" -in 'setup-token', 'login', '/login' })
+        if (-not $__cred -and $__label -and (Test-AccessCooldownActive $__label)) {
             & pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-cli-account.ps1') --ensure-cli-seat
             $__label = if (Test-Path $__act) { (Get-Content $__act -Raw).Trim() } else { '' }
             if ($__label -and (Test-AccessCooldownActive $__label)) {

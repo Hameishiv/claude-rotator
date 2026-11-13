@@ -340,6 +340,18 @@ $py = (Get-Content (Join-Path $PSScriptRoot 'claude-rotate-proxy.py') -Raw) + (G
 Check 'rotator has no hardcoded app-only seat' ($src -notmatch 'AppOnly|reserved app-only')
 Check 'proxy and hook do not exclude label A' ($py -notmatch '== ["'']A["'']|label == "A"')
 
+# --- the claude wrapper's seat gate never blocks a credential command (every seat refused, the user adds a token) ---
+$gd = Join-Path $root 'gate'; $gh = Join-Path $gd 'home'; $ga = Join-Path $gh '.claude-cli-accounts'
+New-Item -ItemType Directory -Force -Path (Join-Path $ga 'B') | Out-Null
+Copy-Item (Join-Path $PSScriptRoot 'rotator-functions.ps1') $gd
+Set-Content -LiteralPath (Join-Path $gd 'claude-cli-account.ps1') -Value '# stand-in: --ensure-cli-seat finds nothing'
+Set-Content -LiteralPath (Join-Path $ga '.active') -Value 'B' -NoNewline
+@{ until = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ga 'B\access-disabled.json')
+$gate = { param($a) & pwsh -NoProfile -NonInteractive -Command "`$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; . '$gd\rotator-functions.ps1'; claude $a" 2>&1 | Out-String }
+Check 'a refused seat still stops a normal start' ((& $gate '--version') -match 'Not starting Claude Code')
+Check 'setup-token is never gated' ((& $gate 'setup-token') -notmatch 'Not starting Claude Code')
+Check '/login is never gated' ((& $gate '/login') -notmatch 'Not starting Claude Code')
+
 # --- the mocks took every machine-wide effect: the rotations above wrote nothing to HKCU and pinged no real session ---
 Check 'rotations persisted the token through the mock only' (@($script:envWrites | Where-Object { $_[0] -eq $EnvName }).Count -ge 1) ("writes=$($script:envWrites.Count)")
 Check 'access rotation pinged sessions through the mock only' ($script:pings.Count -ge 1) ("pings=$($script:pings.Count)")
