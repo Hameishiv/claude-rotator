@@ -185,16 +185,50 @@ def cmd_pull(repo, live, ref, state):
     at = resolve(repo, ref)
     differing, missing = compare(repo, live, at)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    for rel in differing + missing:
-        dest = os.path.join(live, *rel.split("/"))
-        data = repo_bytes(repo, at, rel)        # first: a git failure must not leave a truncated live script
-        if rel in differing:
-            shutil.copy2(dest, "%s.bak-sync-%s" % (dest, stamp))
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        tmp = dest + ".tmp-sync"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, dest)
+    # All or nothing: a half-applied update (a script replaced before the new file it imports arrives) cannot start. So every new
+    # version is read and written to a .tmp-sync sibling first, touching nothing live; only then is each one swapped in, after a
+    # backup, and any failure puts back every file already swapped (and removes the ones added) before it is reported.
+    staged = []
+    try:
+        for rel in differing + missing:
+            dest = os.path.join(live, *rel.split("/"))
+            data = repo_bytes(repo, at, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest + ".tmp-sync", "wb") as fh:
+                fh.write(data)
+            staged.append((rel, dest))
+    except BaseException:
+        for _, dest in staged:
+            with contextlib.suppress(OSError):
+                os.remove(dest + ".tmp-sync")
+        raise
+    done = []                                   # (dest, its backup, or None for a file this pull added)
+    try:
+        for rel, dest in staged:
+            bak = None
+            if rel in differing:
+                bak = "%s.bak-sync-%s" % (dest, stamp)
+                shutil.copy2(dest, bak)
+            os.replace(dest + ".tmp-sync", dest)
+            done.append((dest, bak))
+    except OSError as e:
+        bad = []
+        for dest, bak in reversed(done):
+            try:
+                if bak:
+                    shutil.copy2(bak, dest)
+                else:
+                    os.remove(dest)
+            except OSError:
+                bad.append(dest)
+        for _, dest in staged:
+            with contextlib.suppress(OSError):
+                os.remove(dest + ".tmp-sync")
+        sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
+                         "these could not be put back, restore them from their .bak-sync-%s copies: %s" % (stamp, ", ".join(bad))))
+        record(repo, live, ref, state, at)
+        return 1
+    for rel, _ in staged:
         print("%s %s" % ("added   " if rel in missing else "replaced", rel))
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
@@ -279,6 +313,31 @@ def selftest():
         with open(os.path.join(live, "b.py"), "rb") as fh:
             check("a failed pull leaves the live file intact", fh.read() == b"print(2)\n")
         check("a failed pull leaves no temp file", not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+
+        # --pull is all or nothing: a swap failing part-way puts back every file already swapped and removes the ones it added
+        before_ = {n: open(os.path.join(live, n), "rb").read() for n in ("a.ps1", "b.py", "c.ps1")}
+        os.remove(os.path.join(live, "missing.txt"))
+        real_replace, swaps = os.replace, []
+
+        def failing_replace(src, dst):
+            if str(src).endswith(".tmp-sync"):
+                swaps.append(dst)
+                if len(swaps) == 3:
+                    raise PermissionError("in use")
+            return real_replace(src, dst)
+        os.replace = failing_replace
+        try:
+            rc_ = cmd_pull(repo, live, "HEAD", state)
+        except OSError:
+            rc_ = "raised"
+        finally:
+            os.replace = real_replace
+        check("a failed swap reports failure", rc_ == 1 and len(swaps) == 3)
+        check("... and live is exactly as before", {n: open(os.path.join(live, n), "rb").read() for n in before_} == before_
+              and not os.path.exists(os.path.join(live, "missing.txt")) and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        for n in os.listdir(live):
+            if ".bak-sync-" in n:
+                os.remove(os.path.join(live, n))
 
         # --pull: live is overwritten from the ref, each overwritten file backed up, local files untouched
         cmd_pull(repo, live, "HEAD", state)
