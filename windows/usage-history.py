@@ -1698,6 +1698,14 @@ def rollout_records(events, taken, rebuilt, hist=(), carry=False):
 CODEX_WINDOW_KEYS = ("w", "wr", "wp", "s", "sr", "sp", "ts")    # what a rollout log can measure; banked / bankedList come only from the cache
 
 
+def one_shot(now):
+    """Sample once and save (the run with no --serve). The history is loaded after the slow sample, so a reading the server saved meanwhile is
+    compared too, and the sample's Codex seats keep the newest measurement (newest_codex): a stale cache never undoes a newer logged one."""
+    rec = sample(now)
+    hist = load()
+    return save(hist, newest_codex(rec, hist), now)
+
+
 def newest_codex(rec, hist, new=()):
     """Each Codex seat in sample `rec` keeps the newest measurement (by its own ts) among this sample's cache reading, the rollout points just read
     (`new`) and every earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
@@ -3208,8 +3216,15 @@ def selftest():
         got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, new_)["codex"]
         assert got_["A"] == {"ts": N - 30, "w": 0.7} and got_["B"] == {"ts": N - 10, "w": 0.5} and got_["C"] == rec_["codex"]["C"], got_
         assert newest_codex({"t": 1}, hist_, new_) == {"t": 1}
-        src_ = open(os.path.abspath(__file__), encoding="utf-8").read()                 # the one-shot sample (no --serve) reconciles as take() does
-        assert "hist = save(hist, newest_codex(sample(now), hist), now)" in src_
+        calls_, keep_ = [], (sample, load, save)                                        # the one-shot run (no --serve): sample first, then load, then reconcile
+        try:
+            globals()["sample"] = lambda now, force=False: calls_.append("sample") or {"t": N + 9, "codex": {"A": {"ts": N - 100, "w": 0.1}}}
+            globals()["load"] = lambda: calls_.append("load") or [{"t": N - 50, "codex": {"A": {"ts": N - 60, "w": 0.6}}}]
+            globals()["save"] = lambda h, rec, now: calls_.append(rec) or h
+            one_shot(N + 9)
+        finally:
+            globals()["sample"], globals()["load"], globals()["save"] = keep_
+        assert calls_[:2] == ["sample", "load"] and calls_[2]["codex"]["A"] == {"ts": N - 60, "w": 0.6}, calls_
         # the maximum over every record: a later record holding an older measurement does not hide an earlier record's newer one
         got_ = newest_codex({"t": N, "codex": {"A": {"ts": N - 900, "w": 0.1}}}, [{"t": N - 50, "codex": {"A": {"ts": N - 40, "w": 0.9}}},
                                                                          {"t": N - 10, "codex": {"A": {"ts": N - 500, "w": 0.5}}}])["codex"]
@@ -4918,9 +4933,7 @@ def main():
     if "--serve" in sys.argv:
         return serve(arg("--port", 8787))
     now = time.time()
-    hist = load()
-    if "--render" not in sys.argv:
-        hist = save(hist, newest_codex(sample(now), hist), now)     # as the server's take(): a stale cache never undoes a newer logged reading
+    hist = load() if "--render" in sys.argv else one_shot(now)
     render(build(hist, now, load_emails(), extra=load_extra()))
 
 
