@@ -3,8 +3,8 @@
   "hostId": "my-laptop",
   "repoClone": "C:\\path\\to\\your\\claude-rotator-clone",
   "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py",
-  "_seatWeights": "How many regular seats each seat counts as in the usage dashboard's pooled numbers (default 1; 0 leaves a seat out). Per provider (claude, codex, grok, gemini), by seat letter. Wins over planWeights.",
-  "seatWeights": { "claude": { "A": 1 }, "codex": { "B": 5 } },
-  "_planWeights": "Same, by the plan the provider reports for the seat (Codex only today: shown in the dashboard's Codex table). Providers do not publish exact multipliers, so you state them.",
-  "planWeights": { "codex": { "plus": 1, "pro": 5 } }
+  "_seatWeights": "How many regular seats each seat counts as in the usage dashboard's pooled numbers (default 1; 0 leaves a seat out). Per provider (claude, codex, grok, gemini), by seat letter, e.g. {\"codex\": {\"B\": 5}} for a seat on a plan 5x the others. Wins over planWeights. Leave empty if all your seats are the same size.",
+  "seatWeights": {},
+  "_planWeights": "Same, by the plan the provider reports for the seat (Codex only today: the dashboard's Codex table shows each seat's plan, and warns when seats on different plans are still counted equally). Providers do not publish exact multipliers, so you state them, e.g. {\"codex\": {\"team\": 1, \"pro\": 5}}. The table's 'measured' line is a rough check from your own usage.",
+  "planWeights": {}
 }

@@ -764,6 +764,10 @@ def build_provider(hist, pid, emails, now, extra):
     if pid == "codex":
         out["canReset"] = bool(extra.get("canReset"))      # the redeem script exists: the page may offer Apply reset
     note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
+    mixed = sorted({a["plan"] for a in accounts if a.get("plan") and "w" not in a})
+    if len(mixed) > 1:                      # seats on different plans counted as equal: the pool is only meaningful once the user sizes them
+        hint = "Seats are on different plans (%s) but count equally. Set planWeights or seatWeights in rotator.local.json." % ", ".join(mixed)
+        note = note + " " + hint if note else hint
     if note:
         out["note"] = note
     return out
@@ -2116,6 +2120,9 @@ def selftest():
         ch = [{"t": N, "codex": {s: {"w": .2, "wr": N + 9999, "wp": WEEK, "ts": N} for s in "AB"}}]
         acc = build(ch, N, {}, False, {"weights": dict(c, seat={}, plans={"codex": plans})})["providers"][0]["accounts"]
         assert "w" not in acc[0] and acc[0]["plan"] == "team" and acc[1]["w"] == 3.0 and acc[1]["wsrc"] == "plan pro" and acc[1]["plan"] == "pro", acc
+        set_weights({"seat": {}, "plan": {}, "plans": {"codex": {"A": "team", "B": "pro"}}})
+        mp = build_provider([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1}, "B": {"ts": 1, "w": 0.1}}}], "codex", {}, 2, {})
+        assert "different plans (pro, team)" in mp["note"], mp.get("note")
         assert "w" not in build(ch, N, {}, False, {})["providers"][0]["accounts"][1]       # no extra: weights reset to 1
     # G: the pool is weighted: a x5 seat B next to a regular seat A
     set_weights({"seat": {"claude": {"B": 5.0, "Z": 0.0}}})
