@@ -786,7 +786,6 @@ def sample(now, force=False):
     if email:
         cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
     pcache_merge(before, cache)
-    codex_reconcile(rec.get("codex") or {})
     return rec
 
 
@@ -1876,30 +1875,13 @@ def run_reset(seat, script, popen=subprocess.Popen):
         return {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__}, True, None
     res, settled = reset_result(seat, rep), isinstance(rep, dict) and rep.get("status") in ("redeemed", "no_credit")
     if not settled:
-        res = {"outcome": "error", "text": "The reset on seat %s is unconfirmed (%s). Apply reset stays off for that seat until a new reading shows whether it "
-                                           "was used." % (seat, res["text"].split(": ", 1)[-1].rstrip("."))}
+        res = {"outcome": "error", "text": "The reset on seat %s is unconfirmed (%s). Apply reset stays off for that seat: check codex-usage, and if the reset "
+                                           "was not used, use Clear, then apply again." % (seat, res["text"].split(": ", 1)[-1].rstrip("."))}
     try:
         rd = call()
     except (OSError, subprocess.SubprocessError):
         return res, settled, None
     return res, settled, (codex_seat_from_read(rd.get("rate_limits_before"), math.ceil(time.time())) if isinstance(rd, dict) and rd.get("status") == "checked" else None)
-
-
-def codex_reconcile(readings):
-    """Clear a Codex seat's unconfirmed-reset marker (`codex_pending` in the provider cache) once a reading taken after the attempt ended shows its banked
-    count DROPPED: the reset was applied. An unchanged count proves nothing (the first request may still be processing), so the mark stays until that, or
-    until the user clears it by hand (Store.codex_reset_clear) after checking codex-usage. Until then build_provider() keeps that seat's Apply reset off."""
-    if not load_pcache().get("codex_pending"):
-        return
-    with pcache_txn() as c:
-        pend = c.get("codex_pending") or {}
-        for seat, m in list(pend.items()):
-            r = readings.get(seat) or {}
-            end = m.get("end") or (m.get("at") or 0) + DAY   # shortcut: the app stopped mid-reset and never recorded the end; a day later any reading settles it
-            if (r.get("ts") or 0) <= end or r.get("banked") is None or m.get("banked") is None or r["banked"] >= m["banked"]:
-                continue
-            applog("codex reset: seat %s unconfirmed reset reconciled -> applied (banked %s -> %s)" % (seat, m["banked"], r["banked"]))
-            del pend[seat]
 
 
 SWITCH_TIMEOUT = 120                                     # s: an app rotator closes the app, switches and reopens it
@@ -2082,14 +2064,15 @@ class Store:
     def codex_reset(self, seat, script, popen=subprocess.Popen):
         """Apply one banked reset on a Codex seat (the caller holds `refreshing`). Returns {"outcome", "text"}. The redeem script runs on a thread of its own and
         is never killed: still running after RESET_TIMEOUT s, the outcome is "running", that thread keeps `refreshing` until the script ends (other actions get
-        409 meanwhile), and the caller must NOT release the lock. Before it runs, the seat is marked unconfirmed with its banked count; a seat still marked is
-        refused (codex_reconcile() clears the mark), because a second run would mint a second claim."""
+        409 meanwhile), and the caller must NOT release the lock. Before it runs, the seat is marked unconfirmed; a seat still marked is refused, because a
+        second run would mint a second claim. Only the script's own clear answer or the user's Clear (codex_reset_clear) lifts the mark: a reading proves
+        nothing (a count can drop for another reason, or before the claim lands)."""
         with self.lock, pcache_txn() as c:
             pend = c.setdefault("codex_pending", {})
             if seat in pend:
-                return {"outcome": "error", "text": "The last reset on seat %s is unconfirmed; it is being checked. Apply reset comes back after its next reading." % seat}
-            pend[seat] = {"at": int(time.time()), "banked": next((x["banked"] for x in (seats_of(h, "codex").get(seat) or {} for h in reversed(self.hist))
-                                                                 if x.get("banked") is not None), None)}
+                return {"outcome": "error", "text": "The last reset on seat %s is unconfirmed. Check codex-usage; if the reset was not used, use Clear on that "
+                                                    "seat, then apply again." % seat}
+            pend[seat] = {"at": int(time.time())}
         box, hand, done = {}, threading.Lock(), threading.Event()
 
         def job():
@@ -2125,22 +2108,17 @@ class Store:
             {"outcome": "error", "text": "Seat %s has no unconfirmed reset to clear." % seat}
 
     def codex_reset_job(self, seat, script, popen):
-        """The reset itself, then the reading taken after it recorded; the unconfirmed mark dropped when the answer was clear, else given its end time."""
+        """The reset itself, then the reading taken after it recorded; the unconfirmed mark dropped only when the answer was clear."""
         res, settled, new = run_reset(seat, script, popen)
-        end = time.time()
         applog("codex reset: seat %s -> %s%s" % (seat, res["outcome"], "" if settled else " (unconfirmed)"))
         with self.lock:
             now = time.time()
             with pcache_txn() as cache:
-                pend = cache.setdefault("codex_pending", {})
                 if settled:
-                    pend.pop(seat, None)
-                elif seat in pend:
-                    pend[seat]["end"] = end
+                    cache.setdefault("codex_pending", {}).pop(seat, None)
                 if new:
                     cache.setdefault("codex_fresh", {})[seat] = new       # sample() prefers it until the seat's own cache is newer
             if new:
-                codex_reconcile({seat: new})            # the read after an unclear answer usually settles it at once
                 last = next((dict(h["codex"]) for h in reversed(self.hist) if h.get("codex")), {})
                 last[seat] = new
                 self.hist = save(self.hist, {"t": int(now), "codex": last}, now)
@@ -3014,45 +2992,37 @@ def selftest():
             cst.refreshing.acquire()                                         # in time: the result itself, and the caller keeps the lock
             assert cst.codex_reset("A", "/x", fake)["outcome"] == "redeemed" and cst.refreshing.locked()
             cst.refreshing.release()
-            # B: an unclear Codex answer keeps the seat marked (the script mints a new claim each run): no retry until a reading settles it
+            # B: an unclear Codex answer keeps the seat marked (the script mints a new claim each run): no retry, and no reading lifts the mark;
+            # only the script's clear answer or the user's Clear does
             assert load_pcache().get("codex_pending") == {}
-            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}, {"t": 2, "codex": {"A": {"ts": 2, "w": 0.1}}}]     # an imported point has no count
+            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}]
             seen_ = []
 
             def crash(argv, **kw):
                 seen_.append((argv, load_pcache().get("codex_pending")))
                 return Proc(b"Traceback", 1) if "--confirm" in argv else Proc(b"{}")
             r_ = cst.codex_reset("A", "/x", crash)
-            pm = load_pcache()["codex_pending"]["A"]
-            assert r_["outcome"] == "error" and "unconfirmed" in r_["text"] and seen_[0][1]["A"]["banked"] == 3 and pm["banked"] == 3 and pm["end"] >= pm["at"]
+            assert r_["outcome"] == "error" and "unconfirmed" in r_["text"] and "use Clear" in r_["text"] and "A" in seen_[0][1] and "A" in load_pcache()["codex_pending"]
             n_ = len(seen_)
             r_ = cst.codex_reset("A", "/x", crash)
-            assert "is unconfirmed; it is being checked" in r_["text"] and len(seen_) == n_                 # refused: the script does not run again
+            assert "is unconfirmed" in r_["text"] and "Clear" in r_["text"] and len(seen_) == n_                  # refused: the script does not run again
             assert build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": ["A"]})["providers"][0]["accounts"][0]["resetPending"] is True
-            codex_reconcile({"A": {"ts": int(pm["end"]), "banked": 2}})                                    # not after the attempt: proves nothing
-            assert "A" in load_pcache()["codex_pending"]
-            codex_reconcile({"A": {"ts": int(pm["end"]) + 2}})                                             # no count: proves nothing
-            assert "A" in load_pcache()["codex_pending"]
-            codex_reconcile({"A": {"ts": int(pm["end"]) + 2, "banked": 3}})                                # unchanged: the first request may still be processing
-            assert "A" in load_pcache()["codex_pending"] and "not applied" not in open(APPLOG).read()
-            codex_reconcile({"A": {"ts": int(pm["end"]) + 2, "banked": 2}})                                # the count dropped: it was applied
-            assert load_pcache()["codex_pending"] == {} and "reconciled -> applied (banked 3 -> 2)" in open(APPLOG).read()
-            # an unchanged count after the read straight after the reset keeps the mark; only a hand clear (or a drop) lifts it; sample() reconciles too
-            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
-            r_ = cst.codex_reset("A", "/x", lambda argv, **kw: Proc(b"?", 1) if "--confirm" in argv else Proc(json.dumps(rd).encode()))
-            assert "unconfirmed" in r_["text"] and "A" in load_pcache()["codex_pending"]
-            assert cst.codex_reset_clear("A") == {"outcome": "ok", "text": "Cleared. Apply reset is back on seat A."} and load_pcache()["codex_pending"] == {}
-            assert cst.codex_reset_clear("A")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
+            # a reading straight after the unclear answer, even one whose count dropped, does not lift it; nor does a later sample
+            assert cst.codex_reset_clear("A") =={"outcome": "ok", "text": "Cleared. Apply reset is back on seat A."} and load_pcache()["codex_pending"] == {}
+            r_ = cst.codex_reset("A", "/x", lambda argv, **kw: Proc(b"?", 1) if "--confirm" in argv else Proc(json.dumps(dict(rd, rate_limits_before=dict(rd["rate_limits_before"], banked_reset_credits=1))).encode()))
+            assert "unconfirmed" in r_["text"] and "A" in load_pcache()["codex_pending"]                              # the read showed 3 -> 1: still marked
             stub = {k: globals()[k] for k in ("read_claude", "read_codex", "fetch_grok", "read_gemini", "gemini_email")}
-            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
-            cst.codex_reset("A", "/x", crash)
             try:
-                globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({"A": {"ts": int(time.time()) + 5, "w": 0.1, "banked": 1}}, {}),
+                globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({"A": {"ts": int(time.time()) + 5, "w": 0.1, "banked": 0}}, {}),
                                  fetch_grok=lambda now_: (None, None), read_gemini=lambda now_: (None, "x"), gemini_email=lambda: None)
                 sample(time.time(), True)
             finally:
                 globals().update(stub)
-            assert load_pcache()["codex_pending"] == {}
+            assert "A" in load_pcache()["codex_pending"] and "reconciled" not in open(APPLOG).read()
+            assert cst.codex_reset_clear("A")["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
+            assert cst.codex_reset_clear("A")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
+            r_ = cst.codex_reset("A", "/x", fake)                                                                   # a clear answer: no mark left
+            assert r_["outcome"] == "redeemed" and load_pcache()["codex_pending"] == {}
         finally:
             globals().update(keep)
 

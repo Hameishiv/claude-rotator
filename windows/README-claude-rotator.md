@@ -738,12 +738,11 @@ xAI and Gemini green below 85 %, yellow from 85 %, red and `capped` at 100 %. A 
 with `--account X --confirm`; unset, or with no such file, the button is not shown. The script is never killed (it copies refreshed credentials back as it ends): one still running after 90 s
 gets the answer "still applying", and every other action waits (409) until it exits (`Store.codex_reset`, selftest).
 The script mints a new claim on every run, so before it runs the seat is marked unconfirmed (`codex_pending` in the
-provider cache, with the banked count). A clear answer (`redeemed`, `no_credit`) drops the mark; anything else (a crash,
+provider cache). A clear answer from the script (`redeemed`, `no_credit`) drops the mark; anything else (a crash,
 unreadable output, the script's own error) keeps it, and the seat shows "Last reset unconfirmed" with no Apply button
-(the server refuses it too). The mark clears by itself only when a reading taken after the attempt shows the banked count
-dropped, meaning it was applied (`codex_reconcile`, run on the read after the reset and on every sample). An unchanged
-count proves nothing, since the first request may still be processing, so the mark stays; its `Clear` button asks first
-(Cancel is the default) and then drops it (`POST /api/codex-reset-clear`, `Store.codex_reset_clear`), which is for after
+(the server refuses it too). No reading lifts the mark, not even a lower banked count: a count can drop for another reason
+(a credit expiring, one used elsewhere) or before the claim lands. It stays until the user's `Clear`, which asks first
+(Cancel is the default) and then drops it (`POST /api/codex-reset-clear`, `Store.codex_reset_clear`); that is for after
 codex-usage shows the reset was not used. The reset column stays on show while any seat has a reset action or a pending
 state, even with nothing banked (selftest, `usage-sim.test.js`). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself). Gemini's limits are
 shown one per quota group: a group shared by several models is "Pool 1", "Pool 2"... (no model is named), and only a group
