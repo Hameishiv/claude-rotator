@@ -3,6 +3,7 @@
   "hostId": "my-laptop",
   "repoClone": "C:\\path\\to\\your\\claude-rotator-clone",
   "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py",
+  "_codexUsageScript": "Optional. The command the dashboard's Refresh runs to update every Codex seat's usage before re-reading it: a .ps1 runs under pwsh, a .py under py -3. Unset, Refresh cannot update Codex and the Codex tab says so. Example (a Codex seat rotator's usage read): \"codexUsageScript\": \"C:\\path\\to\\codex-cli-account.ps1\", \"codexUsageArgs\": [\"--usage\", \"--refresh\"]",
   "_claudeResetCredits": "The usage dashboard reads each Claude seat's banked reset credits (read-only; at most one call per seat per 6 hours). Set to false to switch that off entirely.",
   "claudeResetCredits": true,
   "_seatWeights": "How many regular seats each seat counts as in the usage dashboard's pooled numbers (default 1; 0 leaves a seat out). Per provider (claude, codex, grok, gemini), by seat letter, e.g. {\"codex\": {\"B\": 5}} for a seat on a plan 5x the others. Wins over planWeights. Leave empty if all your seats are the same size.",

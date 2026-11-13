@@ -382,7 +382,7 @@ async function refreshAll() {
     const r = await fetch('/api/refresh', { method: 'POST', headers: { 'X-Quota-App': '1' } });
     if (r.status === 409) msg = 'A refresh is already running.';
     else if (!r.ok) msg = 'Refresh failed (' + r.status + ').';
-    else D = await r.json();
+    else { D = await r.json(); if (D.refreshNote) msg = D.refreshNote; }      // 202: Codex is still updating
   } catch (e) { msg = 'Refresh failed: could not reach the app.'; }
   busy = false; render();
 }

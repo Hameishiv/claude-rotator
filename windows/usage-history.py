@@ -1090,6 +1090,8 @@ def build_provider(hist, pid, emails, now, extra):
     if pid == "claude" and extra.get("claudeReset"):
         out["canReset"] = True                             # claudeResetCredits is on: the page may offer the per-kind Apply buttons
     note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
+    if pid == "codex" and extra.get("codexRefresh") is False:     # known to be off (a build without the key says nothing)
+        note = note + " " + CODEX_NO_REFRESH if note else CODEX_NO_REFRESH
     mixed = sorted({a["plan"] for a in accounts if a.get("plan") and "w" not in a})
     if len(mixed) > 1:                      # seats on different plans counted as equal: the pool is only meaningful once the user sizes them
         hint = "Seats are on different plans (%s) but count equally. Set planWeights or seatWeights in rotator.local.json." % ", ".join(mixed)
@@ -1211,7 +1213,7 @@ def load_extra():
         pass
     return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claims": pending_claims(c), "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs},
-            "codexPending": sorted(c.get("codex_pending") or {})}
+            "codexPending": sorted(c.get("codex_pending") or {}), "codexRefresh": codex_usage_argv() is not None}
 
 
 LOCK_WAIT = 30                      # s: how long a writer waits for the history or provider-cache lock
@@ -1759,6 +1761,44 @@ def redeem_script(cfg=None):
     return p if os.path.isfile(p) else None
 
 
+CODEX_NO_REFRESH = ("Refresh does not update Codex: its numbers come from each seat's own Codex runs. To have Refresh read every Codex seat, set "
+                    "codexUsageScript (and codexUsageArgs) in rotator.local.json to your Codex usage command; see the README.")
+CODEX_STILL = "Codex is still updating; the page will catch up when it finishes."
+
+
+def codex_usage_argv(cfg=None):
+    """The command Refresh runs to update the Codex seats' usage caches before re-reading them: `codexUsageScript` (a path; a .ps1 runs under
+    pwsh, a .py under py -3, anything else as is) and `codexUsageArgs` (a list of strings) in rotator.local.json. None when unset or missing:
+    there is no default, every install's Codex tooling differs."""
+    try:
+        with open(cfg or os.path.join(HERE, "rotator.local.json"), encoding="utf-8-sig") as fh:
+            c = json.load(fh)
+        p, args = c.get("codexUsageScript"), c.get("codexUsageArgs") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(p, str) or not p or not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return None
+    p = os.path.expanduser(p)
+    if not os.path.isfile(p):
+        return None
+    ext = os.path.splitext(p)[1].lower()
+    return (["pwsh", "-NoProfile", "-NonInteractive", "-File", p] if ext == ".ps1" else PY + [p] if ext == ".py" else [p]) + args
+
+
+def run_codex_usage(argv, popen=subprocess.Popen):
+    """Start the Codex usage command with no window at Idle and wait up to SWITCH_TIMEOUT s -> (error text or None, the process if still running).
+    It is never killed: one still running is handed back, and the caller waits for it."""
+    try:
+        p = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "The Codex usage command could not run: %s." % type(e).__name__, None
+    try:
+        p.wait(timeout=SWITCH_TIMEOUT)
+        return None, None
+    except subprocess.TimeoutExpired:
+        return None, p
+
+
 def codex_homes(cdir=None):
     """The Codex seat labels: the folder names under ~/.codex/homes."""
     return sorted(os.path.basename(d) for d in glob.glob(os.path.join(cdir or os.path.join(HOME, ".codex"), "homes", "*")) if os.path.isdir(d))
@@ -2126,6 +2166,21 @@ class Store:
         finally:
             self.refreshing.release()
 
+    def codex_usage_wait(self, p):
+        """The waiter for a Codex usage command that outlived SWITCH_TIMEOUT: wait for it with no upper bound, sample again so its caches are read,
+        then `refreshing` back, whatever happens."""
+        try:
+            try:
+                p.wait()
+            except Exception as e:   # shortcut: whatever happens, the lock must come back
+                applog("refresh: lost track of the Codex usage command: %s" % type(e).__name__)
+            self.take(force=True)
+            applog("refresh: Codex usage command finished (exit %s)" % p.returncode)
+        except Exception as e:   # shortcut: same broad catch as the handlers
+            applog("refresh error: %s: %s" % (type(e).__name__, e))
+        finally:
+            self.refreshing.release()
+
     def switch_done(self, what, res):
         applog("switch: %s -> %s" % (what, res["text"]))
         with self.lock:
@@ -2239,19 +2294,30 @@ def make_handler(store, port):
                 return self.switch()
             if not store.refreshing.acquire(blocking=False):
                 return self.send(409, "a refresh is already running")
+            handed = False
             try:
+                cmd = codex_usage_argv()
+                err, p = run_codex_usage(cmd) if cmd else (None, None)     # first, so this refresh's sample reads its caches
+                if err:
+                    applog("refresh: %s" % err)
                 try:
                     rc = probe_claude()
                 except (OSError, subprocess.SubprocessError) as e:
                     rc = type(e).__name__
                 blob = store.take(force=True)
-                applog("refresh: claude probe -> %s, %d providers" % (rc, len(blob["providers"])))
+                applog("refresh: claude probe -> %s, codex -> %s, %d providers" % (rc, "still running" if p else err or ("updated" if cmd else "not set up"),
+                                                                                  len(blob["providers"])))
+                if p is not None:               # never killed: a waiter keeps the lock until it ends, then samples again
+                    handed = True
+                    threading.Thread(target=store.codex_usage_wait, args=(p,), daemon=True).start()
+                    return self.js(202, dict(blob, refreshNote=CODEX_STILL))
                 self.js(200, blob)
             except Exception as e:   # shortcut: broad catch so one bad request never kills the server thread
                 applog("refresh error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"error": type(e).__name__})
             finally:
-                store.refreshing.release()
+                if not handed:
+                    store.refreshing.release()
 
         def codex_reset(self):
             try:
@@ -2813,6 +2879,48 @@ def selftest():
         cfg, scr = os.path.join(td, "rotator.local.json"), os.path.join(td, "redeem.py")
         open(scr, "w").write("")
         assert redeem_script(os.path.join(td, "none.json")) in (None, REDEEM_DEFAULT)                               # no config: the default, if it exists
+        # the Codex usage command Refresh runs: from the config only, by file type, nothing when unset or missing
+        cu = os.path.join(td, "codex-usage.ps1")
+        open(cu, "w").write("")
+        open(cfg, "w").write(json.dumps({"codexUsageScript": cu, "codexUsageArgs": ["--usage", "--refresh"]}))
+        assert codex_usage_argv(cfg) == ["pwsh", "-NoProfile", "-NonInteractive", "-File", cu, "--usage", "--refresh"]
+        open(cfg, "w").write(json.dumps({"codexUsageScript": scr}))
+        assert codex_usage_argv(cfg) == PY + [scr]
+        for bad in ({}, {"codexUsageScript": os.path.join(td, "nope.ps1")}, {"codexUsageScript": cu, "codexUsageArgs": "--usage"}, {"codexUsageScript": 5}):
+            open(cfg, "w").write(json.dumps(bad))
+            assert codex_usage_argv(cfg) is None, bad
+        assert codex_usage_argv(os.path.join(td, "missing.json")) is None
+        cb_ = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1}}}]
+        assert build(cb_, 5, {}, False, {"codexRefresh": False})["providers"][0]["note"] == CODEX_NO_REFRESH
+        assert "note" not in build(cb_, 5, {}, False, {"codexRefresh": True})["providers"][0] and "note" not in build(cb_, 5, {}, False, {})["providers"][0]
+        seen_ = []
+
+        class P_:
+            def __init__(self, slow):
+                self.slow, self.returncode = slow, None
+
+            def wait(self, timeout=None):
+                seen_.append(timeout)
+                if self.slow and timeout is not None:
+                    raise subprocess.TimeoutExpired("x", timeout)
+                self.returncode = 0
+                return 0
+
+        def pp(slow):
+            def f(argv, **kw):
+                seen_.append((argv, kw))
+                return P_(slow)
+            return f
+        assert run_codex_usage(["c"], pp(False)) == (None, None) and seen_[0][1]["creationflags"] == CHILD_FLAGS and seen_[1] == SWITCH_TIMEOUT
+        err_, p_ = run_codex_usage(["c"], pp(True))
+        assert err_ is None and isinstance(p_, P_) and p_.returncode is None                     # still running: handed back, never killed
+        assert "could not run: OSError" in run_codex_usage(["c"], lambda argv, **kw: (_ for _ in ()).throw(OSError()))[0]
+        wst = Store.__new__(Store)
+        wst.refreshing, took = threading.Lock(), []
+        wst.take = lambda force=False: took.append(force)
+        wst.refreshing.acquire()
+        wst.codex_usage_wait(p_)
+        assert p_.returncode == 0 and took == [True] and not wst.refreshing.locked() and seen_[-1] is None     # waited with no limit, sampled, lock back
         open(cfg, "w").write(json.dumps({"codexRedeemScript": scr}))
         assert redeem_script(cfg) == scr
         open(cfg, "w").write(json.dumps({"codexRedeemScript": os.path.join(td, "missing.py")}))
