@@ -57,6 +57,26 @@ WINDOWS = (1, 3, 6, 24)     # hours of history a burn rate is measured over
 BUCKET = 900                # hist is thinned to one point per 15 minutes
 DRIFT_EVERY = 6 * 3600      # rotator-sync --check runs at most this often
 PY = ["py", "-3"]
+IDLE_PRIORITY_CLASS = 0x40
+CHILD_FLAGS = 0x08000000 | IDLE_PRIORITY_CLASS if os.name == "nt" else 0     # every child: no console window, Idle CPU priority
+
+
+def _kernel32():
+    """kernel32 with the priority calls' prototypes (a private instance, so nothing else's prototypes change). Windows only."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32")
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.SetPriorityClass.argtypes, k.SetPriorityClass.restype = (wintypes.HANDLE, wintypes.DWORD), wintypes.BOOL
+    k.GetPriorityClass.argtypes, k.GetPriorityClass.restype = (wintypes.HANDLE,), wintypes.DWORD
+    return k
+
+
+def lower_priority():
+    """This process at Idle CPU priority on Windows, whoever started it (the logon task, a one-shot run): it never competes with the desktop."""
+    if os.name == "nt":
+        k = _kernel32()
+        k.SetPriorityClass(k.GetCurrentProcess(), IDLE_PRIORITY_CLASS)
 BUCKET5 = 300               # imported history keeps one point per 5 minutes
 GROK_EVERY, SAMPLE_EVERY = 900, 300
 
@@ -339,7 +359,7 @@ def ls_probe():
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
                             base64.b64encode(LS_PS.encode("utf-16-le")).decode()],
-                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30, creationflags=0x08000000)
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30, creationflags=CHILD_FLAGS)
     except (OSError, subprocess.SubprocessError):
         return []
     return parse_ls_procs(r.stdout.decode("utf-8", "replace"))
@@ -526,7 +546,7 @@ def claude_version(now, run=subprocess.run, which=shutil.which):
         exe = which("claude")
         if exe:
             r = run([exe, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
-                    creationflags=0x08000000 if os.name == "nt" else 0)
+                    creationflags=CHILD_FLAGS)
             m = re.match(r"\s*(\d+\.\d+\.\d+)", r.stdout or "")
             v = m.group(1) if m else ""
     except (OSError, subprocess.SubprocessError):
@@ -1719,7 +1739,7 @@ def run_reset(seat, script, now, run=subprocess.run):
     Both calls have no window and RESET_TIMEOUT s; neither the script's stderr nor any token is kept."""
     def call(*extra):
         r = run(PY + [script, "--account", seat] + list(extra), stdin=subprocess.DEVNULL, capture_output=True, timeout=RESET_TIMEOUT,
-                creationflags=0x08000000 if os.name == "nt" else 0)
+                creationflags=CHILD_FLAGS)
         try:
             return json.loads(r.stdout.decode("utf-8", "replace"))
         except ValueError:
@@ -1816,7 +1836,7 @@ def run_switch(argv, popen=subprocess.Popen):
     """Start one rotator call with no window and wait up to SWITCH_TIMEOUT s -> (switch_result(), None). A rotator still running then is NEVER killed (a kill
     mid-switch can leave a login moved aside but not replaced): -> ({"outcome": "running", ...}, the process), and the caller waits for it."""
     try:
-        p = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000 if os.name == "nt" else 0)
+        p = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CHILD_FLAGS)
     except (OSError, subprocess.SubprocessError) as e:
         return {"outcome": "error", "text": "The rotator could not run: %s." % type(e).__name__}, None
     try:
@@ -1859,7 +1879,7 @@ class Store:
             cache["drift_run"] = int(now)           # first, so a hang or crash is not retried every sample
         try:
             subprocess.run((py or PY) + [script, "--check", "--quiet"], stdin=subprocess.DEVNULL, capture_output=True, timeout=120,
-                           creationflags=0x08000000 if os.name == "nt" else 0)
+                           creationflags=CHILD_FLAGS)
         except (OSError, subprocess.SubprocessError):
             pass
         return True
@@ -1987,7 +2007,7 @@ def probe_claude():
     """The one live Claude read: the rotator's own --status, with no console window."""
     script = os.path.join(HERE, "claude-cli-account.ps1")
     r = subprocess.run(["pwsh", "-NoProfile", "-File", script, "--status"], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=180, creationflags=0x08000000 if os.name == "nt" else 0)
+                       capture_output=True, timeout=180, creationflags=CHILD_FLAGS)
     return r.returncode
 
 
@@ -2560,6 +2580,24 @@ def selftest():
     assert "drift" not in build([], 5, {}, False, {"drift": None}) and "drift" not in build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": []}})
     assert build([], 5, {}, False, {"drift": {"checked": 1, "ref": "r", "differing": ["a.ps1", "b.py"]}})["drift"] == {"n": 2, "names": ["a.ps1", "b.py"], "checked": 1}
     assert build([], 5, {}, False, {"drift": {"ref": "r", "differing": ["a"]}})["drift"]["checked"] is None
+    # B: Idle CPU priority. Every child is started with CHILD_FLAGS; this process lowers itself in main()
+    with open(__file__, encoding="utf-8") as fh:
+        flags = re.findall("creation" + r"flags=([^,)\n]+)", fh.read())
+    assert len(flags) >= 6 and set(flags) == {"CHILD_FLAGS"}, flags
+    if os.name == "nt":
+        k = _kernel32()
+        me, was = k.GetCurrentProcess(), k.GetPriorityClass(k.GetCurrentProcess())
+        try:
+            assert k.SetPriorityClass(me, 0x20)                     # Normal first, so Idle below is this code's doing, not inherited
+            lower_priority()
+            assert k.GetPriorityClass(me) == IDLE_PRIORITY_CLASS
+            assert k.SetPriorityClass(me, 0x20)
+            r = subprocess.run([sys.executable, "-c", "import ctypes as c; k = c.WinDLL('kernel32'); k.GetCurrentProcess.restype = c.c_void_p; "
+                                "k.GetPriorityClass.argtypes = (c.c_void_p,); print(k.GetPriorityClass(k.GetCurrentProcess()))"],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=60, creationflags=CHILD_FLAGS)
+            assert int(r.stdout) == IDLE_PRIORITY_CLASS, r
+        finally:
+            k.SetPriorityClass(me, was)
     with tempfile.TemporaryDirectory() as td:
         keep, PCACHE = PCACHE, os.path.join(td, "p.json")
         try:
@@ -2615,7 +2653,7 @@ def selftest():
     res, new = run_reset("A", "/x/redeem.py", 1794500000, fake)
     assert res == {"outcome": "redeemed", "text": "Reset applied to seat A."} and new == cs and "SECRET" not in json.dumps(res)
     assert calls[0][0] == PY + ["/x/redeem.py", "--account", "A", "--confirm"] and calls[1][0] == PY + ["/x/redeem.py", "--account", "A"]
-    assert all(k["timeout"] == 90 and k["stdin"] == subprocess.DEVNULL and k["capture_output"] for _, k in calls) and all(k["creationflags"] == (0x08000000 if os.name == "nt" else 0) for _, k in calls)
+    assert all(k["timeout"] == 90 and k["stdin"] == subprocess.DEVNULL and k["capture_output"] for _, k in calls) and all(k["creationflags"] == (0x08000040 if os.name == "nt" else 0) for _, k in calls)
     def boom(argv, **kw):
         raise subprocess.TimeoutExpired(argv, 90)
     assert run_reset("A", "/x", 1, boom) == ({"outcome": "error", "text": "The reset did not go through: TimeoutExpired."}, None)
@@ -3260,7 +3298,7 @@ def selftest():
         p_ = P_(0, b"Relaunched the Claude app on seat B.\r\n")
         assert run_switch(a_, pop(p_)) == ({"outcome": "ok", "text": "Done: Relaunched the Claude app on seat B."}, None) and p_.calls == [("communicate", SWITCH_TIMEOUT)]
         assert seen[0][0] == a_ and SWITCH_TIMEOUT == 120 and seen[0][1]["stdin"] == subprocess.DEVNULL and seen[0][1]["stdout"] == seen[0][1]["stderr"] == subprocess.PIPE
-        assert seen[0][1]["creationflags"] == (0x08000000 if os.name == "nt" else 0) and "shell" not in seen[0][1] and "timeout" not in seen[0][1]
+        assert seen[0][1]["creationflags"] == (0x08000040 if os.name == "nt" else 0) and "shell" not in seen[0][1] and "timeout" not in seen[0][1]
         assert run_switch(a_, pop(P_(1, b"  \r\n", b"pwsh: boom\r\n"))) == ({"outcome": "error", "text": "Failed (exit 1): pwsh: boom"}, None)
 
         def gone(argv, **kw):
@@ -3357,6 +3395,7 @@ def selftest():
 
 
 def main():
+    lower_priority()
     if "--selftest" in sys.argv:
         return selftest()
     if "--make-icons" in sys.argv:

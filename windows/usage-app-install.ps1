@@ -3,7 +3,8 @@
   via pythonw.exe) and a Start-menu shortcut that opens it as a standalone app window.
     usage-app-install.ps1              install / reinstall
     usage-app-install.ps1 -Uninstall   remove the task and the shortcut
-  PowerShell 7. The task keeps its normal CPU priority (7); do not lower this script's own priority.
+  PowerShell 7. The task runs at Idle CPU priority (Task Scheduler priority 10); usage-history.py also lowers itself to Idle
+  and starts every child at Idle, whatever launched it.
 #>
 param([switch]$Uninstall, [int]$Port = 8787)
 
@@ -44,7 +45,7 @@ if (Test-Path $oldLnk) { Remove-Item $oldLnk }
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$script`" --serve --port $Port" -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 7 `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 10 `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
     -Description 'Quota dashboard: samples AI-seat usage every 5 minutes and serves it on 127.0.0.1' | Out-Null
