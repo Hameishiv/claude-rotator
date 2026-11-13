@@ -146,6 +146,11 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaBankedCell({ banked: 0, bankedList: [] }, now, fmt, id), '0');
   assert.strictEqual(quotaBankedCell({ banked: 3, bankedList: two.bankedList }, now, fmt, id).endsWith('<small>Expiry not supplied for 1</small>'), true);
   assert.strictEqual(quotaBankedCell({ banked: 2 }, now, fmt, id), '2<small>Expiry not supplied for 2</small>');
+  // Claude's: a grant holding several resets says so (and is not "missing"), one without an expiry has no expiry part, a seat read with none is empty, never read is a dash
+  assert.strictEqual(quotaBankedCell({ banked: 3, bankedAt: now, bankedList: [{ title: 'Fable reset', n: 2, expiresAt: now + 86400 }, { title: 'Reset', expiresAt: null }] }, now, fmt, id),
+    `3<small>Fable reset ×2 · expires T${now + 86400} (in 1d 0h)</small><small>Reset</small>`);
+  assert.strictEqual(quotaBankedCell({ bankedAt: now }, now, fmt, id), '');
+  assert.strictEqual(quotaBankedCell({ bankedNote: 'sign-in needed' }, now, fmt, id), '–');
   assert.strictEqual(quotaBankedTotal({ accounts: [two, { banked: 1 }, {}] }), 3);
   assert.strictEqual(quotaBankedTotal({ accounts: [{}, {}] }), null);
 }

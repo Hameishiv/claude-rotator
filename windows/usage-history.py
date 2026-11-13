@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import struct
 import subprocess
@@ -457,6 +458,126 @@ def read_live(pid, label, fetch, every, now, force, cache):
     return seat
 
 
+# ---------------------------------------------------------------- Claude reset credits (read-only)
+
+CREDITS_EVERY = 6 * 3600     # one read per seat per 6 h, whatever the outcome; 429 and 401/403 also hold the seat for that long
+CREDITS_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+CLI_FALLBACK = "2.1.322"     # claude-cli-account.ps1 Probe-Usage uses the same fallback when `claude` is not runnable
+CREDIT_KINDS = {"session": "5-hour reset", "weekly": "Weekly reset", "fable": "Fable reset", "full": "Full reset", "other": "Reset"}
+GRANT_ID = re.compile(r"[a-z0-9_-]{1,40}")
+COMPLETE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+_ver = [0, ""]               # when `claude --version` was last read, and what it said
+
+
+def credits_enabled(cfg=None):
+    """`claudeResetCredits` in rotator.local.json (next to this script): false turns every Claude reset-credit call and the page column off. Default on."""
+    try:
+        with open(cfg or os.path.join(HERE, "rotator.local.json"), encoding="utf-8-sig") as fh:
+            return json.load(fh).get("claudeResetCredits") is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def claude_version(now, run=subprocess.run, which=shutil.which):
+    """The installed Claude CLI's version (the usage endpoint's user-agent must track it), from `claude --version`, kept for 6 h; CLI_FALLBACK when it will not run."""
+    if _ver[1] and now - _ver[0] < CREDITS_EVERY:
+        return _ver[1]
+    v = ""
+    try:
+        exe = which("claude")
+        if exe:
+            r = run([exe, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+                    creationflags=0x08000000 if os.name == "nt" else 0)
+            m = re.match(r"\s*(\d+\.\d+\.\d+)", r.stdout or "")
+            v = m.group(1) if m else ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _ver[0], _ver[1] = now, v or CLI_FALLBACK
+    return _ver[1]
+
+
+def _iso(s):
+    """A complete ISO 8601 timestamp -> epoch seconds; None for anything else."""
+    from datetime import datetime
+    if not isinstance(s, str) or not COMPLETE_TS.fullmatch(s):
+        return None
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def grant_kind(g):
+    """Claude Code's own grouping: a grant that gives back weekly usage is a Fable reset, else its declared type, else what it clears."""
+    if g.get("gives_back_weekly") is True:
+        return "fable"
+    if g.get("type") in ("session", "weekly", "full"):
+        return g["type"]
+    cl = g.get("clears")
+    if isinstance(cl, list) and cl:
+        five, other = "five_hour" in cl, any(x != "five_hour" for x in cl)
+        return "session" if five and not other else "weekly" if other and not five else "full"
+    return "other"
+
+
+def parse_cedar(block, now):
+    """The `cedar_ember` block of the usage response -> {"eligible": bool, "grants": [{id, kind, left, endsAt}]}, or None when the shape is not understood
+    (no reading). Absent/null or eligible:false is a reading with no credits. Grants kept: id matches [a-z0-9_-]{1,40}, integer resets_left >= 0, not paused,
+    not usable_now:false, ends_at absent or a complete timestamp still in the future."""
+    if block is None:
+        return {"eligible": False, "grants": []}
+    if not isinstance(block, dict) or not isinstance(block.get("eligible"), bool):
+        return None
+    if not block["eligible"]:
+        return {"eligible": False, "grants": []}
+    raw, out = block.get("grants"), []
+    for g in raw if isinstance(raw, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("id"), str) or not GRANT_ID.fullmatch(g["id"]):
+            continue
+        left, paused = g.get("resets_left"), g.get("paused")
+        if not isinstance(left, int) or isinstance(left, bool) or left < 0 or paused is not False and paused is not None or paused:
+            continue
+        if g.get("usable_now") is False:
+            continue
+        ends = g.get("ends_at")
+        end = None
+        if ends is not None:
+            end = _iso(ends)
+            if end is None or end <= now:
+                continue
+        out.append({"id": g["id"], "kind": grant_kind(g), "left": left, "endsAt": end})
+    return {"eligible": True, "grants": out}
+
+
+def parse_usage(j, now):
+    return parse_cedar(j.get("cedar_ember"), now) if isinstance(j, dict) else None
+
+
+def token_seats():
+    """The Claude seat labels that have a token file (the same one the rotator uses)."""
+    return sorted(os.path.basename(os.path.dirname(f)) for f in glob.glob(os.path.join(ROOT, "*", "token.txt")) if os.path.basename(os.path.dirname(f))[:1] not in "._")
+
+
+def read_credits(label, now, fetch=http_json, ver=None):
+    """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "auth" (401/403), "none" (no token), "fail". The token stays in this
+    function: never logged, stored or returned."""
+    tok = _read(os.path.join(ROOT, label, "token.txt"))
+    if not tok:
+        return "none", None
+    req = urllib.request.Request(CREDITS_URL, headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20",
+                                                       "user-agent": "claude-cli/%s (external, cli)" % (ver or CLI_FALLBACK)})
+    try:
+        code, j = fetch(req)
+    except Exception as e:   # shortcut: whatever a fetch raises is a failed read; only its type is kept
+        return "fail", type(e).__name__
+    if code == 429:
+        return "rl", None
+    if code in (401, 403):
+        return "auth", None
+    r = parse_usage(j, now) if code == 200 else None
+    return ("ok", dict(r, ts=int(now))) if r else ("fail", None)
+
+
 def sample(now, force=False):
     rec = {"t": int(now), "s": read_claude()}
     cache = load_pcache()
@@ -749,6 +870,15 @@ def build_provider(hist, pid, emails, now, extra):
         if bs:                              # a credit past its expiry is gone, even if the cache is older than that
             live = [x for x in bs.get("bankedList") or [] if x["expiresAt"] > now]
             a["banked"], a["bankedList"] = max(bs["banked"] - (len(bs.get("bankedList") or []) - len(live)), len(live)), live
+        cr = ((extra.get("credits") or {}).get(label) or {}) if pid == "claude" else {}
+        if cr.get("ts"):                    # Claude's banked resets come from the read-only usage call, not from history
+            a["bankedAt"] = int(cr["ts"])
+            gs = sorted((g for g in cr.get("grants") or [] if g["left"] > 0 and (g["endsAt"] is None or g["endsAt"] > now)), key=lambda g: (g["endsAt"] is None, g["endsAt"] or 0))
+            if cr.get("eligible") and gs:
+                a["banked"] = sum(g["left"] for g in gs)
+                a["bankedList"] = [dict({"title": CREDIT_KINDS.get(g["kind"], "Reset"), "expiresAt": g["endsAt"]}, **({"n": g["left"]} if g["left"] > 1 else {})) for g in gs]
+        if cr.get("note"):
+            a["bankedNote"] = cr["note"]
         accounts.append(a)
     if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
         meas = measured_ratios((extra.get("codex") or {}).get("pairs") or {}, now)
@@ -881,7 +1011,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
 
 
@@ -1448,6 +1578,41 @@ class Store:
             pass
         return True
 
+    def credits_read(self, label, now, fetch=http_json, force=False, ver=None):
+        """Read one Claude seat's reset credits into the provider cache (`credits`: {seat: {ts, eligible, grants, next, hold, note}}). `next` is claimed before the
+        call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read. Returns the read's state, or None when it was skipped."""
+        with self.lock:
+            cache = load_pcache()
+            e = cache.setdefault("credits", {}).setdefault(label, {})
+            if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
+                return None
+            e["next"] = int(now + CREDITS_EVERY)
+            save_pcache(cache)
+        state, rd = read_credits(label, now, fetch, ver or claude_version(now))
+        with self.lock:
+            cache = load_pcache()
+            e = cache.setdefault("credits", {}).setdefault(label, {})
+            if state == "ok":
+                e.update(ts=rd["ts"], eligible=rd["eligible"], grants=rd["grants"])
+                e.pop("note", None), e.pop("hold", None)
+            elif state in ("rl", "auth"):
+                e["hold"] = int(now + CREDITS_EVERY)
+                e["note"] = "rate limited" if state == "rl" else "sign-in needed"
+            save_pcache(cache)
+        return state
+
+    def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
+        """The sampler's share: at most ONE seat per tick, the one whose next read is oldest and due; seats without a token file are not read. Off with claudeResetCredits:false."""
+        if not credits_enabled(cfg):
+            return None
+        with self.lock:
+            cr = load_pcache().get("credits") or {}
+        due = sorted((max((cr.get(l) or {}).get("next") or 0, (cr.get(l) or {}).get("hold") or 0), l)
+                     for l in (token_seats() if labels is None else labels))
+        if not due or due[0][0] > now:
+            return None
+        return due[0][1], self.credits_read(due[0][1], now, fetch)
+
     def rebuild(self, now):
         self.blob = build(self.hist, now, load_emails(), True, load_extra())
         render(dict(self.blob, app=False))
@@ -1577,6 +1742,7 @@ def serve(port):
         while True:
             try:
                 store.drift_check(time.time())
+                store.credits_tick(time.time())
                 store.take()
             except Exception as e:   # shortcut: same, the loop must keep sampling
                 applog("sample error: %s: %s" % (type(e).__name__, e))
@@ -2231,6 +2397,96 @@ def selftest():
     set_weights(None)
     # the page keeps both placeholders from being re-scanned and escapes </
     assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
+    # J: Claude reset credits (read-only): the parser, the version, the per-seat 6-hourly schedule (one seat per tick, 429 and sign-in holds, the kill switch). No network: fetch is injected.
+    JN, ISO = 1_800_000_000, lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    gr = lambda i, left=1, **k: dict({"id": i, "resets_left": left, "usable_now": True}, **k)
+    blk = {"eligible": True, "grants": [gr("g1", 2, gives_back_weekly=True, ends_at=ISO(JN + 3 * DAY)), gr("g2", 1, type="full", ends_at=ISO(JN + 5 * DAY)),
+                                         gr("g3", 4, type="full", paused=True), gr("g4", 1, type="full", ends_at=ISO(JN - 5)), gr("BAD id", 1), gr("g6", -1), gr("g7", 1.5),
+                                         gr("g8", 0, type="weekly"), gr("g9", 1, type="session"), gr("g10", 1, clears=["five_hour"]), gr("g11", 1, clears=["weekly", "five_hour"]),
+                                         gr("g12", 1, type="x"), gr("g13", 1, usable_now=False), gr("g14", 1, ends_at="soon"), gr("g15", True), "junk", None, gr("x" * 41, 1)],
+           "next_grant_id": "g1"}
+    pc_ = parse_cedar(blk, JN)
+    assert pc_["eligible"] and [(g["id"], g["kind"], g["left"]) for g in pc_["grants"]] == [("g1", "fable", 2), ("g2", "full", 1), ("g8", "weekly", 0), ("g9", "session", 1),
+                                                                                           ("g10", "session", 1), ("g11", "full", 1), ("g12", "other", 1)], pc_
+    assert pc_["grants"][0]["endsAt"] == JN + 3 * DAY and pc_["grants"][3]["endsAt"] is None
+    assert parse_cedar(None, JN) == parse_cedar({"eligible": False, "grants": [gr("a")]}, JN) == {"eligible": False, "grants": []}
+    assert parse_cedar({"eligible": True}, JN) == {"eligible": True, "grants": []} and parse_cedar({"eligible": True, "grants": "x"}, JN)["grants"] == []
+    assert all(parse_cedar(x, JN) is None for x in ("junk", 5, [], {}, {"eligible": "yes"}, {"grants": []}))
+    assert parse_usage({"x": 1}, JN) == {"eligible": False, "grants": []} and parse_usage([1], JN) is None and parse_usage(None, JN) is None
+    assert parse_usage({"cedar_ember": {"eligible": 1}}, JN) is None
+    # the installed version: from `claude --version`, kept 6 h, a fallback when it will not run or says nothing usable
+    class _R:
+        def __init__(self, out):
+            self.stdout = out
+    vs = []
+    ok_run = lambda argv, **kw: (vs.append(argv), _R("2.1.400 (Claude Code)\n"))[1]
+    _ver[:] = [0, ""]
+    assert claude_version(JN, ok_run, lambda n: "C:/x/claude.exe") == "2.1.400" and vs == [["C:/x/claude.exe", "--version"]]
+    assert claude_version(JN + 60, ok_run, lambda n: "C:/x/claude.exe") == "2.1.400" and len(vs) == 1        # kept, not re-read
+    assert claude_version(JN + CREDITS_EVERY, lambda argv, **kw: _R("garbage"), lambda n: "c") == CLI_FALLBACK
+
+    def raising(argv, **kw):
+        raise OSError("nope")
+    assert claude_version(JN + 3 * CREDITS_EVERY, raising, lambda n: "c") == CLI_FALLBACK and claude_version(JN + 6 * CREDITS_EVERY, ok_run, lambda n: None) == CLI_FALLBACK
+    _ver[:] = [0, ""]
+    # the schedule, against a temp seat root and provider cache
+    keep_root, keep_pc, jd = ROOT, PCACHE, tempfile.mkdtemp()
+    try:
+        globals()["ROOT"], globals()["PCACHE"] = jd, os.path.join(jd, "p.json")
+        for lab_ in "ABC":
+            os.makedirs(os.path.join(jd, lab_))
+            open(os.path.join(jd, lab_, "token.txt"), "w").write("secret-" + lab_)
+        os.makedirs(os.path.join(jd, "D"))                                                   # no token file: never read
+        calls = []
+
+        def fake(plan):
+            def f(req):
+                calls.append((req.full_url, req.get_header("Authorization"), req.get_header("User-agent"), req.get_header("Anthropic-beta"), req.get_method()))
+                return plan.get(req.get_header("Authorization")[7:].split("secret-")[1], (200, {"cedar_ember": blk}))
+            return f
+        st = Store.__new__(Store)
+        st.lock = threading.RLock()
+        plan = {"B": (429, None), "C": (401, None)}
+        fx = fake(plan)
+        r1 = st.credits_tick(JN, fx, "no-such-config.json")
+        assert r1 == ("A", "ok") and len(calls) == 1 and calls[0][0] == CREDITS_URL and calls[0][4] == "GET"             # one seat per tick
+        assert calls[0][1] == "Bearer secret-A" and calls[0][2].startswith("claude-cli/") and calls[0][2].endswith(" (external, cli)") and calls[0][3] == "oauth-2025-04-20"
+        assert st.credits_tick(JN + 300, fx, "no-such-config.json") == ("B", "rl") and st.credits_tick(JN + 600, fx, "no-such-config.json") == ("C", "auth")
+        assert st.credits_tick(JN + 900, fx, "no-such-config.json") is None and len(calls) == 3          # D has no token; A, B, C are not due for 6 h
+        cc = load_pcache()["credits"]
+        assert cc["A"]["eligible"] is True and cc["A"]["ts"] == JN and [g["id"] for g in cc["A"]["grants"]][:2] == ["g1", "g2"] and cc["A"]["next"] == JN + CREDITS_EVERY
+        assert cc["B"]["note"] == "rate limited" and cc["B"]["hold"] == JN + 300 + CREDITS_EVERY and "ts" not in cc["B"] and cc["C"]["note"] == "sign-in needed"
+        assert "secret-" not in open(PCACHE).read()                                                      # the token is never stored
+        assert st.credits_read("B", JN + CREDITS_EVERY, fx, force=True) is None and len(calls) == 3      # a forced read still honours a 429 hold
+        assert st.credits_tick(JN + CREDITS_EVERY - 1, fx, "no-such-config.json") is None
+        plan.clear()
+        assert st.credits_tick(JN + CREDITS_EVERY, fx, "no-such-config.json") == ("A", "ok") and len(calls) == 4      # A is due again; B (held to +300) and C follow in order
+        assert st.credits_tick(JN + CREDITS_EVERY + 300, fx, "no-such-config.json") == ("B", "ok") and "hold" not in load_pcache()["credits"]["B"] and "note" not in load_pcache()["credits"]["B"]
+        bad = fake({"A": (500, None), "B": (200, {"cedar_ember": "junk"}), "C": (0, "URLError")})
+        before = load_pcache()["credits"]["A"]["grants"]
+        assert st.credits_read("A", JN + 2 * CREDITS_EVERY, bad) == "fail" and load_pcache()["credits"]["A"]["grants"] == before     # any other failure keeps the last good reading
+        assert st.credits_read("B", JN + 2 * CREDITS_EVERY + 1000, bad) == "fail" and st.credits_read("C", JN + 2 * CREDITS_EVERY + 1000, bad) == "fail"
+        assert st.credits_read("A", JN + 2 * CREDITS_EVERY + 5, bad) is None                             # failures count as the 6-hourly attempt too
+        assert st.credits_read("A", JN + 3 * CREDITS_EVERY, lambda req: 1 / 0) == "fail"                  # a raising fetch is a failed read, not a crash
+        n_ = len(calls)
+        off = os.path.join(jd, "off.json")
+        open(off, "w").write('{"claudeResetCredits": false}')
+        assert credits_enabled(off) is False and credits_enabled(os.path.join(jd, "none.json")) and credits_enabled(os.path.join(jd, "p.json"))
+        assert st.credits_tick(JN + 9 * CREDITS_EVERY, fx, off) is None and len(calls) == n_              # the kill switch: no call at all
+        # build: the grants become the banked column (a count, a muted line per grant); not eligible / no reading / expired show nothing
+        ex = {"credits": {"A": {"ts": JN, "eligible": True, "grants": parse_cedar(blk, JN)["grants"]},
+                          "B": {"ts": JN, "eligible": False, "grants": []}, "C": {"note": "sign-in needed"}}}
+        ba_ = build([{"t": JN, "s": {k: {"w": 0.1, "wr": JN + 9, "ts": JN} for k in "ABCD"}}], JN + 10, {}, False, ex)["providers"][0]["accounts"]
+        assert ba_[0]["banked"] == 7 and ba_[0]["bankedAt"] == JN and [(x["title"], x.get("n")) for x in ba_[0]["bankedList"]] == [
+            ("Fable reset", 2), ("Full reset", None), ("5-hour reset", None), ("5-hour reset", None), ("Full reset", None), ("Reset", None)], ba_[0]
+        assert ba_[0]["bankedList"][0]["expiresAt"] == JN + 3 * DAY and ba_[0]["bankedList"][-1]["expiresAt"] is None                 # no expiry sorts last
+        assert "banked" not in ba_[1] and ba_[1]["bankedAt"] == JN and "bankedAt" not in ba_[2] and ba_[2]["bankedNote"] == "sign-in needed" and "banked" not in ba_[3]
+        gone = build([{"t": JN, "s": {"A": {"w": 0.1, "wr": JN + 9, "ts": JN}}}], JN + 4 * DAY, {}, False, ex)["providers"][0]["accounts"][0]       # the Fable grant (3 d) has expired by now
+        assert gone["banked"] == 5 and gone["bankedList"][0]["title"] == "Full reset"
+        assert "banked" not in build([{"t": JN, "s": {"A": {"w": 0.1, "wr": JN + 9, "ts": JN}}}], JN, {}, False, {})["providers"][0]["accounts"][0]
+    finally:
+        globals()["ROOT"], globals()["PCACHE"] = keep_root, keep_pc
+        __import__("shutil").rmtree(jd, ignore_errors=True)
     # icons: a valid PNG signature and an ICO header
     assert png(16)[:8] == b"\x89PNG\r\n\x1a\n" and ico(png(16))[:6] == b"\0\0\1\0\1\0"
     say("usage-history selftest: ok")

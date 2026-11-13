@@ -265,6 +265,7 @@ function chart(p, lim, W) {
 const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 10800 ? ' class="w" title="Reading is over 3 hours old"' : s > 3600 ? ' class="w3" title="Reading is over an hour old"' : ''; };
 // A reset time more than 6 days away would read like the weekday just gone ("Thu" on a Friday): give it its date.
 const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
+const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a.bankedNote || ''].filter(Boolean).join(' · '); return t ? ` title="${esc(t)}"` : ''; };
 const resetBtn = (p, a) => D.app && p.canReset && a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
 function accounts(p) {
@@ -279,7 +280,7 @@ function accounts(p) {
       const lv = quotaLevel(p.id, w), pct = w.used == null ? null : Math.round(w.used * 100);
       return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtRS(w.reset))}</small>` : ''}</td>`;
     }).join('');
-    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk"${bkTitle(a)}>${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');
   return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
 }

@@ -71,11 +71,13 @@ function quotaIn(sec) {
   const m = Math.max(0, Math.floor(sec / 60)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
   return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m % 60 + 'm' : m + 'm';
 }
-// Banked resets (Codex), as the Codex rotator words them: the count, then a muted line per credit; a count above the list says so.
+// Banked resets (Codex's, and Claude's from the read-only usage call): the count, then a muted line per credit ("x2" when a grant holds more than one, no
+// expiry part when it has none); a count above the list says so. A seat that was read and has none shows an empty cell, one never read '–'.
 function quotaBankedCell(a, now, fmt, esc) {
-  if (a.banked == null) return '–';
-  const l = a.bankedList || [], miss = a.banked - l.length;
-  return a.banked + l.map(c => '<small>' + esc(c.title) + ' · expires ' + esc(fmt(c.expiresAt)) + ' (in ' + quotaIn(c.expiresAt - now) + ')</small>').join('') +
+  if (a.banked == null) return a.bankedAt ? '' : '–';
+  const l = a.bankedList || [], miss = a.banked - l.reduce((n, c) => n + (c.n || 1), 0);
+  return a.banked + l.map(c => '<small>' + esc(c.title) + (c.n > 1 ? ' ×' + c.n : '') +
+    (c.expiresAt == null ? '' : ' · expires ' + esc(fmt(c.expiresAt)) + ' (in ' + quotaIn(c.expiresAt - now) + ')') + '</small>').join('') +
     (miss > 0 ? '<small>Expiry not supplied for ' + miss + '</small>' : '');
 }
 // A table cell's status level: 'ok' | 'warn' | 'bad', or '' when unknown. Claude's comes from the API's own status for the window (allowed, allowed_warning,
