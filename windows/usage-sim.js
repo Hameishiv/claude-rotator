@@ -1,36 +1,44 @@
 // Pooled-quota projection shared by the dashboard and its tests. Same semantics as the v1 Python project() and usage-history.py's project().
-// `ratePerHour` is %/h of one account, or an array of 24 of them indexed by the local hour of each step (the typical-day profile).
+// `ratePerHour` is %/h of one regular seat, or an array of 24 of them indexed by the local hour of each step (the typical-day profile).
+// A seat's optional `w` (default 1) is how many regular seats it counts as: it holds w x 100 %, its use drains in those units (a seat empties when its weighted capacity is
+// used) and the pooled points are in weighted % (a full pool is 100 x the sum of the weights). A seat of weight 0 is left out.
 function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec = 600) {
   const prof = Array.isArray(ratePerHour), anyRate = prof ? ratePerHour.some(r => r > 0) : ratePerHour > 0;
   // period must be > 0 or a roll-forward would never end; a seat without one just stops resetting.
-  const ss = seats.map(s => ({ used: s.used || 0, reset: s.reset || null, period: s.period > 0 ? s.period : 0 }));
+  const ss = seats.map(s => ({ used: s.used || 0, reset: s.reset || null, period: s.period > 0 ? s.period : 0, w: s.w == null ? 1 : s.w })).filter(s => s.w > 0);
   const roll = (s, t) => { while (s.reset && s.period && s.reset <= t) { s.used = 0; s.reset += s.period; } };
   for (const s of ss) { while (s.reset && s.period && s.reset <= now) s.reset += s.period; }
   const pts = []; let empty = null;
   for (let t = now; t <= now + horizonSec; t += stepSec) {
     for (const s of ss) roll(s, t);
-    const left = ss.reduce((a, s) => a + (1 - s.used), 0) * 100;
+    const left = ss.reduce((a, s) => a + s.w * (1 - s.used), 0) * 100;
     pts.push([t, Math.round(left * 10) / 10]);
     if (empty === null && anyRate && left < 0.05) empty = t;
     const r = prof ? ratePerHour[new Date(t * 1000).getHours()] : ratePerHour;
     let drain = r > 0 ? r / 100 * stepSec / 3600 : 0;
     for (const s of ss.slice().sort((a, b) => (a.reset || Infinity) - (b.reset || Infinity))) {
       if (drain <= 0) break;
-      const take = Math.min(1 - s.used, drain);
-      s.used += take; drain -= take;
+      const take = Math.min(s.w * (1 - s.used), drain);
+      s.used += take / s.w; drain -= take;
     }
   }
   return { pts, empty };
 }
 // A seat's name for a table or list: always its letter, the email under it (muted, smaller) when emails are shown. `esc` escapes HTML.
-// Its in-use badges (CLI / App) sit as coloured pills right after the letter.
+// Its weight badge (a neutral "×5", only when the weight is not 1) and in-use badges (CLI / App, coloured pills) sit right after the letter.
 const QUOTA_BADGE = { CLI: ['cli', 'Claude Code CLI'], App: ['app', 'Desktop app'] };
 const quotaBadge = (b, seat, esc) => {
   const [cls, who] = QUOTA_BADGE[b] || ['', b], tip = who + (seat ? ' is on seat ' + seat : ' is on this seat');
   return '<span class="bdg' + (cls ? ' ' + cls : '') + '" role="img" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">' + esc(seat ? b + ' ' + seat : b) + '</span>';
 };
+const quotaNum = n => String(+n.toFixed(2));
+function quotaWeight(a, esc) {
+  if (a.w == null || a.w === 1) return '';
+  const tip = (a.w === 0 ? 'Left out of the pooled numbers' : 'Counts as ' + quotaNum(a.w) + ' regular seats') + (a.wsrc ? ' (from ' + a.wsrc + ')' : '');
+  return '<span class="bdg wt" role="img" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">×' + esc(quotaNum(a.w)) + '</span>';
+}
 function quotaSeat(a, emails, esc) {
-  return esc(a.label) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '');
+  return esc(a.label) + quotaWeight(a, esc) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '');
 }
 // A provider header's badges with their seat letter ("CLI D", "App B") as HTML, or '' when no seat is known to be in use.
 function quotaInUse(p, esc) {
@@ -64,4 +72,4 @@ function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };

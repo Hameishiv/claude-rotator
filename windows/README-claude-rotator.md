@@ -704,6 +704,10 @@ counts as. Set it in `rotator.local.json` (see `rotator.local.example.json`), pe
 matched without regard to case), then 1. There is no built-in plan table: the providers do not publish exact multipliers, so you state them. Only Codex
 reports a plan, as `plan_type` in its rollout logs (`~/.codex/**/sessions/**/rollout-*.jsonl`, read locally, nothing is sent anywhere; `auth.json` is never read);
 for the other providers set `seatWeights`. A seat with a weight other than 1 shows a small `×5` badge next to its letter in the account tables.
+The pool stays a percent: the pooled % left is Σ weight × (1 − used) ÷ Σ weight, so with seats A (1) and B (5) at 50 % and 10 % used the pool is 83 % left, not 70 %.
+Every pooled number is weighted the same way: the headline, chips, history line, usage rate, typical-day profile, projection (a seat empties when its weighted
+capacity is used) and `--backtest`. A seat of weight 0 is left out of all of them. The per-seat percents in the table stay per seat, and "left across N seats"
+counts seats, not weights. The **current** weights are applied to the whole recorded history, so changing a weight redraws the past too.
 
 ## Keeping the install in sync (`rotator-sync`)
 

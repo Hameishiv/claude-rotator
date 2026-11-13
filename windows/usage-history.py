@@ -542,24 +542,25 @@ def util_at(seat, key, t):
 
 
 def remaining(rec, key, t=None, pid="claude"):
-    """(pooled % left, seat count) for one history record; each seat counts as 100%."""
+    """(pooled % left, seat count) for one history record; a seat counts as its weight (wt) x 100 %, so the pool's cap is 100 x the sum of the weights.
+    A seat of weight 0 is left out."""
     t = rec["t"] if t is None else t
-    us = [u for u in (util_at(s, key, t) for s in seats_of(rec, pid).values()) if u is not None]
-    return sum(1 - u for u in us) * 100, len(us)
+    us = [(w, u) for label, s in seats_of(rec, pid).items() if (w := wt(pid, label)[0]) > 0 and (u := util_at(s, key, t)) is not None]
+    return sum(w * (1 - u) for w, u in us) * 100, len(us)
 
 
-def _step(sa_all, sb_all, key):
-    """Fraction of one account used between two consecutive records, summed over accounts."""
+def _step(sa_all, sb_all, key, pid="claude"):
+    """Fraction of one account used between two consecutive records, summed over accounts, each seat times its weight."""
     total = 0.0
     for label, sb in sb_all.items():
-        sa = sa_all.get(label)
-        if not sa or sa.get(key) is None or sb.get(key) is None:
+        sa, w = sa_all.get(label), wt(pid, label)[0]
+        if not sa or w <= 0 or sa.get(key) is None or sb.get(key) is None:
             continue
         ra, rb = sa.get(key + "r") or 0, sb.get(key + "r") or 0
         if rb > ra + 3600:          # the window reset between the two readings
-            total += sb[key]
+            total += w * sb[key]
         else:
-            total += max(0.0, sb[key] - sa[key])
+            total += w * max(0.0, sb[key] - sa[key])
     return total
 
 
@@ -567,12 +568,12 @@ def prep(hist, key, pid="claude"):
     """Times and a running total of use, so a burn rate over any span is two lookups."""
     ts, cum = [h["t"] for h in hist], [0.0]
     for a, b in zip(hist, hist[1:]):
-        cum.append(cum[-1] + _step(seats_of(a, pid), seats_of(b, pid), key))
+        cum.append(cum[-1] + _step(seats_of(a, pid), seats_of(b, pid), key, pid))
     return ts, cum
 
 
 def burn_p(p, hours, now):
-    """% of one account used per hour over the last `hours` up to `now`, or None with under 15 min of history."""
+    """% of one regular seat used per hour over the last `hours` up to `now` (a weighted seat counts its weight), or None with under 15 min of history."""
     ts, cum = p
     hi = bisect.bisect_right(ts, now) - 1
     lo = bisect.bisect_left(ts, now - hours * 3600)
@@ -600,7 +601,7 @@ def hour_profile(rows, wid, pid="claude", gap=DAY):
         ta, tb = a["t"], b["t"]
         if tb <= ta or tb - ta > gap:
             continue
-        d = _step(seats_of(a, pid), seats_of(b, pid), wid) * 100
+        d = _step(seats_of(a, pid), seats_of(b, pid), wid, pid) * 100
         t = ta
         while t < tb:
             lt = time.localtime(t)
@@ -616,8 +617,10 @@ def hour_profile(rows, wid, pid="claude", gap=DAY):
 
 
 def project(seats, rate, now, horizon=14 * DAY, step=600):
-    """Python twin of quotaProject in usage-sim.js (pooled quota left, soonest-reset seat drains first); `rate` is %/h of one account, or 24 of them by local hour."""
-    ss = [{"used": s.get("used") or 0, "reset": s.get("reset") or None, "period": s["period"] if (s.get("period") or 0) > 0 else 0} for s in seats]
+    """Python twin of quotaProject in usage-sim.js (pooled quota left, soonest-reset seat drains first); `rate` is %/h of one regular seat, or 24 of them by local hour.
+    A seat's optional "w" (default 1) is how many regular seats it counts as: it holds that much, and its use is drained in those units; weight 0 is left out."""
+    ss = [{"used": s.get("used") or 0, "reset": s.get("reset") or None, "period": s["period"] if (s.get("period") or 0) > 0 else 0, "w": s.get("w", 1)}
+          for s in seats if s.get("w", 1) > 0]
     for s in ss:
         while s["reset"] and s["period"] and s["reset"] <= now:
             s["reset"] += s["period"]
@@ -628,7 +631,7 @@ def project(seats, rate, now, horizon=14 * DAY, step=600):
             while s["reset"] and s["period"] and s["reset"] <= t:
                 s["used"] = 0
                 s["reset"] += s["period"]
-        left = sum(1 - s["used"] for s in ss) * 100
+        left = sum(s["w"] * (1 - s["used"]) for s in ss) * 100
         pts.append((t, round(left, 1)))
         if empty is None and anyrate and left < 0.05:
             empty = t
@@ -637,8 +640,8 @@ def project(seats, rate, now, horizon=14 * DAY, step=600):
         for s in sorted(ss, key=lambda s: s["reset"] or math.inf):
             if drain <= 0:
                 break
-            take = min(1 - s["used"], drain)
-            s["used"] += take
+            take = min(s["w"] * (1 - s["used"]), drain)
+            s["used"] += take / s["w"]
             drain -= take
         t += step
     return pts, empty
@@ -678,10 +681,10 @@ def latest_of(hist, pid):
 
 
 def build_limit(hist, latest, pid, wid, label, now, dflt):
-    seats = [s for s in seats_of(latest, pid).values() if util_at(s, wid, now) is not None]
+    seats = [(s, w) for label, s in seats_of(latest, pid).items() if (w := wt(pid, label)[0]) > 0 and util_at(s, wid, now) is not None]
     if not seats:
         return None
-    rem, n = remaining(latest, wid, now, pid)
+    rem = remaining(latest, wid, now, pid)[0]
     last, rows = {}, []
     for h in hist:                   # last record in each 15-minute bucket that has this window
         r, cnt = remaining(h, wid, pid=pid)
@@ -690,7 +693,7 @@ def build_limit(hist, latest, pid, wid, label, now, dflt):
             last[h["t"] // BUCKET] = [h["t"], round(r, 1), 1 if h.get("b") else 0]
     p = prep(rows, wid, pid)         # burn only over records that carry this window, so a young provider reads null
     first = rows[0]["t"]
-    lim = {"id": wid, "label": label, "cap": n * 100, "now": round(rem, 1), "hist": [last[k] for k in sorted(last)],
+    lim = {"id": wid, "label": label, "cap": round(sum(w for _, w in seats) * 100, 2), "now": round(rem, 1), "hist": [last[k] for k in sorted(last)],
            "burn": {}, "drain": {}, "seats": []}
     prof = hour_profile(rows, wid, pid)
     if prof:
@@ -703,11 +706,11 @@ def build_limit(hist, latest, pid, wid, label, now, dflt):
             if b is not None:
                 pts.append([t, round(b, 1)])
         lim["drain"][str(w)] = pts[::-1]
-    for s in seats:
+    for s, w in seats:
         period = s.get(wid + "p") or dflt[wid]
         r = s.get(wid + "r")
-        lim["seats"].append({"used": util_at(s, wid, now), "reset": None if r is None else int(_roll(r, period, now)),
-                             "period": int(period)})
+        lim["seats"].append(dict({"used": util_at(s, wid, now), "reset": None if r is None else int(_roll(r, period, now)),
+                                  "period": int(period)}, **({"w": w} if w != 1 else {})))
     return lim
 
 
@@ -797,11 +800,11 @@ def backtest(hist, targets=BT_TARGETS, every=6 * 3600, ahead=DAY, fresh=6 * 3600
             rates = {"typical": prof and prof[0], "3h": burn_p(p, 3, t0), "24h": burn_p(p, 24, t0)}
             if len(actual) >= minpts and all(r is not None for r in rates.values()):
                 seats = []
-                for s in seats_of(rows[i], pid).values():
+                for lab, s in seats_of(rows[i], pid).items():
                     u = util_at(s, wid, t0)
                     if u is not None:
                         per = s.get(wid + "p") or dflt[wid]
-                        seats.append({"used": u, "reset": _roll(s.get(wid + "r"), per, t0), "period": per})
+                        seats.append({"used": u, "reset": _roll(s.get(wid + "r"), per, t0), "period": per, "w": wt(pid, lab)[0]})
                 for m, r in rates.items():
                     pts = project(seats, r, t0, ahead)[0]
                     errs[m].append(sum(abs(pts[round(dt / 600)][1] - v) for dt, v in actual) / len(actual))
@@ -2098,6 +2101,23 @@ def selftest():
         acc = build(ch, N, {}, False, {"weights": dict(c, seat={}, plans={"codex": plans})})["providers"][0]["accounts"]
         assert "w" not in acc[0] and acc[0]["plan"] == "team" and acc[1]["w"] == 3.0 and acc[1]["wsrc"] == "plan pro" and acc[1]["plan"] == "pro", acc
         assert "w" not in build(ch, N, {}, False, {})["providers"][0]["accounts"][1]       # no extra: weights reset to 1
+    # G: the pool is weighted: a x5 seat B next to a regular seat A
+    set_weights({"seat": {"claude": {"B": 5.0, "Z": 0.0}}})
+    far = T + 30 * 86400
+    assert remaining(rec(T, A=(0.5, far), B=(0.1, far)), "w") == (500.0, 2)         # (0.5 + 5 x 0.9) x 100 of a 600 cap
+    assert remaining(rec(T, A=(0.5, far), B=(0.1, far), Z=(0.0, far)), "w") == (500.0, 2)      # weight 0 is left out
+    hw = [rec(T, A=(0.1, far), B=(0.1, far)), rec(T + 3600, A=(0.2, far), B=(0.12, far))]
+    assert abs(burn(hw, "w", 3, T + 3600) - 20) < 1e-9                                # A +10 % and B +2 % x 5, in weighted % per hour
+    pw, ew = project([{"used": 0, "reset": far, "period": WEEK}, {"used": 0, "reset": far, "period": WEEK, "w": 5}], 100, T, 8 * 3600)
+    assert dict(pw)[T] == 600 and dict(pw)[T + 3600] == 500 and ew == T + 6 * 3600, (ew, pw[:3])      # 100 %/h = one regular seat an hour
+    pw, ew = project([{"used": 0, "reset": far, "period": WEEK}, {"used": 0, "reset": T + 1800, "period": WEEK, "w": 5}], 600, T, 3600)
+    assert [dict(pw)[T + d] for d in (600, 1200, 1800, 2400)] == [500, 400, 600, 500]       # 600 %/h = a regular seat per 10 min, taken from the x5 seat (resets first), which refills at 1800
+    assert project([{"used": 0.5, "reset": far, "period": WEEK, "w": 0}], 100, T, 600)[0][0][1] == 0.0      # a seat of weight 0 holds nothing
+    wl = build([rec(T, A=(0.5, far), B=(0.1, far), Z=(0.9, far))], T, {}, False, {"weights": {"seat": {"claude": {"B": 5.0, "Z": 0.0}}}})["providers"][0]
+    lm = wl["limits"][0]
+    assert lm["cap"] == 600 and lm["now"] == 500.0 and [s.get("w") for s in lm["seats"]] == [None, 5.0] and lm["hist"][0][1] == 500.0, lm      # Z is out of the pool
+    assert [a.get("w") for a in wl["accounts"]] == [None, 5.0, 0.0] and wl["accounts"][1]["wsrc"] == "seatWeights"
+    set_weights(None)
     # the page keeps both placeholders from being re-scanned and escapes </
     assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
     # icons: a valid PNG signature and an ICO header
@@ -2117,6 +2137,7 @@ def main():
     if "--backfill" in sys.argv:
         return backfill(arg("--days", 7))
     if "--backtest" in sys.argv:
+        set_weights(load_extra()["weights"])
         say(backtest_table(backtest(load()))[0])
         return 0
     if "--serve" in sys.argv:

@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaWeight, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -51,6 +51,36 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   // the array drains hour by hour: 100 %/h in hour 0 and 50 %/h in hour 1 -> 1 seat + 0.5 seat gone by the end of hour 1
   const p2 = Array(24).fill(0); p2[0] = 100; p2[1] = 50;
   assert.strictEqual(quotaProject(two(), p2, mid, 7200).pts.find(p => p[0] === mid + 7200)[1], 50);
+}
+// weighted pool: a x5 seat B and a regular seat A, far resets. Pool 600; 100 %/h is one regular seat an hour, so it is empty after 6 h
+{
+  const two = () => [{ used: 0, reset: far, period: W }, { used: 0, reset: far, period: W, w: 5 }];
+  let r = quotaProject(two(), 100, now);
+  assert.strictEqual(r.pts[0][1], 600);
+  assert.strictEqual(r.pts.find(p => p[0] === now + 3600)[1], 500);
+  assert.strictEqual(r.empty, now + 6 * 3600);
+  // used fractions are of each seat's own capacity: A half used, B 10 % used -> (0.5 + 5 x 0.9) x 100
+  assert.strictEqual(quotaProject([{ used: 0.5, reset: far, period: W }, { used: 0.1, reset: far, period: W, w: 5 }], 0, now).pts[0][1], 500);
+  // soonest reset drains first and a seat empties when its weighted capacity is used: B (x5) resets in 30 min, 600 %/h = a regular seat per 10 min
+  r = quotaProject([{ used: 0, reset: far, period: W }, { used: 0, reset: now + 1800, period: W, w: 5 }], 600, now, 3600);
+  assert.deepStrictEqual([600, 1200, 1800, 2400].map(d => r.pts.find(p => p[0] === now + d)[1]), [500, 400, 600, 500]);
+  // weight 0 holds nothing; a missing w is 1 (the same points as an explicit 1)
+  assert.strictEqual(quotaProject([{ used: 0.5, reset: far, period: W, w: 0 }], 100, now).pts[0][1], 0);
+  assert.deepStrictEqual(quotaProject([{ used: 0.3, reset: far, period: W }], 50, now).pts, quotaProject([{ used: 0.3, reset: far, period: W, w: 1 }], 50, now).pts);
+  // quotaShare of a weighted pool: 500 of a 600 cap
+  assert.strictEqual(Math.round(quotaShare(500, 600)), 83);
+}
+// weight badge: neutral pill with a title saying where the weight came from; none at weight 1
+{
+  const esc = s => String(s).replace(/</g, '&lt;');
+  assert.strictEqual(quotaWeight({ label: 'B' }, esc), '');
+  assert.strictEqual(quotaWeight({ label: 'B', w: 1 }, esc), '');
+  const t5 = 'Counts as 5 regular seats (from seatWeights)';
+  assert.strictEqual(quotaWeight({ label: 'B', w: 5, wsrc: 'seatWeights' }, esc), `<span class="bdg wt" role="img" title="${t5}" aria-label="${t5}">×5</span>`);
+  assert.ok(quotaWeight({ w: 5, wsrc: 'plan Pro' }, esc).includes('title="Counts as 5 regular seats (from plan Pro)"'));
+  assert.ok(quotaWeight({ w: 0.5 }, esc).includes('×0.5') && quotaWeight({ w: 0.5 }, esc).includes('Counts as 0.5 regular seats'));
+  assert.ok(quotaWeight({ w: 0, wsrc: 'seatWeights' }, esc).includes('Left out of the pooled numbers (from seatWeights)'));
+  assert.strictEqual(quotaSeat({ label: 'B', w: 5, wsrc: 'seatWeights', badges: ['App'] }, false, esc), 'B' + quotaWeight({ w: 5, wsrc: 'seatWeights' }, esc) + '<span class="bdg app" role="img" title="Desktop app is on this seat" aria-label="Desktop app is on this seat">App</span>');
 }
 // seat name: the letter always, the email under it only when shown and known
 {

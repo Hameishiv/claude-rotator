@@ -84,6 +84,7 @@ td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--b
 .bar i{display:block;height:100%;background:var(--lvc,var(--muted))}
 .bdg{display:inline-block;margin-left:8px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em;line-height:18px;vertical-align:1px;white-space:nowrap;background:var(--bdg-cli);color:var(--bdg-cli-ink)}
 .bdg.app{background:var(--bdg-app);color:var(--bdg-app-ink)}
+.bdg.wt{background:var(--btn);color:var(--ink2);box-shadow:inset 0 0 0 1px var(--grid);font-weight:600;letter-spacing:0}
 .ph .bdg{margin-left:0;vertical-align:0}
 .inuse{display:inline-flex;flex-wrap:wrap;gap:6px}
 td small{display:block;color:var(--muted);font-size:12px}
@@ -142,7 +143,7 @@ const fmtD = t => loc(t, { month: 'short', day: 'numeric' });
 const ago = t => { const s = D.now - t; return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? +(s / 3600).toFixed(1) + ' h ago' : Math.round(s / 86400) + ' d ago'; };
 const nm = a => quotaSeat(a, ui.emails, esc);
 const fr = v => v >= 10 ? Math.round(v) : v >= 1 ? +v.toFixed(1) : +v.toFixed(2);     // a rate in % of the whole pool per hour: finer when small, as it is divided by the seats
-const seatsOf = lim => Math.round((lim.cap || 100) / 100);
+const seatsOf = lim => (lim.seats || []).length || Math.round((lim.cap || 100) / 100);      // seats counted in the pool; the cap is in weighted seats
 const sh = (v, lim) => quotaShare(v, lim.cap);
 const seatsTxt = lim => seatsOf(lim) + ' seat' + (seatsOf(lim) === 1 ? '' : 's');
 // The rate the headline number and the projection use. 'typ' is the limit's typical-day profile (24 hourly %/h); a young limit has none and falls back to 3h.
