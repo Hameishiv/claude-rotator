@@ -697,7 +697,8 @@ each cell: for Claude from the API's own status for that window (`allowed`, `all
 xAI and Gemini green below 85 %, yellow from 85 %, red and `capped` at 100 %. A Codex seat with a banked reset gets an
 `Apply reset` button (app only; it asks first) that runs `codexRedeemScript` (`rotator.local.json`, default
 `~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py`) with `--account X --confirm`; with no such file the button is
-not shown. Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
+not shown. The script is never killed (it copies refreshed credentials back as it ends): one still running after 90 s
+gets the answer "still applying", and every other action waits (409) until it exits (`Store.codex_reset`, selftest). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
 A reading over 1 h old is shown in a muted warning colour in the `Read` column, over 3 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
 

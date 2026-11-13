@@ -1734,16 +1734,18 @@ def reset_result(seat, rep):
     return {"outcome": "error", "text": "The reset did not go through" + (": " + err if err else ".")}
 
 
-def run_reset(seat, script, now, run=subprocess.run):
+def run_reset(seat, script, now, popen=subprocess.Popen):
     """Apply one banked reset on `seat` (the script's --confirm), then read the seat again (its read-only mode): (result for the page, new seat reading or None).
-    Both calls have no window and RESET_TIMEOUT s; neither the script's stderr nor any token is kept."""
+    Both calls have no window and are NEVER killed: the script copies refreshed credentials back as it ends, so a kill could leave them stale (Store.codex_reset
+    runs this off the request thread). Neither the script's stderr nor any token is kept."""
     def call(*extra):
-        r = run(PY + [script, "--account", seat] + list(extra), stdin=subprocess.DEVNULL, capture_output=True, timeout=RESET_TIMEOUT,
-                creationflags=CHILD_FLAGS)
+        p = popen(PY + [script, "--account", seat] + list(extra), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                  creationflags=CHILD_FLAGS)
+        out = p.communicate()[0] or b""
         try:
-            return json.loads(r.stdout.decode("utf-8", "replace"))
+            return json.loads(out.decode("utf-8", "replace"))
         except ValueError:
-            return {"status": "error", "error": "unreadable output (exit %s)" % r.returncode}
+            return {"status": "error", "error": "unreadable output (exit %s)" % p.returncode}
     try:
         res = reset_result(seat, call("--confirm"))
     except (OSError, subprocess.SubprocessError) as e:
@@ -1824,6 +1826,7 @@ def switch_outcome(rc, out):
 
 
 SWITCH_RUNNING = "Still switching; the dashboard will update when it finishes."
+RESET_RUNNING = "Still applying the reset; the dashboard will update when it finishes."
 
 
 def switch_result(p, outs):
@@ -1929,9 +1932,36 @@ class Store:
             self.import_codex(now)
             return self.rebuild(now)
 
-    def codex_reset(self, seat, script, run=subprocess.run):
-        """Apply one banked reset on a Codex seat and record the reading taken after it (the caller holds `refreshing`). Returns {"outcome", "text"}."""
-        res, new = run_reset(seat, script, time.time(), run)
+    def codex_reset(self, seat, script, popen=subprocess.Popen):
+        """Apply one banked reset on a Codex seat (the caller holds `refreshing`). Returns {"outcome", "text"}. The redeem script runs on a thread of its own and
+        is never killed: still running after RESET_TIMEOUT s, the outcome is "running", that thread keeps `refreshing` until the script ends (other actions get
+        409 meanwhile), and the caller must NOT release the lock."""
+        box, hand, done = {}, threading.Lock(), threading.Event()
+
+        def job():
+            try:
+                box["res"] = self.codex_reset_job(seat, script, popen)
+            except Exception as e:   # shortcut: same broad catch as the handlers
+                applog("codex reset error: %s: %s" % (type(e).__name__, e))
+                box["res"] = {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__}
+            finally:
+                with hand:
+                    done.set()
+                    handed = box.get("handed")
+                if handed:
+                    self.refreshing.release()
+        threading.Thread(target=job, daemon=True).start()
+        done.wait(RESET_TIMEOUT)
+        with hand:
+            if done.is_set():
+                return box["res"]
+            box["handed"] = True
+        applog("codex reset: seat %s -> still running after %d s; waiting for it" % (seat, RESET_TIMEOUT))
+        return {"outcome": "running", "text": RESET_RUNNING}
+
+    def codex_reset_job(self, seat, script, popen):
+        """The reset itself, then the reading taken after it recorded."""
+        res, new = run_reset(seat, script, time.time(), popen)
         applog("codex reset: seat %s -> %s" % (seat, res["outcome"]))
         if new:
             with self.lock:
@@ -2105,13 +2135,17 @@ def make_handler(store, port):
                 return self.js(400, {"outcome": "error", "text": "Unknown Codex seat."})
             if not store.refreshing.acquire(blocking=False):
                 return self.js(409, {"outcome": "error", "text": "A refresh is running; try again in a minute."})
+            handed = False
             try:
-                self.js(200, store.codex_reset(seat, script))
+                res = store.codex_reset(seat, script)
+                handed = res["outcome"] == "running"            # the script outlived the wait: its thread now holds the lock
+                self.js(202 if handed else 200, res)
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("codex reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
             finally:
-                store.refreshing.release()
+                if not handed:
+                    store.refreshing.release()
 
         def claude_reset(self):
             try:
@@ -2643,31 +2677,62 @@ def selftest():
     cs = codex_seat_from_read(rd["rate_limits_before"], 1794500000)
     assert cs == {"ts": 1794500000, "w": 0.07, "wr": 1795000000, "wp": WEEK, "s": 0.4, "sr": 1794510000, "sp": 18000, "banked": 2, "bankedList": [{"title": "Full reset", "expiresAt": 1796166737}]}, cs
     assert codex_seat_from_read({"primary": {"used_percent": 5, "resets_at": 9}, "secondary": {}}, 1)["w"] == 0.05 and codex_seat_from_read({}, 1) is None and codex_seat_from_read(None, 1) is None
-    calls = []
-    class Out:
-        def __init__(self, o, rc=0):
-            self.stdout, self.returncode = json.dumps(o).encode(), rc
+    calls, comm = [], []
+
+    class Proc:
+        def __init__(self, out, rc=0, gate=None):
+            self.out, self.returncode, self.gate = out, rc, gate
+
+        def communicate(self, *a, **kw):
+            comm.append((a, kw))
+            if self.gate:
+                self.gate.wait(5)
+            return self.out, None
+
     def fake(argv, **kw):
         calls.append((argv, kw))
-        return Out({"status": "redeemed", "outcome": "redeemed", "token": "SECRET"} if "--confirm" in argv else rd)
+        return Proc(json.dumps({"status": "redeemed", "outcome": "redeemed", "token": "SECRET"} if "--confirm" in argv else rd).encode())
     res, new = run_reset("A", "/x/redeem.py", 1794500000, fake)
     assert res == {"outcome": "redeemed", "text": "Reset applied to seat A."} and new == cs and "SECRET" not in json.dumps(res)
     assert calls[0][0] == PY + ["/x/redeem.py", "--account", "A", "--confirm"] and calls[1][0] == PY + ["/x/redeem.py", "--account", "A"]
-    assert all(k["timeout"] == 90 and k["stdin"] == subprocess.DEVNULL and k["capture_output"] for _, k in calls) and all(k["creationflags"] == (0x08000040 if os.name == "nt" else 0) for _, k in calls)
+    assert all(k["stdin"] == subprocess.DEVNULL and k["stdout"] == subprocess.PIPE and "timeout" not in k for _, k in calls)
+    assert all(k["creationflags"] == (0x08000040 if os.name == "nt" else 0) for _, k in calls)
+    assert len(comm) == 2 and all(c == ((), {}) for c in comm)                       # never a timeout: the script is never killed
     def boom(argv, **kw):
-        raise subprocess.TimeoutExpired(argv, 90)
-    assert run_reset("A", "/x", 1, boom) == ({"outcome": "error", "text": "The reset did not go through: TimeoutExpired."}, None)
-    def junk(argv, **kw):
-        o = Out({})
-        o.stdout = b"<html>"
-        return o
-    assert run_reset("A", "/x", 1, junk)[0]["outcome"] == "error"
+        raise OSError("no python")
+    assert run_reset("A", "/x", 1, boom) == ({"outcome": "error", "text": "The reset did not go through: OSError."}, None)
+    assert run_reset("A", "/x", 1, lambda argv, **kw: Proc(b"<html>", 3))[0]["outcome"] == "error"
     calls.clear()
     def once(argv, **kw):
         if "--confirm" in argv:
             return fake(argv, **kw)
         raise OSError("gone")
     assert run_reset("A", "/x", 1, once) == ({"outcome": "redeemed", "text": "Reset applied to seat A."}, None)         # the follow-up read failing keeps the result
+    # B: a script that outlives RESET_TIMEOUT is not killed: "running", and its thread keeps `refreshing` until it ends, then releases it
+    keep = {k: globals()[k] for k in ("HIST", "PCACHE", "APPLOG", "RESET_TIMEOUT")}
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            globals().update(HIST=os.path.join(td, "h.jsonl"), PCACHE=os.path.join(td, "p.json"), APPLOG=os.path.join(td, "app.log"), RESET_TIMEOUT=0.3)
+            cst = Store.__new__(Store)
+            cst.lock, cst.refreshing, cst.hist, cst.rebuild = threading.RLock(), threading.Lock(), [], lambda now: None
+            gate = threading.Event()
+
+            def slow(argv, **kw):
+                return Proc(json.dumps({"status": "redeemed", "outcome": "redeemed"} if "--confirm" in argv else rd).encode(), gate=gate if "--confirm" in argv else None)
+            cst.refreshing.acquire()
+            assert cst.codex_reset("A", "/x", slow) == {"outcome": "running", "text": RESET_RUNNING} and cst.refreshing.locked()
+            time.sleep(0.3)
+            assert cst.refreshing.locked()                                   # still running: the lock stays taken
+            gate.set()
+            end = time.time() + 5
+            while cst.refreshing.locked() and time.time() < end:
+                time.sleep(0.05)
+            assert not cst.refreshing.locked() and "seat A -> redeemed" in open(APPLOG).read()
+            cst.refreshing.acquire()                                         # in time: the result itself, and the caller keeps the lock
+            assert cst.codex_reset("A", "/x", fake)["outcome"] == "redeemed" and cst.refreshing.locked()
+            cst.refreshing.release()
+        finally:
+            globals().update(keep)
 
     # 5: which seat is in use - the desktop app's seat by uuid (owner-uuid.txt, then meta.txt), else its .active; the CLI's .active; Codex's .active-account
     with tempfile.TemporaryDirectory() as td:
