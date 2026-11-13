@@ -1909,21 +1909,24 @@ class Store:
 
     def claude_reset(self, seat, kind, fetch=None, new_id=None):
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
-        the last reading, never taken from the page. The request id is saved before the call and kept while the outcome is unconfirmed, so a retry of the same
-        grant reuses it; a settled outcome drops it. Returns {"outcome", "text"}."""
+        the last reading, never taken from the page. The claim (grant id + request id) is saved per seat and kind before the call and kept while the outcome
+        is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
+        claim that landed), so a retry can never spend a second grant. Returns {"outcome", "text"}."""
         now = time.time()
         with self.lock:
             cache = load_pcache()
-            gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
-            if not gs:
-                return {"outcome": "noCredit", "text": "Seat %s has no %s to apply." % (seat, CREDIT_KINDS[kind].lower())}
-            key = seat + ":" + gs[0]["id"]
+            key = seat + ":" + kind
             claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict) and now - (v.get("at") or 0) < DAY}
-            if key not in claims:
-                claims[key] = {"id": (new_id or (lambda: secrets.token_urlsafe(16)))(), "at": int(now)}
+            if not (claims.get(key) or {}).get("gid"):          # nothing pending for this seat and kind: a grant from the last reading
+                gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
+                if not gs:
+                    return {"outcome": "noCredit", "text": "Seat %s has no %s to apply." % (seat, CREDIT_KINDS[kind].lower())}
+                old = claims.pop(seat + ":" + gs[0]["id"], None)    # a claim saved under the older per-grant key keeps its request id
+                claims[key] = {"id": old["id"] if old and old.get("id") else (new_id or (lambda: secrets.token_urlsafe(16)))(), "gid": gs[0]["id"], "at": int(now)}
             cache["credits_claims"] = claims
             save_pcache(cache)
-        res, settled = consume_reset(seat, kind, gs[0]["id"], claims[key]["id"], fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
+            gid, rid = claims[key]["gid"], claims[key]["id"]
+        res, settled = consume_reset(seat, kind, gid, rid, fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
         applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], "" if settled else " (unconfirmed)"))
         if settled:
             with self.lock:
@@ -2997,14 +3000,24 @@ def selftest():
         kc.clear(), post.extend([TimeoutError("t"), (200, {"result": "already_used"}), (200, {"result": "reset"})])
         r_ = ks.claude_reset("A", "full", kf, nid)
         cl = load_pcache()["credits_claims"]
-        assert r_["outcome"] == "error" and "unconfirmed (Claude could not be reached)" in r_["text"] and list(cl) == ["A:g2"] and cl["A:g2"]["id"] == "rid2"
-        save_pcache(dict(load_pcache(), credits={"A": dict(ke)}))                                            # the re-read dropped g1, the next grant: put the reading back
+        assert r_["outcome"] == "error" and "unconfirmed (Claude could not be reached)" in r_["text"] and list(cl) == ["A:full"] and cl["A:full"]["id"] == "rid2"
+        assert cl["A:full"]["gid"] == "g2"
+        # the claim landed but its answer was lost: the next reading no longer lists g2 and offers g11; the retry still resends g2 with rid2
+        save_pcache(dict(load_pcache(), credits={"A": dict(ke, grants=[g for g in ke["grants"] if g["id"] != "g2"])}))
+        assert [g["id"] for g in usable_grants(load_pcache()["credits"]["A"], "full", KN)] == ["g11"]
         r_ = ks.claude_reset("A", "full", kf, nid)
-        assert r_ == {"outcome": "alreadyRedeemed", "text": "That reset was already applied; nothing more was used."} and b'"request_id": "rid2"' in kc[2][2]
+        assert r_ == {"outcome": "alreadyRedeemed", "text": "That reset was already applied; nothing more was used."}
+        assert b'"grant_id": "g2", "request_id": "rid2"' in kc[2][2] and not any(b'"g11"' in (c[2] or b"") for c in kc)
         assert load_pcache()["credits_claims"] == {}
         save_pcache(dict(load_pcache(), credits={"A": dict(ke)}))
         ks.claude_reset("A", "full", kf, nid)
         assert b'"request_id": "rid3"' in kc[4][2]                                                          # a new claim, a new id
+        # a claim saved under the older per-grant key keeps its request id and moves to the seat-and-kind key
+        save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:g2": {"id": "ridL", "at": KN}}})
+        post.append(TimeoutError("t"))
+        ks.claude_reset("A", "full", kf, nid)
+        cl = load_pcache()["credits_claims"]
+        assert b'"grant_id": "g2", "request_id": "ridL"' in kc[-2][2] and list(cl) == ["A:full"] and cl["A:full"]["id"] == "ridL" and cl["A:full"]["gid"] == "g2"
         # every other outcome
         for ans, oc, text, kept in [((200, {"result": "not_limited"}), "nothingToReset", "Seat A had nothing to reset right now.", False),
                                     ((200, {"result": "ineligible"}), "noCredit", "Claude says seat A has no 5-hour reset to apply.", False),
