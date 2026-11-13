@@ -683,7 +683,9 @@ seat's `usage-cache[-fable].json` (it never probes), appends a line to
 `~/.claude-cli-accounts/usage-dashboard.html` from `usage-dashboard.template.html`. The page shows
 the weekly quota left (all models or Fable) as a share of the whole pool (100 % = every seat full; the headline says how many seats), the usage rate in % of the whole pool per hour, and a projection of
 when the pool runs out, with each seat refilled at its weekly reset. It reloads itself every 5 min.
-`--render` re-renders without sampling; `--selftest` runs the checks.
+`--render` re-renders without sampling; `--selftest` runs the checks. `--backfill [--days N]` rebuilds past history (Claude from
+`.rotate-log.txt`, Codex from the session logs) and is safe while the app runs: every write to the history file holds
+`.usage-history.jsonl.lock` (`hist_lock`), and a writer re-reads the file when another process changed it (selftest block A).
 
 The projection uses, by default, a **typical-day profile** (button `Typical` under `Rate over`): the expected %/h for
 each local hour of the day, built from the limit's whole history (up to 35 days), so nights and weekends are not

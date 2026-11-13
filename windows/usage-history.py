@@ -22,6 +22,7 @@ probes it (a rotation, /seats, --status), so its line moves in steps; add probin
 steps hide real burn.
 """
 import bisect
+import contextlib
 import glob
 import json
 import math
@@ -1090,9 +1091,49 @@ def load_extra():
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
 
 
-def load():
-    """The history, oldest first (imported points are appended out of order). Cursor's retired key is stripped, once, on disk too."""
-    hist = []
+LOCK_WAIT, LOCK_STALE = 30, 120    # s: how long a writer waits for the history lock; a lock older than this was left by a crash
+_SIG = None                         # HIST's (mtime, size) as this process last read or wrote it
+
+
+def hist_sig():
+    try:
+        st = os.stat(HIST)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def hist_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
+    """Cross-process lock on HIST (the app, the scheduled sample and --backfill all write it): every write holds it."""
+    path, end = HIST + ".lock", time.time() + wait
+    while True:
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except (FileExistsError, PermissionError):     # Windows gives PermissionError while the lock is being deleted
+            try:
+                if time.time() - os.path.getmtime(path) > stale:
+                    os.remove(path)     # shortcut: two waiters can both judge it stale; only after a crash, so not guarded
+                    continue
+            except OSError:
+                pass                    # released meanwhile, or not removable: wait as usual
+            if time.time() >= end:
+                raise TimeoutError("history lock held over %d s: %s" % (wait, path))
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _read_hist():
+    """(history oldest first with Cursor's retired key stripped in memory, whether any was stripped); notes the file's signature."""
+    global _SIG
+    sig, hist = hist_sig(), []      # stat first: a write during the read leaves the signature stale, so it is re-read later
     try:
         with open(HIST, encoding="utf-8") as fh:
             for line in fh:
@@ -1106,26 +1147,50 @@ def load():
     for h in old:
         del h["cursor"]
     hist.sort(key=lambda h: h["t"])
+    _SIG = sig
+    return hist, bool(old)
+
+
+def load():
+    """The history, oldest first (imported points are appended out of order). Cursor's retired key is stripped, once, on disk too."""
+    hist, old = _read_hist()
     if old:
-        write_all(hist)
+        with hist_lock():
+            hist = _read_hist()[0]      # again under the lock, so a line appended meanwhile is not dropped
+            write_all(hist)
     return hist
 
 
 def write_all(hist):
+    """Replace HIST with hist; the caller holds hist_lock()."""
+    global _SIG
     tmp = HIST + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.writelines(json.dumps(h, separators=(",", ":")) + "\n" for h in hist)
     os.replace(tmp, HIST)
+    _SIG = hist_sig()
+
+
+def append_lines(recs):
+    """Append recs to HIST; the caller holds hist_lock()."""
+    global _SIG
+    with open(HIST, "a", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in recs)
+    _SIG = hist_sig()
 
 
 def save(hist, rec, now):
-    """Append rec; once a day, rewrite the file without lines older than KEEP_DAYS."""
-    if hist and hist[0]["t"] < now - (KEEP_DAYS + 1) * 86400:
-        keep = [h for h in hist if h["t"] >= now - KEEP_DAYS * 86400] + [rec]
-        write_all(keep)
-        return keep
-    with open(HIST, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    """Append rec; once a day, rewrite the file without lines older than KEEP_DAYS. Under the lock, a file another
+    process changed since this one last read or wrote it (a --backfill) is re-read first, and the prune always re-reads,
+    so a rewrite never drops what someone else wrote. Returns the history now on disk."""
+    with hist_lock():
+        if hist_sig() != _SIG:
+            hist = _read_hist()[0]
+        if hist and hist[0]["t"] < now - (KEEP_DAYS + 1) * 86400:
+            keep = [h for h in _read_hist()[0] if h["t"] >= now - KEEP_DAYS * 86400] + [rec]
+            write_all(keep)
+            return keep
+        append_lines([rec])
     return hist + [rec]
 
 
@@ -1489,13 +1554,14 @@ def backfill_claude(real, days, now):
 
 def backfill(days):
     """Rebuild past history (flagged b): Claude from the rotate log, Codex from the session logs. Recorded points are never touched."""
-    hist = load()
-    real, now = [h for h in hist if not h.get("b")], time.time()
-    claude = backfill_claude(real, days, now)
-    if claude is None:                  # keep what an earlier backfill rebuilt
-        claude = [h for h in hist if h.get("b") and "s" in h]
-    codex, per = import_rollouts(real, now, True)
-    write_all(sorted(real + claude + codex, key=lambda h: h["t"]))
+    with hist_lock():                   # load -> write as one step, so a line the running app appends is never dropped
+        hist = _read_hist()[0]
+        real, now = [h for h in hist if not h.get("b")], time.time()
+        claude = backfill_claude(real, days, now)
+        if claude is None:                  # keep what an earlier backfill rebuilt
+            claude = [h for h in hist if h.get("b") and "s" in h]
+        codex, per = import_rollouts(real, now, True)
+        write_all(sorted(real + claude + codex, key=lambda h: h["t"]))
     say("backfill: codex %d records, %s" % (len(codex), "; ".join("%s %d events from %s" % (k, n, when(f)) for k, (n, f) in sorted(per.items())) or "no events"))
 
 
@@ -1723,9 +1789,10 @@ class Store:
         cache["codex_import"] = int(now)
         save_pcache(cache)
         if new:
-            with open(HIST, "a", encoding="utf-8") as fh:
-                fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in new)
-            self.hist = sorted(self.hist + new, key=lambda h: h["t"])
+            with hist_lock():
+                stale = hist_sig() != _SIG      # someone else wrote since: take the file as it now is
+                append_lines(new)
+                self.hist = _read_hist()[0] if stale else sorted(self.hist + new, key=lambda h: h["t"])
 
     def drift_check(self, now, here=None, py=None):
         """rotator-sync.py --check --quiet at most every DRIFT_EVERY, when the script sits next to this one. It writes .rotator-drift.json; its exit code and output are ignored."""
@@ -2203,7 +2270,7 @@ def selftest():
     assert PROVIDERS["grok"][0] == "xAI" and PROVIDERS["gemini"][0] == "Gemini" and manifest()["name"] == "Quota Management" and "same xAI quota" in PROVIDER_NOTE["grok"]
 
     # A: history lines and the provider cache lose the retired cursor key, on disk
-    global HIST, PCACHE
+    global HIST, PCACHE, _SIG
     with tempfile.TemporaryDirectory() as td:
         HIST, PCACHE, keep = os.path.join(td, "h.jsonl"), os.path.join(td, "p.json"), (HIST, PCACHE)
         try:
@@ -2215,6 +2282,63 @@ def selftest():
             assert load_pcache() == {"emails": {"grok": {"grok": "g@x"}}}
         finally:
             HIST, PCACHE = keep
+
+    # A: the history lock - a held lock makes the second writer wait, a stale one is removed; nothing another process wrote is lost
+    with tempfile.TemporaryDirectory() as td:
+        keep, HIST = HIST, os.path.join(td, "h.jsonl")
+        try:
+            def raw(recs):      # another process's write: this one's signature does not see it
+                with open(HIST, "w", encoding="utf-8") as fh:
+                    fh.writelines(json.dumps(r) + chr(10) for r in recs)
+            held, go = threading.Event(), threading.Event()
+            def other():
+                with hist_lock():
+                    held.set()
+                    go.wait(5)
+                    with open(HIST, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"t": 1, "x": 1}) + chr(10))
+            th = threading.Thread(target=other)
+            th.start()
+            held.wait(5)
+            try:
+                with hist_lock(wait=0.3):
+                    raise AssertionError("got a held lock")
+            except TimeoutError:
+                pass
+            threading.Timer(0.3, go.set).start()
+            t0 = time.time()
+            got = save([], {"t": 2, "x": 2}, 1000)
+            th.join()
+            assert time.time() - t0 >= 0.25 and [h["t"] for h in got] == [1, 2] and not os.path.exists(HIST + ".lock")
+            assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [1, 2]
+            open(HIST + ".lock", "w").close()
+            os.utime(HIST + ".lock", (time.time() - LOCK_STALE - 5,) * 2)
+            t0 = time.time()
+            with hist_lock(wait=1):
+                assert os.path.exists(HIST + ".lock")
+            assert time.time() - t0 < 0.5 and not os.path.exists(HIST + ".lock")
+            os.mkdir(HIST + ".lock")        # a stale lock that cannot be removed: the wait still ends
+            os.utime(HIST + ".lock", (time.time() - LOCK_STALE - 5,) * 2)
+            try:
+                with hist_lock(wait=0.3):
+                    raise AssertionError("got an unremovable lock")
+            except TimeoutError:
+                pass
+            os.rmdir(HIST + ".lock")
+            # a backfill rewrites the file under a Store holding an older list: its next save keeps both
+            mem = load()
+            raw([{"t": 0, "b": 1, "s": {}}] + mem)
+            got = save(mem, {"t": 3}, 1000)
+            assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [0, 1, 2, 3] and [h["t"] for h in got] == [0, 1, 2, 3]
+            # the daily prune re-reads the file even when the signature looks unchanged, so backfilled lines survive it
+            NOW = 100 * DAY
+            mem = [{"t": NOW - 40 * DAY}, {"t": NOW - DAY}]
+            raw(mem[:1] + [{"t": NOW - 2 * DAY, "b": 1, "s": {}}] + mem[1:])
+            _SIG = hist_sig()
+            got = save(mem, {"t": NOW}, NOW)
+            assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [NOW - 2 * DAY, NOW - DAY, NOW] == [h["t"] for h in got]
+        finally:
+            HIST = keep
 
     # B: Gemini (Antigravity) from synthetic language-server JSON
     def cfg(label, frac, reset="2026-11-12T20:15:30Z"):
@@ -2335,7 +2459,7 @@ def selftest():
         keep, HIST, PCACHE = (HIST, PCACHE), os.path.join(td, "h.jsonl"), os.path.join(td, "p.json")
         try:
             st = Store.__new__(Store)
-            st.hist = [{"t": N - 5000, "s": {}}, {"t": N, "s": {}}]
+            st.hist, _SIG = [{"t": N - 5000, "s": {}}, {"t": N, "s": {}}], None     # the fake Store's list stands for the unwritten file
             st.import_codex(N + 20, td)
             assert st.hist == [{"t": N - 5000, "s": {}}, {"t": N, "s": {}}] and load_pcache()["codex_import"] == N + 20 and not os.path.exists(HIST)
             roll(os.path.join(td, "homes", "A", "sessions", "rollout-new.jsonl"), [tc(N + 5, wk=(30, WA))], N + 30)
@@ -2344,6 +2468,11 @@ def selftest():
             assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [N + 5] and load_pcache()["codex_import"] == N + 40
             st.import_codex(N + 60, td)
             assert len(st.hist) == 3
+            with open(HIST, "a", encoding="utf-8") as fh:     # a --backfill's line, unseen by this process: the next import takes the file as it is
+                fh.write(json.dumps({"t": N - 9000, "b": 1, "s": {}}) + chr(10))
+            roll(os.path.join(td, "homes", "A", "sessions", "rollout-new2.jsonl"), [tc(N + 400, wk=(40, WA))], N + 500)
+            st.import_codex(N + 600, td)
+            assert [h["t"] for h in st.hist] == [N - 9000, N + 5, N + 400]
         finally:
             HIST, PCACHE = keep
         # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
