@@ -744,7 +744,7 @@ credit it uses and when that expires, and warns when the window it refills renew
 the credit itself from the last reading, soonest expiry first, and never takes a credit id from the page; then it makes Claude Code's claim,
 `POST https://api.anthropic.com/api/organizations/<org>/reset_rate_limits` with `{"program": "cedar_ember", "grant_id": ..., "request_id": ...}` (the
 organization from the seat's `usage-cache.json`), and reads that seat's credits again. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
-keeps its `request_id` in the provider cache, so applying again retries the same claim instead of spending a second reset. Code: `Store.claude_reset`,
+keeps its `request_id` in the provider cache, however old, until a resend settles it, so applying again retries the same claim instead of spending a second reset. Code: `Store.claude_reset`,
 `consume_reset` and `usable_grants` in `usage-history.py` (selftest block K); the kinds' wording is `QUOTA_RESET_KINDS` in `usage-sim.js`.
 
 **Switching seats from the dashboard.** In the app, each seat row has a Switch column and each provider header a button; they run the rotators next to

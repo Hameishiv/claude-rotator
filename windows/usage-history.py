@@ -1963,7 +1963,7 @@ class Store:
         now = time.time()
         with self.lock, pcache_txn() as cache:
             key = seat + ":" + kind
-            claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict) and now - (v.get("at") or 0) < DAY}
+            claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict)}     # kept, whatever their age, until a resend settles them
             if not (claims.get(key) or {}).get("gid"):          # nothing pending for this seat and kind: a grant from the last reading
                 gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
                 if not gs:
@@ -3064,6 +3064,11 @@ def selftest():
         save_pcache(dict(load_pcache(), credits={"A": dict(ke)}))
         ks.claude_reset("A", "full", kf, nid)
         assert b'"request_id": "rid3"' in kc[4][2]                                                          # a new claim, a new id
+        # an unconfirmed claim does not expire: two days later the click still resends it, never a new grant
+        save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:full": {"id": "ridOld", "gid": "g2", "at": int(time.time()) - 2 * DAY}}})
+        post.append((200, {"result": "already_used"}))
+        ks.claude_reset("A", "full", kf, nid)
+        assert b'"grant_id": "g2", "request_id": "ridOld"' in kc[-2][2] and load_pcache()["credits_claims"] == {}, kc[-2]
         # a claim saved under the older per-grant key keeps its request id and moves to the seat-and-kind key
         save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:g2": {"id": "ridL", "at": KN}}})
         post.append(TimeoutError("t"))
