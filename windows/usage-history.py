@@ -2223,22 +2223,30 @@ class Store:
 
     def import_codex(self, now, cdir=None):
         """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
-        self.append_rollouts(self.read_rollouts(now, cdir))
+        self.append_rollouts(self.read_rollouts(now, cdir, mark=False))
+        self.mark_import(now)
 
-    def read_rollouts(self, now, cdir=None, rec=None):
-        """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it."""
+    def read_rollouts(self, now, cdir=None, rec=None, mark=True):
+        """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it.
+        With mark=False the watermark is left for the caller to move (mark_import) once the points and the sample are saved: a save that fails
+        then re-reads the same logs next tick instead of skipping them."""
         since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
             new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
             applog("codex import error: %s: %s" % (type(e).__name__, e))
             return []
+        if mark:
+            self.mark_import(now)
+        return new
+
+    def mark_import(self, now):
+        """Move the rollout import watermark to `now`."""
         try:
             with pcache_txn() as cache:
                 cache["codex_import"] = int(now)
-        except PcacheError as e:                # the watermark stays where it was; the points found are still returned (the import skips what the history has)
+        except PcacheError as e:                # the watermark stays where it was; the next import reads those logs again (it skips what the history has)
             applog("codex import: provider cache not updated: %s" % e)
-        return new
 
     def append_rollouts(self, new):
         new = [r for r in new if not r.get("carry")]      # a carry record only feeds newest_codex
@@ -2337,9 +2345,10 @@ class Store:
         with self.lock:
             now = time.time()
             rec = sample(now, force)
-            new = self.read_rollouts(now)                   # first, and every point of them, so the sample is merged with all the logs saw
+            new = self.read_rollouts(now, mark=False)       # first, and every point of them, so the sample is merged with all the logs saw
             self.hist = save(self.hist, newest_codex(rec, self.hist, new), now)
             self.append_rollouts([r for r in new if r["t"] // BUCKET5 != rec["t"] // BUCKET5])     # the sample now holds its own bucket (carry records are dropped there)
+            self.mark_import(now)                           # only now: a save above that raised leaves the logs to be read again
             return self.rebuild(now)
 
     def codex_reset(self, seat, script, popen=subprocess.Popen):
@@ -3232,7 +3241,7 @@ def selftest():
             keep_s, real_time = sample, time.time
             orig_rr = st.read_rollouts
             st.lock, st.rebuild = threading.RLock(), lambda now: None
-            st.read_rollouts = lambda now, cdir=None, rec=None: orig_rr(now, td, rec)
+            st.read_rollouts = lambda now, cdir=None, rec=None, **kw: orig_rr(now, td, rec, **kw)
             try:
                 globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": {"ts": N - 7000, "w": 0.1, "wr": WA, "wp": WEEK}}}
                 time.time = lambda: N + 1000
@@ -3254,6 +3263,37 @@ def selftest():
             zs = [h for h in st.hist if "codex" in h]
             assert zs[-1]["t"] == T_ and zs[-1]["codex"]["A"]["w"] == 0.6 and zs[-1]["codex"]["A"]["ts"] == T_ - 100, zs[-2:]
             assert len({h["t"] // BUCKET5 for h in zs}) == len(zs) and load_pcache()["codex_import"] == T_
+            # a log reading between two samples, in the bucket the earlier sample already holds: the next sample still gets it (carry), never saved itself
+            K_ = (T_ + 900) // BUCKET5 * BUCKET5 + 20
+            stale_ = {"ts": K_ - 500, "w": 0.2, "wr": WA, "wp": WEEK}
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": dict(stale_)}}
+                time.time = lambda: K_
+                st.take()
+                roll(os.path.join(td, "homes", "A", "sessions", "rollout-between.jsonl"), [tc(K_ + 60, wk=(65, WA))], K_ + 61)
+                time.time = lambda: K_ + BUCKET5
+                st.take()
+            finally:
+                globals()["sample"], time.time = keep_s, real_time
+            zs = [h for h in st.hist if "codex" in h]
+            assert zs[-1]["t"] == K_ + BUCKET5 and zs[-1]["codex"]["A"]["w"] == 0.65 and zs[-1]["codex"]["A"]["ts"] == K_ + 60, zs[-2:]
+            with open(HIST, encoding="utf-8") as fh:
+                assert not any(json.loads(l).get("carry") for l in fh if l.strip()), "a carry record was saved"
+            # a failed save leaves the watermark where it was
+            wm_ = load_pcache()["codex_import"]
+            keep_save = save
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": dict(stale_)}}
+                globals()["save"] = lambda *a, **k: (_ for _ in ()).throw(TimeoutError("history lock"))
+                time.time = lambda: K_ + 2 * BUCKET5
+                try:
+                    st.take()
+                    assert False, "save did not raise"
+                except TimeoutError:
+                    pass
+            finally:
+                globals()["sample"], globals()["save"], time.time = keep_s, keep_save, real_time
+            assert load_pcache()["codex_import"] == wm_, "the watermark moved past a sample that was not saved"
         finally:
             HIST, PCACHE = keep
         # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
@@ -3849,13 +3889,14 @@ def selftest():
                     fh_.write(("@echo off" + crlf_ + body_).encode())
             t0_ = time.monotonic()
             rb_ = run_bounded([os.path.join(bd_, "held.cmd")], 3, text=True, stdin=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
-            assert rb_.returncode == 0 and rb_.stdout.strip() == "1.2.3" and time.monotonic() - t0_ < 6, (rb_, time.monotonic() - t0_)     # child done, pipe still held
+            bound_ = 3 + 16 + 5          # the documented worst case (timeout + ~16 s of kill and grace) plus a margin for an Idle-priority run
+            assert rb_.returncode == 0 and rb_.stdout.strip() == "1.2.3" and time.monotonic() - t0_ < bound_, (rb_, time.monotonic() - t0_)     # child done, pipe still held
             t0_ = time.monotonic()
             try:
                 run_bounded([os.path.join(bd_, "hung.cmd")], 3, stdin=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
                 assert False, "no timeout"
             except subprocess.TimeoutExpired:
-                assert time.monotonic() - t0_ < 6, time.monotonic() - t0_
+                assert time.monotonic() - t0_ < bound_, time.monotonic() - t0_
         finally:
             shutil.rmtree(bd_, ignore_errors=True)
     _ver[:] = [JN + 99 * CREDITS_EVERY, "2.1.400"]                                        # pinned: the schedule below must not run the real `claude --version`
