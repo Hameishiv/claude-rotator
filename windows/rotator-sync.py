@@ -135,11 +135,14 @@ def cmd_pull(repo, live, ref, state):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     for rel in differing + missing:
         dest = os.path.join(live, *rel.split("/"))
+        data = repo_bytes(repo, ref, rel)       # first: a git failure must not leave a truncated live script
         if rel in differing:
             shutil.copy2(dest, "%s.bak-sync-%s" % (dest, stamp))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as fh:
-            fh.write(repo_bytes(repo, ref, rel))
+        tmp = dest + ".tmp-sync"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, dest)
         print("%s %s" % ("added   " if rel in missing else "replaced", rel))
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
@@ -241,6 +244,26 @@ def selftest():
         with open(os.path.join(wt, "windows", "a.ps1"), "rb") as fh:
             check("pushed CRLF file kept its CRLF", fh.read() == b"one\r\nTWO\r\n")
         git(repo, "worktree", "remove", "--force", wt)
+
+        # --pull gets the repo bytes before it touches a live file: a git failure leaves the live script whole
+        real_rb, seen = repo_bytes, []
+
+        def failing_rb(repo_, ref_, rel_):
+            seen.append(rel_)
+            if rel_ == "b.py" and seen.count("b.py") > 1:      # compare() reads it once; the pull's own read fails
+                raise SystemExit("git show failed")
+            return real_rb(repo_, ref_, rel_)
+        globals()["repo_bytes"] = failing_rb
+        try:
+            try:
+                cmd_pull(repo, live, "HEAD", state)
+            except SystemExit:
+                pass
+        finally:
+            globals()["repo_bytes"] = real_rb
+        with open(os.path.join(live, "b.py"), "rb") as fh:
+            check("a failed pull leaves the live file intact", fh.read() == b"print(2)\n")
+        check("a failed pull leaves no temp file", not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
 
         # --pull: live is overwritten from the ref, each overwritten file backed up, local files untouched
         cmd_pull(repo, live, "HEAD", state)
