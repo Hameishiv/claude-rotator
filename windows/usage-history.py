@@ -10,7 +10,7 @@ from file:// with no server. The 'Claude usage dashboard' scheduled task runs --
   usage-history.py --render    render only
   usage-history.py --backfill [--days N]   rebuild past Claude history from .rotate-log.txt (default 7 days)
   usage-history.py --backtest            projection error of the Typical, 3h and 24h rates over the recorded history
-  usage-history.py --serve [--port 8787]   local app: page, /api/data, POST /api/refresh, sampler thread
+  usage-history.py --serve [--port 8787]   local app: page, /api/data, POST /api/refresh, POST /api/switch, sampler thread
   usage-history.py --make-icons            write the app icons into <state dir>\\usage-app\\
   usage-history.py --selftest              run the checks
 
@@ -907,6 +907,7 @@ def build_provider(hist, pid, emails, now, extra):
     name, wins, lims = prov_spec(pid, seats)
     accounts = []
     use = {k: v for k, v in ((extra.get("inUse") or {}).get(pid) or {}).items() if k in BADGE and v in seats}      # only a seat this provider shows
+    sw = (extra.get("switch") or {}).get(pid) or {}
     for label in sorted(seats):
         s = seats[label]
         a = {"label": label, "email": (emails.get(pid) or {}).get(label), "ok": s.get("ok") is not False,
@@ -943,6 +944,9 @@ def build_provider(hist, pid, emails, now, extra):
                 a["bankedList"] = [dict({"title": CREDIT_KINDS.get(g["kind"], "Reset"), "expiresAt": g["endsAt"]}, **({"n": g["left"]} if g["left"] > 1 else {})) for g in gs]
         if cr.get("note"):
             a["bankedNote"] = cr["note"]
+        acts = [r for r in sw if r != "best" and label in sw[r] and use.get("app" if r == "both" else r) != label]
+        if acts:                            # the switch buttons: roles whose rotator can use this seat, minus the one it already holds
+            a["switch"] = acts
         rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
         if any(gs for _, gs in rk):         # what the Apply buttons and their dialog need: no grant ids, the server picks the grant again on the click
             a["resets"] = [{"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} for k, gs in rk if gs]
@@ -961,6 +965,8 @@ def build_provider(hist, pid, emails, now, extra):
            "accounts": accounts, "limits": limits}
     if use:
         out["inUse"] = use
+    if ("cli" if pid == "claude" else "both") in sw:
+        out["best"] = True                                 # the header's best/next seat button: its rotator is here
     if pid == "codex":
         out["canReset"] = bool(extra.get("canReset"))      # the redeem script exists: the page may offer Apply reset
     if pid == "claude" and extra.get("claudeReset"):
@@ -1080,7 +1086,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
 
 
@@ -1606,6 +1612,86 @@ def run_reset(seat, script, now, run=subprocess.run):
     return res, (codex_seat_from_read(rep.get("rate_limits_before"), now) if rep.get("status") == "checked" else None)
 
 
+SWITCH_TIMEOUT = 120                                     # s: an app rotator closes the app, switches and reopens it
+SWITCH_ROLES = {"claude": ("cli", "app", "best"), "codex": ("both", "best")}     # what /api/switch accepts; Codex's CLI and app share one login
+SEAT_RE = re.compile(r"[A-Za-z]+")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+EMAIL_RE = re.compile(r"[^\s@()<>\"',;]+@[^\s@()<>\"',;]+\.[A-Za-z]{2,}")
+
+
+def switch_targets(here=None, cli_root=None, app_root=None, codex_dir=None):
+    """{provider: {role: [seats]}}: the seats each rotator can switch to (letters-only names): Claude CLI seats with a token.txt, Claude app seats with a
+    captured config.json, Codex homes with a saved auth.json. A role is left out when its rotator script is not next to this one (the Codex rotators are
+    not in the public repo)."""
+    here = here or HERE
+
+    def seats(d, need):
+        return sorted(os.path.basename(x) for x in glob.glob(os.path.join(d, "*")) if SEAT_RE.fullmatch(os.path.basename(x)) and os.path.isfile(os.path.join(x, need)))
+    out, cl = {}, {}
+    if os.path.isfile(os.path.join(here, "claude-cli-account.ps1")):
+        cl["cli"] = seats(cli_root or ROOT, "token.txt")
+    if os.path.isfile(os.path.join(here, "claude-app-rotator.ps1")):
+        cl["app"] = seats(app_root or os.path.join(HOME, ".claude-app-seats"), "config.json")
+    if cl:
+        out["claude"] = cl
+    if os.path.isfile(os.path.join(here, "codex-app-rotator.ps1")):
+        out["codex"] = {"both": seats(os.path.join(codex_dir or os.path.join(HOME, ".codex"), "homes"), "auth.json")}
+    return out
+
+
+def switch_check(body, targets):
+    """(provider, role, seat) for a valid /api/switch body, else None. The provider and role must be known and their rotator present; the seat must be
+    letters only and one that rotator can use. "best" takes no seat (the rotator picks)."""
+    if not isinstance(body, dict):
+        return None
+    p, r, s = body.get("provider"), body.get("role"), body.get("seat")
+    if not isinstance(p, str) or not isinstance(r, str) or r not in SWITCH_ROLES.get(p, ()):
+        return None
+    t = targets.get(p) or {}
+    if r == "best":
+        return (p, r, None) if ("cli" if p == "claude" else "both") in t else None
+    if not isinstance(s, str) or not SEAT_RE.fullmatch(s) or s not in t.get(r, ()):
+        return None
+    return p, r, s
+
+
+def switch_argv(provider, role, seat, here=None):
+    """The rotator call for one dashboard action, as an argv list (no shell). Claude's "best" is `--switch best` (`--best` only prints the ranking);
+    `--no-usage` leaves the switch result as the CLI rotator's last line. Codex's "best" is the rotator's --rotate."""
+    def ps(name, *a):
+        return ["pwsh", "-NoProfile", "-File", os.path.join(here or HERE, name)] + list(a)
+    if provider == "claude":
+        if role == "app":
+            return ps("claude-app-rotator.ps1", "--switch", seat, "--relaunch")
+        return ps("claude-cli-account.ps1", "--switch", "best" if role == "best" else seat, "--no-usage")
+    return ps("codex-app-rotator.ps1", "--rotate") if role == "best" else ps("codex-app-rotator.ps1", "--switch", seat)
+
+
+def switch_outcome(rc, out):
+    """{"outcome": ok|error, "text"}: the exit code and the rotator's last meaningful line (the last unindented one), without colour codes, tokens or
+    email addresses."""
+    lines = [x for x in (ANSI.sub("", y).rstrip() for y in (out or "").splitlines()) if x.strip()]
+    last = next((x for x in reversed(lines) if not x[:1].isspace()), lines[-1] if lines else "").strip()
+    t = re.sub(r"sk-ant-[A-Za-z0-9_\-]+", "[redacted]", last)
+    t = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", t)
+    t = re.sub(r"[A-Za-z0-9_\-.+/=]{40,}", "[redacted]", t)
+    t = re.sub(r"\s+", " ", EMAIL_RE.sub("[email]", t))[:200]
+    head = "Done" if rc == 0 else "Failed (exit %s)" % rc
+    return {"outcome": "ok" if rc == 0 else "error", "text": head + (": " + t if t else ".")}
+
+
+def run_switch(argv, run=subprocess.run):
+    """Run one rotator call with no window and SWITCH_TIMEOUT s -> switch_outcome(); stderr only when stdout said nothing."""
+    try:
+        r = run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=SWITCH_TIMEOUT, creationflags=0x08000000 if os.name == "nt" else 0)
+    except subprocess.TimeoutExpired:
+        return {"outcome": "error", "text": "The rotator did not finish within %d s. Check the app and the seat before trying again." % SWITCH_TIMEOUT}
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"outcome": "error", "text": "The rotator could not run: %s." % type(e).__name__}
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    return switch_outcome(r.returncode, out if out.strip() else (r.stderr or b"").decode("utf-8", "replace"))
+
+
 class Store:
     """The in-memory history and the last built blob, shared by the sampler thread and the request threads."""
 
@@ -1712,6 +1798,14 @@ class Store:
                 self.rebuild(now)
         return res
 
+    def switch(self, provider, role, seat, run=subprocess.run, here=None):
+        """Run one rotator action (the caller holds `refreshing`), log it, and rebuild, which reads the in-use seats again so the badges move."""
+        res = run_switch(switch_argv(provider, role, seat, here), run)
+        applog("switch: %s %s%s -> %s" % (provider, role, " " + seat if seat else "", res["text"]))
+        with self.lock:
+            self.rebuild(time.time())
+        return res
+
     def claude_reset(self, seat, kind, fetch=None, new_id=None):
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
         the last reading, never taken from the page. The request id is saved before the call and kept while the outcome is unconfirmed, so a retry of the same
@@ -1794,7 +1888,7 @@ def make_handler(store, port):
             if not host_ok(self.headers.get("Host"), port):
                 return self.send(403, "forbidden")
             path = self.path.split("?")[0]
-            if path not in ("/api/refresh", "/api/codex-reset", "/api/claude-reset"):
+            if path not in ("/api/refresh", "/api/codex-reset", "/api/claude-reset", "/api/switch"):
                 return self.send(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
                 return self.send(403, "forbidden")
@@ -1802,6 +1896,8 @@ def make_handler(store, port):
                 return self.codex_reset()
             if path == "/api/claude-reset":
                 return self.claude_reset()
+            if path == "/api/switch":
+                return self.switch()
             if not store.refreshing.acquire(blocking=False):
                 return self.send(409, "a refresh is already running")
             try:
@@ -1857,6 +1953,25 @@ def make_handler(store, port):
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
+            finally:
+                store.refreshing.release()
+
+        def switch(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else None
+            except (ValueError, AttributeError):
+                b = None
+            ok = switch_check(b, switch_targets())
+            if not ok:
+                return self.js(400, {"outcome": "error", "text": "Unknown provider, role or seat."})
+            if not store.refreshing.acquire(blocking=False):
+                return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
+            try:
+                self.js(200, store.switch(*ok))
+            except Exception as e:   # shortcut: same broad catch as refresh
+                applog("switch error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"outcome": "error", "text": "The switch did not run: %s." % type(e).__name__})
             finally:
                 store.refreshing.release()
 
@@ -2758,6 +2873,134 @@ def selftest():
         globals().update(keep)
         _ver[:] = [0, ""]
         __import__("shutil").rmtree(kd, ignore_errors=True)
+    # L: the dashboard's switch actions - which seats each rotator can use, the argv per action (an injected runner; no rotator ever runs), the outcome
+    # text (no tokens, no emails), the badges/buttons in the blob, and the HTTP guards on a spare loopback port with a fake store.
+    ld = __import__("tempfile").mkdtemp(prefix="qsw-")
+    keep = {k: globals()[k] for k in ("APPLOG", "switch_targets")}
+    try:
+        here, cli_r, app_r, cx_r = (os.path.join(ld, x) for x in ("here", "cli", "app", "codex"))
+        for d, names, need in ((cli_r, ("A", "B", ".inactive", "_old", "C1", "D"), "token.txt"), (app_r, ("A", "B", "C"), "config.json"),
+                               (os.path.join(cx_r, "homes"), ("A", "B", "Z"), "auth.json")):
+            for n in names:
+                os.makedirs(os.path.join(d, n))
+                if n not in ("D", "C", "Z"):                              # D/C/Z: a seat folder with nothing to switch to
+                    open(os.path.join(d, n, need), "w").close()
+        os.makedirs(here)
+        assert switch_targets(here, cli_r, app_r, cx_r) == {}                                                   # no rotator next to this script
+        for n in ("claude-cli-account.ps1", "claude-app-rotator.ps1"):
+            open(os.path.join(here, n), "w").close()
+        tg = switch_targets(here, cli_r, app_r, cx_r)
+        assert tg == {"claude": {"cli": ["A", "B"], "app": ["A", "B"]}}, tg                                     # no Codex rotator here: no Codex buttons
+        open(os.path.join(here, "codex-app-rotator.ps1"), "w").close()
+        tg = switch_targets(here, cli_r, app_r, cx_r)
+        assert tg["codex"] == {"both": ["A", "B"]}, tg
+        # argv per action: a list, the script next to this one, the exact flags
+        ps = lambda n: ["pwsh", "-NoProfile", "-File", os.path.join(here, n)]
+        assert switch_argv("claude", "cli", "B", here) == ps("claude-cli-account.ps1") + ["--switch", "B", "--no-usage"]
+        assert switch_argv("claude", "app", "B", here) == ps("claude-app-rotator.ps1") + ["--switch", "B", "--relaunch"]
+        assert switch_argv("claude", "best", None, here) == ps("claude-cli-account.ps1") + ["--switch", "best", "--no-usage"]
+        assert switch_argv("codex", "both", "A", here) == ps("codex-app-rotator.ps1") + ["--switch", "A"]
+        assert switch_argv("codex", "best", None, here) == ps("codex-app-rotator.ps1") + ["--rotate"]
+        # validation
+        assert switch_check({"provider": "claude", "role": "cli", "seat": "A"}, tg) == ("claude", "cli", "A")
+        assert switch_check({"provider": "claude", "role": "best", "seat": "x/../y"}, tg) == ("claude", "best", None)     # best ignores any seat
+        assert switch_check({"provider": "codex", "role": "both", "seat": "B"}, tg) == ("codex", "both", "B")
+        for bad in ({"provider": "claude", "role": "cli", "seat": "D"}, {"provider": "claude", "role": "app", "seat": "C"}, {"provider": "codex", "role": "both", "seat": "Z"},
+                    {"provider": "claude", "role": "cli", "seat": "a"}, {"provider": "claude", "role": "cli", "seat": "A/../B"}, {"provider": "claude", "role": "cli", "seat": ["A"]},
+                    {"provider": "claude", "role": "cli"}, {"provider": "claude", "role": "both", "seat": "A"}, {"provider": "codex", "role": "cli", "seat": "A"},
+                    {"provider": "codex", "role": "app", "seat": "A"}, {"provider": "grok", "role": "best"}, {"provider": ["claude"], "role": "cli", "seat": "A"},
+                    {"provider": "claude", "role": {"x": 1}, "seat": "A"}, ["claude"], None, "x"):
+            assert switch_check(bad, tg) is None, bad
+        assert switch_check({"provider": "codex", "role": "best"}, {"claude": tg["claude"]}) is None                # no Codex rotator: no Codex best
+        assert switch_check({"provider": "claude", "role": "best"}, {"claude": {"app": ["A"]}}) is None              # Claude best needs the CLI rotator
+        # outcome text: the last unindented line, colour codes gone, tokens and emails redacted
+        tok = "sk-ant-oat01-" + "x" * 50
+        o_ = switch_outcome(0, "\x1b[32mActive CLI account -> 'B' (someone@example.com).\x1b[0m\r\n  New terminals + VS Code use it immediately\r\n\r\n")
+        assert o_ == {"outcome": "ok", "text": "Done: Active CLI account -> 'B' ([email])."}, o_
+        o_ = switch_outcome(1, "ABORTED: still running, token " + tok + " Bearer abc.def and " + "Q" * 45)
+        assert o_["outcome"] == "error" and o_["text"].startswith("Failed (exit 1): ABORTED") and "sk-ant" not in o_["text"] and "abc.def" not in o_["text"] and "Q" * 40 not in o_["text"], o_
+        assert switch_outcome(3, "") == {"outcome": "error", "text": "Failed (exit 3)."} and switch_outcome(0, None)["text"] == "Done."
+        assert len(switch_outcome(0, "y " * 300)["text"]) <= 206
+        assert switch_outcome(0, "  only indented\n")["text"] == "Done: only indented"
+        # the runner: argv as given, no window, the timeout; stderr when stdout is empty; a timeout or a missing pwsh is an error, never a raise
+        seen = []
+
+        class R_:
+            def __init__(self, rc, out, err=b""):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        def fake(argv, **kw):
+            seen.append((argv, kw))
+            return R_(0, b"Relaunched the Claude app on seat B.\r\n")
+        a_ = switch_argv("claude", "app", "B", here)
+        assert run_switch(a_, fake) == {"outcome": "ok", "text": "Done: Relaunched the Claude app on seat B."}
+        assert seen[0][0] == a_ and seen[0][1]["timeout"] == SWITCH_TIMEOUT == 120 and seen[0][1]["capture_output"] and seen[0][1]["stdin"] == subprocess.DEVNULL
+        assert seen[0][1]["creationflags"] == (0x08000000 if os.name == "nt" else 0) and "shell" not in seen[0][1]
+        assert run_switch(a_, lambda argv, **kw: R_(1, b"  \r\n", b"pwsh: boom\r\n")) == {"outcome": "error", "text": "Failed (exit 1): pwsh: boom"}
+
+        def slow(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+        def gone(argv, **kw):
+            raise FileNotFoundError("pwsh")
+        assert run_switch(a_, slow)["text"].startswith("The rotator did not finish within 120 s") and run_switch(a_, gone) == {"outcome": "error", "text": "The rotator could not run: FileNotFoundError."}
+        # Store.switch: runs the argv for the action, logs without tokens, rebuilds (which re-reads in_use)
+        globals()["APPLOG"] = os.path.join(ld, "log.txt")
+        fs = Store.__new__(Store)
+        fs.lock, rb = threading.RLock(), []
+        fs.rebuild = lambda now: rb.append(now)
+        seen.clear()
+        assert fs.switch("codex", "best", None, lambda argv, **kw: (seen.append(argv), R_(0, b"The app will come up on the new account. " + tok.encode()))[1], here)["outcome"] == "ok"
+        assert seen == [ps("codex-app-rotator.ps1") + ["--rotate"]] and len(rb) == 1
+        lg = open(APPLOG, encoding="utf-8").read()
+        assert "switch: codex best -> Done: The app will come up on the new account." in lg and "sk-ant" not in lg, lg
+        # the blob: per-seat roles minus the role the seat holds; the header button only with its rotator
+        sh_ = [{"t": 5, "s": {k: {"w": 0.1, "wr": 9, "ts": 5} for k in "ABD"}, "codex": {k: {"w": 0.1, "wr": 9, "ts": 5} for k in "AB"}}]
+        sp = build(sh_, 6, {}, True, {"switch": tg, "inUse": {"claude": {"cli": "A", "app": "B"}, "codex": {"app": "A"}}})["providers"]
+        assert [a_.get("switch") for a_ in sp[0]["accounts"]] == [["app"], ["cli"], None] and sp[0]["best"] is True       # D has no token: no button
+        assert [a_.get("switch") for a_ in sp[1]["accounts"]] == [None, ["both"]] and sp[1]["best"] is True
+        sp = build(sh_, 6, {}, True, {"switch": {"claude": {"app": ["A"]}}})["providers"]
+        assert "best" not in sp[0] and "best" not in sp[1] and sp[0]["accounts"][0]["switch"] == ["app"] and "switch" not in sp[1]["accounts"][0]
+        # the HTTP guards
+        globals()["switch_targets"] = lambda *a, **k: tg
+        hs = Store.__new__(Store)
+        hs.lock, hs.refreshing, hs.blob, hc = threading.RLock(), threading.Lock(), {}, []
+        hs.switch = lambda p, r, s: (hc.append((p, r, s)), {"outcome": "ok", "text": "Done."})[1]
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), __import__("http.server").server.BaseHTTPRequestHandler)
+        port = srv.server_address[1]
+        srv.RequestHandlerClass = make_handler(hs, port)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def hq(body, host="127.0.0.1:%d" % port, app="1"):
+            cn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+            cn.request("POST", "/api/switch", raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
+            rp = cn.getresponse()
+            out = (rp.status, rp.read())
+            cn.close()
+            return out
+        try:
+            ok_ = {"provider": "claude", "role": "app", "seat": "B"}
+            assert hq(ok_, host="evil.example:%d" % port)[0] == 403 and hq(ok_, host="127.0.0.1:1")[0] == 403 and hq(ok_, app=None)[0] == 403 and hq(ok_, app="0")[0] == 403 and not hc
+            for bad in ({"provider": "claude", "role": "app", "seat": "C"}, {"provider": "claude", "role": "app", "seat": "B;calc"}, {"provider": "codex", "role": "cli", "seat": "A"},
+                        dict(ok_, pad="x" * 1100), ["claude"], b"not json", b""):
+                assert hq(bad)[0] == 400, bad
+            assert not hc
+            st_, body_ = hq(ok_)
+            assert st_ == 200 and json.loads(body_) == {"outcome": "ok", "text": "Done."} and hc == [("claude", "app", "B")]
+            assert hq({"provider": "codex", "role": "best", "seat": "A"})[0] == 200 and hc[-1] == ("codex", "best", None)
+            hs.refreshing.acquire()
+            assert hq(ok_)[0] == 409 and len(hc) == 2                                                       # single flight with refresh and the resets
+            hs.refreshing.release()
+            hs.switch = lambda p, r, s: 1 / 0
+            assert hq(ok_)[0] == 500 and hs.refreshing.acquire(blocking=False)                              # a crash still releases the lock
+            hs.refreshing.release()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    finally:
+        globals().update(keep)
+        __import__("shutil").rmtree(ld, ignore_errors=True)
     # icons: a valid PNG signature and an ICO header
     assert png(16)[:8] == b"\x89PNG\r\n\x1a\n" and ico(png(16))[:6] == b"\0\0\1\0\1\0"
     say("usage-history selftest: ok")
