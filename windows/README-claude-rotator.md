@@ -374,7 +374,11 @@ errors, so this usually shows up as a pause, not a failure.
   subscription-disabled 403 (`oauth_org_not_allowed`), it launches `--check-rotate --now` and
   returns at once. If the hook event has no `error` field, it reads only the transcript's newest
   API-error token. A normal stop does not fire. This is the backstop for sessions that don't go
-  through the proxy.
+  through the proxy. On a 403 refusal it first writes the refusal marker (`<seat>\access-disabled.json`,
+  as the proxy does) for the seat the stopping session ran on, found by matching its
+  `CLAUDE_CODE_OAUTH_TOKEN` against the seats' `token.txt` (never `.active`, which another session may
+  have moved), so the `--now` check takes its refusal path, fallback included. A session without that
+  variable (an app-spawned one) marks nothing (`session_seat`, `mark_refused`; `test-stopfailure-rotate.py`).
 - **Rate cap.** The watcher refuses a 4th rotation inside 10 min (`$RotateCapCount`/
   `$RotateCapWindow`), logs `RATE CAP`, and returns 3. Three rotations that fast mean every seat is
   failing.

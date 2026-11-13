@@ -9,12 +9,17 @@ merely quotes the error, does not fire.
 
 Fire-and-forget: launches `claude-cli-account.ps1 --check-rotate --now` and returns at
 once, so the stopping session never waits on it. The check itself decides whether to rotate.
+On an access refusal it first writes the rotator's refusal marker (<seat>/access-disabled.json,
+the file and fields claude-rotate-proxy.py writes) for the seat THIS session ran on: the one whose
+token.txt holds the session's CLAUDE_CODE_OAUTH_TOKEN, never whatever .active says now. The check
+then takes its refusal path for that seat, including the fallback when probes time out.
 Always exits 0: a broken backstop must never break a session.
 """
 import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -23,6 +28,42 @@ from rotator_access import classify_hook
 CMD = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
        os.path.join(HERE, "claude-cli-account.ps1"), "--check-rotate", "--now", "--source", "StopFailure"]
 CREATE_NO_WINDOW, BREAKAWAY = 0x08000000, 0x01000000
+ROOT = os.environ.get("CLAUDE_ROTATOR_TEST_ROOT") or os.path.join(os.path.expanduser("~"), ".claude-cli-accounts")
+ACCESS_COOLDOWN = 1800                                          # the rotator's $AccessCooldownSec
+ACCESS_TOKENS = ("oauth_org_not_allowed", "subscription_disabled")
+
+
+def session_seat(root=None):
+    """The seat this session runs on: the label whose token.txt holds the session's CLAUDE_CODE_OAUTH_TOKEN (the hook inherits
+    the session's environment), or None. Seat folders as the rotator counts them (not . or _). The token is never logged or returned."""
+    tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    root = root or ROOT
+    if not tok:
+        return None
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        if name[:1] in "._":
+            continue
+        try:
+            with open(os.path.join(root, name, "token.txt"), encoding="utf-8-sig") as handle:
+                if handle.read().strip() == tok:
+                    return name
+        except OSError:
+            continue
+    return None
+
+
+def mark_refused(label, code, root=None):
+    """Write <label>/access-disabled.json as the rotator reads it. Never touches token.txt."""
+    path = os.path.join(root or ROOT, label, "access-disabled.json")
+    now = int(time.time())
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump({"ts": now, "until": now + ACCESS_COOLDOWN, "http": 403, "code": code, "kind": "subscription_disabled"}, handle)
+    os.replace(tmp, path)
 
 
 def transcript_api_error(path):
@@ -100,8 +141,17 @@ def main():
         event = json.load(sys.stdin)
     except Exception:
         return
-    if not should_rotate(event):
+    why = should_rotate(event)
+    if not why:
         return
+    # A test run (the sink) never marks a real seat: only with its own sandbox root.
+    if why in ACCESS_TOKENS and (os.environ.get("CLAUDE_ROTATOR_TEST_ROOT") or not os.environ.get("CLAUDE_ROTATOR_TEST_SINK")):
+        try:
+            seat = session_seat()
+            if seat:
+                mark_refused(seat, why)
+        except Exception:
+            pass
     try:
         spawn(rotator_cmd())
     except Exception:

@@ -77,7 +77,8 @@ def test_transcript_reader():
 
 def test_spawn_gate():
     sink = os.path.join(tempfile.mkdtemp(prefix="sf-sink-"), "fired.txt")
-    env = dict(os.environ, CLAUDE_ROTATOR_TEST_SINK=sink)
+    env = dict(os.environ, CLAUDE_ROTATOR_TEST_SINK=sink, CLAUDE_ROTATOR_TEST_ROOT=tempfile.mkdtemp(prefix="sf-root-"))
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)        # never this session's real token: no real seat can be matched or marked
     script = os.path.join(HERE, "stopfailure-rotate.py")
 
     def run(event, expect):
@@ -100,6 +101,44 @@ def test_spawn_gate():
         handle.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
                                   "message": {"content": [{"type": "text", "text": "limit"}]}}) + "\n")
     check("hook spawns from the transcript when error is absent", run({"transcript_path": path}, True))
+
+
+def test_refusal_marks_the_sessions_seat():
+    """An access refusal writes the rotator's marker for the seat the SESSION ran on (its own token), not the active one."""
+    root = tempfile.mkdtemp(prefix="sf-seat-")
+    for label, token in (("A", "tok-A"), ("B", "tok-B"), ("_old", "tok-B"), (".inactive", "tok-B")):
+        os.makedirs(os.path.join(root, label))
+        with open(os.path.join(root, label, "token.txt"), "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+    with open(os.path.join(root, ".active"), "w", encoding="utf-8") as handle:
+        handle.write("A")                           # another session already moved .active on
+    sink = os.path.join(root, "fired.txt")
+    script = os.path.join(HERE, "stopfailure-rotate.py")
+    env = dict(os.environ, CLAUDE_ROTATOR_TEST_SINK=sink, CLAUDE_ROTATOR_TEST_ROOT=root, CLAUDE_CODE_OAUTH_TOKEN="tok-B")
+    keep = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "tok-B"
+    try:
+        check("the session's seat is found by its token", hook.session_seat(root) == "B")
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "tok-none"
+        check("an unknown token is no seat", hook.session_seat(root) is None)
+    finally:
+        if keep is None:
+            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        else:
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = keep
+
+    def run(event):
+        subprocess.run([sys.executable, "-I", script], input=json.dumps(event).encode(), env=env, check=False, timeout=15)
+    run({"error": "rate_limit"})
+    check("a quota stop writes no marker", not any(os.path.exists(os.path.join(root, l, "access-disabled.json")) for l in "AB"))
+    run({"error": "403 permission_error: OAuth authentication is currently not allowed for this organization."})
+    mb = os.path.join(root, "B", "access-disabled.json")
+    data = json.load(open(mb, encoding="utf-8")) if os.path.exists(mb) else {}
+    check("the refusal marks the session's seat B with its reason", data.get("code") == "oauth_org_not_allowed" and data.get("http") == 403
+          and data.get("kind") == "subscription_disabled" and data.get("until", 0) - data.get("ts", 0) == 1800, repr(data))
+    check("the active seat A is not marked", not os.path.exists(os.path.join(root, "A", "access-disabled.json")))
+    check("the marker holds no token", "tok-" not in open(mb, encoding="utf-8").read() if os.path.exists(mb) else False)
+    check("the token files are untouched", open(os.path.join(root, "B", "token.txt"), encoding="utf-8").read() == "tok-B\n")
 
 
 def test_seat_dirs_not_letters():
@@ -131,6 +170,7 @@ def main():
     test_classify()
     test_transcript_reader()
     test_spawn_gate()
+    test_refusal_marks_the_sessions_seat()
     test_seat_dirs_not_letters()
     if fail:
         print("%d FAILED" % fail)
