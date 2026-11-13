@@ -16,6 +16,8 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
     if (empty === null && anyRate && left < 0.05) empty = t;
     const r = prof ? ratePerHour[new Date(t * 1000).getHours()] : ratePerHour;
     let drain = r > 0 ? r / 100 * stepSec / 3600 : 0;
+    // The pool may run out inside this step: record when, before a later reset refills it and hides the first depletion.
+    if (empty === null && drain > 0 && drain >= left / 100 - 0.0005) empty = t + Math.round(stepSec * Math.min(1, left / 100 / drain));
     for (const s of ss.slice().sort((a, b) => (a.reset || Infinity) - (b.reset || Infinity))) {
       if (drain <= 0) break;
       const take = Math.min(s.w * (1 - s.used), drain);

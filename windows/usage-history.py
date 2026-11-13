@@ -939,6 +939,8 @@ def project(seats, rate, now, horizon=14 * DAY, step=600):
             empty = t
         r = rate[time.localtime(t).tm_hour] if isinstance(rate, list) else rate
         drain = r / 100 * step / 3600 if r > 0 else 0
+        if empty is None and drain > 0 and drain >= left / 100 - 0.0005:     # it runs out inside this step: before a later reset refills it
+            empty = t + int(step * min(1, left / 100 / drain) + 0.5)
         for s in sorted(ss, key=lambda s: s["reset"] or math.inf):
             if drain <= 0:
                 break
@@ -3336,6 +3338,7 @@ def selftest():
     pw, ew = project([{"used": 0, "reset": far, "period": WEEK}, {"used": 0, "reset": T + 1800, "period": WEEK, "w": 5}], 600, T, 3600)
     assert [dict(pw)[T + d] for d in (600, 1200, 1800, 2400)] == [500, 400, 600, 500]       # 600 %/h = a regular seat per 10 min, taken from the x5 seat (resets first), which refills at 1800
     assert project([{"used": 0.5, "reset": far, "period": WEEK, "w": 0}], 100, T, 600)[0][0][1] == 0.0      # a seat of weight 0 holds nothing
+    assert project([{"used": 0.95, "reset": T + 600, "period": WEEK}], 60, T, 3600)[1] == T + 300           # twin of the node case: empty inside a step, before a reset
     wl = build([rec(T, A=(0.5, far), B=(0.1, far), Z=(0.9, far))], T, {}, False, {"weights": {"seat": {"claude": {"B": 5.0, "Z": 0.0}}}})["providers"][0]
     lm = wl["limits"][0]
     assert lm["cap"] == 600 and lm["now"] == 500.0 and [s.get("w") for s in lm["seats"]] == [None, 5.0] and lm["hist"][0][1] == 500.0, lm      # Z is out of the pool

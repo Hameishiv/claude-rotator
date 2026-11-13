@@ -30,6 +30,12 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(r.pts[0][1], 60);
   assert.strictEqual(r.pts.find(p => p[0] === now + 43200)[1], 100);
 }
+// the pool runs out between steps, just before a reset refills it: the first depletion is still reported (95 % used, 60 %/h -> empty after 5 min;
+// the reset at 10 min would hide it if depletion were only checked at step starts)
+{
+  const r = quotaProject([{ used: 0.95, reset: now + 600, period: W }], 60, now, 3600);
+  assert.strictEqual(r.empty, now + 300);
+}
 // null reset drains last and a missing period does not hang
 {
   const r = quotaProject([{ used: 0, reset: null, period: 0 }], 100, now, 7200);
