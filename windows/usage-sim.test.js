@@ -209,4 +209,13 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const none = panel({ id: 'grok', name: 'xAI', total: 1, limits: [], accounts: [{ label: 'grok', note: '' }] }, 600);
   assert.ok(none.includes('<ACCOUNTS>') && none.includes('No usage data yet.'), none);
 }
+// a Codex seat whose last reset is unconfirmed shows that instead of Apply reset, so a retry cannot mint a second claim
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const src = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction accounts('));
+  const resetBtn = new Function('D', 'esc', 'QUOTA_RESET_KINDS', src + '\nreturn resetBtn;')({ app: true }, s => String(s), QUOTA_RESET_KINDS);
+  const cx = { id: 'codex', canReset: true };
+  assert.ok(resetBtn(cx, { label: 'A', banked: 2 }).includes('>Apply reset</button>'));
+  assert.strictEqual(resetBtn(cx, { label: 'A', banked: 2, resetPending: true }), '<small class="muted">Last reset unconfirmed — checking</small>');
+}
 console.log('usage-sim tests passed');

@@ -275,6 +275,7 @@ const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a
 // Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
 const resetBtn = (p, a) => !D.app || !p.canReset ? '' : p.id === 'claude'
   ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">Apply ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>`).join('')
+  : a.resetPending ? '<small class="muted">Last reset unconfirmed — checking</small>'
   : a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
 function accounts(p) {

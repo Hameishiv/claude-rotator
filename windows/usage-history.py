@@ -728,6 +728,7 @@ def sample(now, force=False):
     if email:
         cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
     pcache_merge(before, cache)
+    codex_reconcile(rec.get("codex") or {})
     return rec
 
 
@@ -1004,6 +1005,8 @@ def build_provider(hist, pid, emails, now, extra):
         if cr.get("note"):
             a["bankedNote"] = cr["note"]
         acts = [r for r in sw if r != "best" and label in sw[r] and use.get("app" if r == "both" else r) != label]
+        if pid == "codex" and label in (extra.get("codexPending") or ()):
+            a["resetPending"] = True        # its last reset is unconfirmed: no Apply reset until a reading settles it
         if acts:                            # the switch buttons: roles whose rotator can use this seat, minus the one it already holds
             a["switch"] = acts
         rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
@@ -1146,7 +1149,8 @@ def load_extra():
     except (OSError, ValueError):
         pass
     return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
-            "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
+            "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs},
+            "codexPending": sorted(c.get("codex_pending") or {})}
 
 
 LOCK_WAIT, LOCK_STALE = 30, 120    # s: how long a writer waits for the history lock; a lock older than this was left by a crash
@@ -1734,27 +1738,53 @@ def reset_result(seat, rep):
     return {"outcome": "error", "text": "The reset did not go through" + (": " + err if err else ".")}
 
 
-def run_reset(seat, script, now, popen=subprocess.Popen):
-    """Apply one banked reset on `seat` (the script's --confirm), then read the seat again (its read-only mode): (result for the page, new seat reading or None).
+def run_reset(seat, script, popen=subprocess.Popen):
+    """Apply one banked reset on `seat` (the script's --confirm), then read the seat again (its read-only mode): (result for the page, settled, new seat reading
+    or None). `settled` only for a clear answer, the script's `redeemed` or `no_credit` report, or a script that could not start: anything else (a crash,
+    unreadable output, its own error report) may have spent the credit, and the script mints a new claim each run, so the caller must not offer a retry.
     Both calls have no window and are NEVER killed: the script copies refreshed credentials back as it ends, so a kill could leave them stale (Store.codex_reset
     runs this off the request thread). Neither the script's stderr nor any token is kept."""
     def call(*extra):
         p = popen(PY + [script, "--account", seat] + list(extra), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                   creationflags=CHILD_FLAGS)
-        out = p.communicate()[0] or b""
+        try:
+            out = p.communicate()[0] or b""
+        except Exception as e:   # shortcut: started but lost: as unclear as a crash
+            return {"status": "error", "error": "lost track of the script: %s" % type(e).__name__}
         try:
             return json.loads(out.decode("utf-8", "replace"))
         except ValueError:
             return {"status": "error", "error": "unreadable output (exit %s)" % p.returncode}
     try:
-        res = reset_result(seat, call("--confirm"))
-    except (OSError, subprocess.SubprocessError) as e:
-        return {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__}, None
+        rep = call("--confirm")
+    except (OSError, subprocess.SubprocessError) as e:      # it never started: nothing was spent
+        return {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__}, True, None
+    res, settled = reset_result(seat, rep), isinstance(rep, dict) and rep.get("status") in ("redeemed", "no_credit")
+    if not settled:
+        res = {"outcome": "error", "text": "The reset on seat %s is unconfirmed (%s). Apply reset stays off for that seat until a new reading shows whether it "
+                                           "was used." % (seat, res["text"].split(": ", 1)[-1].rstrip("."))}
     try:
-        rep = call()
+        rd = call()
     except (OSError, subprocess.SubprocessError):
-        return res, None
-    return res, (codex_seat_from_read(rep.get("rate_limits_before"), now) if rep.get("status") == "checked" else None)
+        return res, settled, None
+    return res, settled, (codex_seat_from_read(rd.get("rate_limits_before"), math.ceil(time.time())) if isinstance(rd, dict) and rd.get("status") == "checked" else None)
+
+
+def codex_reconcile(readings):
+    """Clear a Codex seat's unconfirmed-reset marker (`codex_pending` in the provider cache) once a reading taken after the attempt ended carries its banked
+    count: lower than before -> it was applied, otherwise it was not. Until then build_provider() keeps that seat's Apply reset off."""
+    if not load_pcache().get("codex_pending"):
+        return
+    with pcache_txn() as c:
+        pend = c.get("codex_pending") or {}
+        for seat, m in list(pend.items()):
+            r = readings.get(seat) or {}
+            end = m.get("end") or (m.get("at") or 0) + DAY   # shortcut: the app stopped mid-reset and never recorded the end; a day later any reading settles it
+            if (r.get("ts") or 0) <= end or r.get("banked") is None:
+                continue
+            applied = m.get("banked") is not None and r["banked"] < m["banked"]
+            applog("codex reset: seat %s unconfirmed reset reconciled -> %s (banked %s -> %s)" % (seat, "applied" if applied else "not applied", m.get("banked"), r["banked"]))
+            del pend[seat]
 
 
 SWITCH_TIMEOUT = 120                                     # s: an app rotator closes the app, switches and reopens it
@@ -1935,7 +1965,14 @@ class Store:
     def codex_reset(self, seat, script, popen=subprocess.Popen):
         """Apply one banked reset on a Codex seat (the caller holds `refreshing`). Returns {"outcome", "text"}. The redeem script runs on a thread of its own and
         is never killed: still running after RESET_TIMEOUT s, the outcome is "running", that thread keeps `refreshing` until the script ends (other actions get
-        409 meanwhile), and the caller must NOT release the lock."""
+        409 meanwhile), and the caller must NOT release the lock. Before it runs, the seat is marked unconfirmed with its banked count; a seat still marked is
+        refused (codex_reconcile() clears the mark), because a second run would mint a second claim."""
+        with self.lock, pcache_txn() as c:
+            pend = c.setdefault("codex_pending", {})
+            if seat in pend:
+                return {"outcome": "error", "text": "The last reset on seat %s is unconfirmed; it is being checked. Apply reset comes back after its next reading." % seat}
+            pend[seat] = {"at": int(time.time()), "banked": next((x["banked"] for x in (seats_of(h, "codex").get(seat) or {} for h in reversed(self.hist))
+                                                                 if x.get("banked") is not None), None)}
         box, hand, done = {}, threading.Lock(), threading.Event()
 
         def job():
@@ -1960,18 +1997,26 @@ class Store:
         return {"outcome": "running", "text": RESET_RUNNING}
 
     def codex_reset_job(self, seat, script, popen):
-        """The reset itself, then the reading taken after it recorded."""
-        res, new = run_reset(seat, script, time.time(), popen)
-        applog("codex reset: seat %s -> %s" % (seat, res["outcome"]))
-        if new:
-            with self.lock:
-                now = time.time()
-                with pcache_txn() as cache:
+        """The reset itself, then the reading taken after it recorded; the unconfirmed mark dropped when the answer was clear, else given its end time."""
+        res, settled, new = run_reset(seat, script, popen)
+        end = time.time()
+        applog("codex reset: seat %s -> %s%s" % (seat, res["outcome"], "" if settled else " (unconfirmed)"))
+        with self.lock:
+            now = time.time()
+            with pcache_txn() as cache:
+                pend = cache.setdefault("codex_pending", {})
+                if settled:
+                    pend.pop(seat, None)
+                elif seat in pend:
+                    pend[seat]["end"] = end
+                if new:
                     cache.setdefault("codex_fresh", {})[seat] = new       # sample() prefers it until the seat's own cache is newer
+            if new:
+                codex_reconcile({seat: new})            # the read after an unclear answer usually settles it at once
                 last = next((dict(h["codex"]) for h in reversed(self.hist) if h.get("codex")), {})
                 last[seat] = new
                 self.hist = save(self.hist, {"t": int(now), "codex": last}, now)
-                self.rebuild(now)
+            self.rebuild(now)
         return res
 
     def switch(self, provider, role, seat, popen=subprocess.Popen, here=None):
@@ -2692,22 +2737,32 @@ def selftest():
     def fake(argv, **kw):
         calls.append((argv, kw))
         return Proc(json.dumps({"status": "redeemed", "outcome": "redeemed", "token": "SECRET"} if "--confirm" in argv else rd).encode())
-    res, new = run_reset("A", "/x/redeem.py", 1794500000, fake)
-    assert res == {"outcome": "redeemed", "text": "Reset applied to seat A."} and new == cs and "SECRET" not in json.dumps(res)
+    t0 = time.time()
+    res, ok_, new = run_reset("A", "/x/redeem.py", fake)
+    assert res == {"outcome": "redeemed", "text": "Reset applied to seat A."} and ok_ is True and "SECRET" not in json.dumps(res)
+    assert dict(new, ts=0) == dict(cs, ts=0) and new["ts"] > t0                     # the reading's time is after the read, not before the reset
     assert calls[0][0] == PY + ["/x/redeem.py", "--account", "A", "--confirm"] and calls[1][0] == PY + ["/x/redeem.py", "--account", "A"]
     assert all(k["stdin"] == subprocess.DEVNULL and k["stdout"] == subprocess.PIPE and "timeout" not in k for _, k in calls)
     assert all(k["creationflags"] == (0x08000040 if os.name == "nt" else 0) for _, k in calls)
     assert len(comm) == 2 and all(c == ((), {}) for c in comm)                       # never a timeout: the script is never killed
     def boom(argv, **kw):
         raise OSError("no python")
-    assert run_reset("A", "/x", 1, boom) == ({"outcome": "error", "text": "The reset did not go through: OSError."}, None)
-    assert run_reset("A", "/x", 1, lambda argv, **kw: Proc(b"<html>", 3))[0]["outcome"] == "error"
+    assert run_reset("A", "/x", boom) == ({"outcome": "error", "text": "The reset did not go through: OSError."}, True, None)    # never started: settled
+    j_ = run_reset("A", "/x", lambda argv, **kw: Proc(b"<html>", 3) if "--confirm" in argv else Proc(b"{}"))
+    assert j_[0]["outcome"] == "error" and "unconfirmed" in j_[0]["text"] and j_[1] is False and j_[2] is None
+    for rep_, ok_ in (({"status": "no_credit"}, True), ({"status": "redeemed", "outcome": "already_redeemed"}, True), ({"status": "error", "error": "consume timed out"}, False)):
+        assert run_reset("A", "/x", lambda argv, **kw: Proc(json.dumps(rep_).encode()))[1] is ok_, rep_
+
+    class Lost(Proc):
+        def communicate(self, *a, **kw):
+            raise BrokenPipeError()
+    assert run_reset("A", "/x", lambda argv, **kw: Lost(b""))[1] is False
     calls.clear()
     def once(argv, **kw):
         if "--confirm" in argv:
             return fake(argv, **kw)
         raise OSError("gone")
-    assert run_reset("A", "/x", 1, once) == ({"outcome": "redeemed", "text": "Reset applied to seat A."}, None)         # the follow-up read failing keeps the result
+    assert run_reset("A", "/x", once) == ({"outcome": "redeemed", "text": "Reset applied to seat A."}, True, None)         # the follow-up read failing keeps the result
     # B: a script that outlives RESET_TIMEOUT is not killed: "running", and its thread keeps `refreshing` until it ends, then releases it
     keep = {k: globals()[k] for k in ("HIST", "PCACHE", "APPLOG", "RESET_TIMEOUT")}
     with tempfile.TemporaryDirectory() as td:
@@ -2731,6 +2786,41 @@ def selftest():
             cst.refreshing.acquire()                                         # in time: the result itself, and the caller keeps the lock
             assert cst.codex_reset("A", "/x", fake)["outcome"] == "redeemed" and cst.refreshing.locked()
             cst.refreshing.release()
+            # B: an unclear Codex answer keeps the seat marked (the script mints a new claim each run): no retry until a reading settles it
+            assert load_pcache().get("codex_pending") == {}
+            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}, {"t": 2, "codex": {"A": {"ts": 2, "w": 0.1}}}]     # an imported point has no count
+            seen_ = []
+
+            def crash(argv, **kw):
+                seen_.append((argv, load_pcache().get("codex_pending")))
+                return Proc(b"Traceback", 1) if "--confirm" in argv else Proc(b"{}")
+            r_ = cst.codex_reset("A", "/x", crash)
+            pm = load_pcache()["codex_pending"]["A"]
+            assert r_["outcome"] == "error" and "unconfirmed" in r_["text"] and seen_[0][1]["A"]["banked"] == 3 and pm["banked"] == 3 and pm["end"] >= pm["at"]
+            n_ = len(seen_)
+            r_ = cst.codex_reset("A", "/x", crash)
+            assert "is unconfirmed; it is being checked" in r_["text"] and len(seen_) == n_                 # refused: the script does not run again
+            assert build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": ["A"]})["providers"][0]["accounts"][0]["resetPending"] is True
+            codex_reconcile({"A": {"ts": int(pm["end"]), "banked": 2}})                                    # not after the attempt: proves nothing
+            assert "A" in load_pcache()["codex_pending"]
+            codex_reconcile({"A": {"ts": int(pm["end"]) + 2}})                                             # no count: proves nothing
+            assert "A" in load_pcache()["codex_pending"]
+            codex_reconcile({"A": {"ts": int(pm["end"]) + 2, "banked": 2}})                                # the count dropped: it was applied
+            assert load_pcache()["codex_pending"] == {} and "reconciled -> applied (banked 3 -> 2)" in open(APPLOG).read()
+            # the read straight after an unclear answer settles it at once when the count is unchanged; sample() reconciles too
+            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
+            r_ = cst.codex_reset("A", "/x", lambda argv, **kw: Proc(b"?", 1) if "--confirm" in argv else Proc(json.dumps(rd).encode()))
+            assert "unconfirmed" in r_["text"] and load_pcache()["codex_pending"] == {} and "reconciled -> not applied (banked 2 -> 2)" in open(APPLOG).read()
+            stub = {k: globals()[k] for k in ("read_claude", "read_codex", "fetch_grok", "read_gemini", "gemini_email")}
+            cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
+            cst.codex_reset("A", "/x", crash)
+            try:
+                globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({"A": {"ts": int(time.time()) + 5, "w": 0.1, "banked": 2}}, {}),
+                                 fetch_grok=lambda now_: (None, None), read_gemini=lambda now_: (None, "x"), gemini_email=lambda: None)
+                sample(time.time(), True)
+            finally:
+                globals().update(stub)
+            assert load_pcache()["codex_pending"] == {}
         finally:
             globals().update(keep)
 
