@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaSeat, quotaInUse, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -85,6 +85,11 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaBankedTotal({ accounts: [two, { banked: 1 }, {}] }), 3);
   assert.strictEqual(quotaBankedTotal({ accounts: [{}, {}] }), null);
 }
+// share of the whole pool: 162 of 600 -> 27 %, a pooled 3.6 %/h over 6 seats -> 0.6 %/h; a missing cap means one seat
+assert.strictEqual(Math.round(quotaShare(162, 600)), 27);
+assert.strictEqual(quotaShare(3.6, 600), 0.6);
+assert.strictEqual(quotaShare(50, undefined), 50);
+assert.strictEqual(quotaShare(600, 600), 100);
 // status levels: Claude by the API's status (unknown is neutral), the others by the displayed percentage
 {
   assert.deepStrictEqual(['allowed', 'allowed_warning', 'rejected', undefined, 'odd'].map(stat => quotaLevel('claude', { used: 0.99, stat })), ['ok', 'warn', 'bad', '', '']);

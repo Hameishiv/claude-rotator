@@ -139,7 +139,10 @@ const fmtWT = t => loc(t, { weekday: 'short', hour: 'numeric', minute: '2-digit'
 const fmtD = t => loc(t, { month: 'short', day: 'numeric' });
 const ago = t => { const s = D.now - t; return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? +(s / 3600).toFixed(1) + ' h ago' : Math.round(s / 86400) + ' d ago'; };
 const nm = a => quotaSeat(a, ui.emails, esc);
-const num = v => Math.round(v * 10) / 10;
+const fr = v => v >= 10 ? Math.round(v) : v >= 1 ? +v.toFixed(1) : +v.toFixed(2);     // a rate in % of the whole pool per hour: finer when small, as it is divided by the seats
+const seatsOf = lim => Math.round((lim.cap || 100) / 100);
+const sh = (v, lim) => quotaShare(v, lim.cap);
+const seatsTxt = lim => seatsOf(lim) + ' seat' + (seatsOf(lim) === 1 ? '' : 's');
 // The rate the headline number and the projection use. 'typ' is the limit's typical-day profile (24 hourly %/h); a young limit has none and falls back to 3h.
 function rateFor(lim) {
   const w = ui.win;
@@ -188,17 +191,17 @@ function chart(p, lim, W) {
   const X = t => L + (t - x0) / (x1 - x0) * pw;
   const drain = ui.view === 'drain';
   const mult = parseFloat(ui.mult), rf = rateFor(lim), rate = rf.rate, wk = winKey();
-  const cap = lim.cap || 100;
-  const hist = drain ? [] : lim.hist.filter(q => q[0] >= x0 && q[0] <= x1);
-  const dr = drain ? ((lim.drain || {})[wk] || []).filter(q => q[0] >= x0 && q[0] <= x1) : [];
+  const sc = a => a.map(q => [q[0], sh(q[1], lim)].concat(q.slice(2)));          // pooled -> % of the whole pool, for display only
+  const hist = drain ? [] : sc(lim.hist.filter(q => q[0] >= x0 && q[0] <= x1));
+  const dr = drain ? sc(((lim.drain || {})[wk] || []).filter(q => q[0] >= x0 && q[0] <= x1)) : [];
   let pr = null;
   if (!drain && rate != null && x1 > D.now && lim.seats && lim.seats.length) {
     pr = quotaProject(lim.seats, Array.isArray(rate) ? rate.map(r => r * mult) : rate * mult, D.now, x1 - D.now);
-    pr.pts = pr.pts.filter(q => q[0] >= x0 && q[0] <= x1);
+    pr.pts = sc(pr.pts.filter(q => q[0] >= x0 && q[0] <= x1));
   }
-  const ymax = drain ? niceMax(Math.max(0, ...dr.map(q => q[1]))) : cap;
+  const ymax = drain ? niceMax(Math.max(0, ...dr.map(q => q[1]))) : 100;
   const Y = v => T + (1 - Math.min(Math.max(v, 0), ymax) / ymax) * (H - T - B);
-  const yl = v => drain ? num(v) + '%/h' : Math.round(v) + '%';
+  const yl = v => drain ? fr(v) + '%/h' : Math.round(v) + '%';
   const s = [];
   for (const v of [0, ymax / 2, ymax]) s.push(`<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end" fill="var(--muted)">${yl(v)}</text>`);
   const ppd = pw / 14;
@@ -239,7 +242,7 @@ function chart(p, lim, W) {
   s.push(`<line class="cx" y1="${T}" y2="${H - B}" stroke="var(--ink2)" visibility="hidden"/><circle class="cd" r="5" fill="var(--acc)" stroke="var(--panel)" stroke-width="2" visibility="hidden"/><rect class="hit" x="${L}" y="0" width="${pw}" height="${H}" fill="transparent"/>`);
   const cand = drain ? dr.map(q => [q[0], q[1], 'd']) : hist.map(q => [q[0], q[1], q[2] ? 'b' : 'r']).concat(pr ? pr.pts.map(q => [q[0], q[1], 'p']) : []);
   charts[p.id] = { W, H, L, R, x0, x1, X, Y, cand };
-  const label = drain ? `${lim.label} usage rate over the last ${wk} hours` : `${lim.label}: ${Math.round(lim.now)}% of ${cap}% left now` + (emptyTxt ? ', projected ' + emptyTxt.toLowerCase() : '');
+  const label = drain ? `${lim.label} usage rate over the last ${wk} hours` : `${lim.label}: ${Math.round(sh(lim.now, lim))}% left now across ${seatsTxt(lim)}` + (emptyTxt ? ', projected ' + emptyTxt.toLowerCase() : '');
   const notes = [];
   if (!drain) {
     notes.push('Solid: recorded');
@@ -272,11 +275,11 @@ function accounts(p) {
 function panel(p, W) {
   const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0], bk = quotaBankedTotal(p);
   let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p, esc) ? `<span class="inuse">${quotaInUse(p, esc)}</span>` : ''}</div>`;
-  h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(l.now)}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
+  h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(sh(l.now, l))}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
   if (p.note) h += `<p class="note">${esc(p.note)}</p>`;
   if (lim) {
     const rf = rateFor(lim);
-    h += `<div class="hd"><div><span class="big">${Math.round(lim.now)}%</span><span class="of">of ${lim.cap}%</span></div><div class="stat"><span class="muted">Usage rate</span><b>${rf.avg == null ? 'not enough history yet' : num(rf.avg) + '%/h'}</b><span class="muted why">${esc(rf.why)}</span></div></div>`;
+    h += `<div class="hd"><div><span class="big">${Math.round(sh(lim.now, lim))}%</span><span class="of">left across ${seatsTxt(lim)}</span></div><div class="stat"><span class="muted">Usage rate</span><b>${rf.avg == null ? 'not enough history yet' : fr(sh(rf.avg, lim)) + '%/h'}</b><span class="muted why">${esc(rf.why)}</span></div></div>`;
     h += chart(p, lim, W);
   } else {
     h += `<p class="muted">No usage data yet.</p>` + (p.accounts.some(a => a.note) ? `<ul class="nl">${p.accounts.filter(a => a.note).map(a => `<li>${nm(a)}: ${esc(a.note)}</li>`).join('')}</ul>` : '');
@@ -328,7 +331,7 @@ function hover(el) {
     const px = c.X(q[0]), py = c.Y(q[1]);
     cx.setAttribute('x1', px); cx.setAttribute('x2', px); cd.setAttribute('cx', px); cd.setAttribute('cy', py);
     cx.setAttribute('visibility', 'visible'); cd.setAttribute('visibility', 'visible');
-    const val = q[2] === 'd' ? num(q[1]) + '%/h' : Math.round(q[1]) + '% left' + (q[2] === 'p' ? ' (projected)' : q[2] === 'b' ? ' (rebuilt)' : '');
+    const val = q[2] === 'd' ? fr(q[1]) + '%/h' : Math.round(q[1]) + '% left' + (q[2] === 'p' ? ' (projected)' : q[2] === 'b' ? ' (rebuilt)' : '');
     tip.textContent = fmtDT(q[0]) + ' · ' + val;
     tip.style.display = 'block'; tip.style.top = (py * k) + 'px';
     tip.style.left = Math.min(Math.max(px * k, tip.offsetWidth / 2 + 2), r.width - tip.offsetWidth / 2 - 2) + 'px';

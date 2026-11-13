@@ -37,6 +37,8 @@ function quotaInUse(p, esc) {
   const u = p.inUse || {};
   return [['cli', 'CLI'], ['app', 'App']].filter(([k]) => u[k]).map(([k, n]) => quotaBadge(n, u[k], esc)).join('');
 }
+// A pooled figure as a share of the provider's whole pool: 100 % is every seat full. `cap` is 100 per seat (the blob's limit.cap); pooled %/h rates scale the same way.
+const quotaShare = (v, cap) => v * 100 / (cap || 100);
 // "17d 23h", "5h 12m", "12m": time left until an expiry.
 function quotaIn(sec) {
   const m = Math.max(0, Math.floor(sec / 60)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
@@ -62,4 +64,4 @@ function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaInUse, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
