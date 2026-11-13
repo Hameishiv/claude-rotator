@@ -106,9 +106,15 @@ def write_state(state, data):
     os.replace(tmp, state)
 
 
-def record(repo, live, ref, state):
-    differing, missing = compare(repo, live, ref)
-    sha = git(repo, "rev-parse", "--short", ref).stdout.decode().strip()
+def resolve(repo, ref):
+    """The commit `ref` names now. Pull and push resolve it once, after fetching, so a fetch running meanwhile cannot move what they compare and write."""
+    return git(repo, "rev-parse", "--verify", ref + "^{commit}").stdout.decode().strip()
+
+
+def record(repo, live, ref, state, at=None):
+    """Compare live with `at` (a resolved commit; default `ref`) and write the drift state, labelled with `ref`."""
+    differing, missing = compare(repo, live, at or ref)
+    sha = git(repo, "rev-parse", "--short", at or ref).stdout.decode().strip()
     st = load_json(state)
     st.update({"checked": int(time.time()), "ref": "%s %s" % (ref, sha), "differing": sorted(differing + missing), "missingLive": missing})
     write_state(state, st)
@@ -132,11 +138,12 @@ def cmd_check(repo, live, ref, state, quiet):
 
 def cmd_pull(repo, live, ref, state):
     maybe_fetch(repo, ref, state, force=True)
-    differing, missing = compare(repo, live, ref)
+    at = resolve(repo, ref)
+    differing, missing = compare(repo, live, at)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     for rel in differing + missing:
         dest = os.path.join(live, *rel.split("/"))
-        data = repo_bytes(repo, ref, rel)       # first: a git failure must not leave a truncated live script
+        data = repo_bytes(repo, at, rel)        # first: a git failure must not leave a truncated live script
         if rel in differing:
             shutil.copy2(dest, "%s.bak-sync-%s" % (dest, stamp))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -147,9 +154,9 @@ def cmd_pull(repo, live, ref, state):
         print("%s %s" % ("added   " if rel in missing else "replaced", rel))
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
-    record(repo, live, ref, state)
+    record(repo, live, ref, state, at)
     st = load_json(state)
-    st["installed"] = git(repo, "rev-parse", ref).stdout.decode().strip()     # --push exports changes relative to this
+    st["installed"] = at        # --push exports changes relative to this
     write_state(state, st)
     return 0
 
@@ -171,6 +178,7 @@ def cmd_push(repo, live, ref, state, branch, worktree):
         sys.stderr.write("rotator-sync: no installed commit recorded (or it is not in the clone): run --pull first\n")
         return 2
     maybe_fetch(repo, ref, state, force=True)
+    at = resolve(repo, ref)
     changed, clash = [], []
     for rel in sorted(repo_files(repo, base)):
         path = os.path.join(live, *rel.split("/"))
@@ -180,24 +188,24 @@ def cmd_push(repo, live, ref, state, branch, worktree):
             if norm(fh.read()) == norm(repo_bytes(repo, base, rel)):
                 continue
         changed.append(rel)
-        up = git(repo, "show", "%s:%s%s" % (ref, PREFIX, rel), check=False)
+        up = git(repo, "show", "%s:%s%s" % (at, PREFIX, rel), check=False)
         if up.returncode or norm(up.stdout) != norm(repo_bytes(repo, base, rel)):
             clash.append(rel)
     if not changed:
         print("rotator-sync: no live file changed since the installed commit %s, nothing to push" % base[:9])
         return 0
     if clash:
-        sys.stderr.write("rotator-sync: refusing to push: %s also changed since the installed commit %s:\n" % (ref, base[:9]))
+        sys.stderr.write("rotator-sync: refusing to push: %s also changed since the installed commit %s:\n" % ("%s (%s)" % (ref, at[:9]), base[:9]))
         for rel in clash:
             sys.stderr.write("  both changed: %s\n" % rel)
         return 1
     if not worktree:
         root = r"C:\Dev\Temp" if os.path.isdir(r"C:\Dev\Temp") else tempfile.gettempdir()
         worktree = os.path.join(root, "wt-rotator-push-" + branch.replace("/", "-"))
-    git(repo, "worktree", "add", "-b", branch, worktree, ref)
+    git(repo, "worktree", "add", "-b", branch, worktree, at)
     for rel in changed:
         with open(os.path.join(live, *rel.split("/")), "rb") as fh:
-            data = match_style(fh.read(), repo_bytes(repo, ref, rel))
+            data = match_style(fh.read(), repo_bytes(repo, at, rel))
         with open(os.path.join(worktree, "windows", *rel.split("/")), "wb") as fh:
             fh.write(data)
     git(worktree, "add", "--", *["windows/" + r for r in changed])
@@ -318,6 +326,47 @@ def selftest():
             check("upstream's newer a.ps1 is not rolled back", fh.read() == b"one\r\nthree\r\n")
         with open(os.path.join(wt, "windows", "c.ps1"), "rb") as fh:
             check("pushed CRLF file kept its CRLF", fh.read() == b"y\r\n")
+        git(repo, "worktree", "remove", "--" + "force", wt)
+
+        # the ref is resolved once per operation: a fetch moving it mid-pull or mid-push changes neither what --pull records nor the push's base
+        real_git, real_compare, real_rb, moved = git, compare, repo_bytes, []
+
+        def move(rel, data):        # another process's fetch lands a new upstream commit
+            write(os.path.join(repo, "windows", rel), data)
+            real_git(repo, "add", "--", "windows/" + rel)
+            real_git(repo, "commit", "-q", "-m", "moved")
+            moved.append(real_git(repo, "rev-parse", "HEAD").stdout.decode().strip())
+
+        def racing_compare(*a):
+            out = real_compare(*a)
+            globals()["repo_bytes"] = racing_rb
+            return out
+
+        def racing_rb(*a):
+            globals()["repo_bytes"] = real_rb
+            move("missing.txt", b"moved\n")
+            return real_rb(*a)
+
+        def racing_git(repo_, *args, **kw):
+            if args[:2] == ("worktree", "add"):
+                move("a.ps1", b"one\r\nupstream two\r\n")
+            return real_git(repo_, *args, **kw)
+        before = git(repo, "rev-parse", "HEAD").stdout.decode().strip()
+        globals()["compare"] = racing_compare
+        try:
+            cmd_pull(repo, live, "HEAD", state)
+        finally:
+            globals().update(compare=real_compare, repo_bytes=real_rb)
+        check("a fetch mid-pull: the commit it installed is recorded", len(moved) == 1 and load_json(state)["installed"] == before
+              and compare(repo, live, before) == ([], []))
+        write(os.path.join(live, "a.ps1"), b"one\nhot\n")
+        globals()["git"] = racing_git
+        try:
+            check("push exit 0", cmd_push(repo, live, "HEAD", state, "hotfix2", wt) == 0)
+        finally:
+            globals()["git"] = real_git
+        check("a fetch mid-push: the branch is built on the commit it checked", len(moved) == 2
+              and git(wt, "rev-parse", "HEAD~1").stdout.decode().strip() == moved[0])
         git(repo, "worktree", "remove", "--" + "force", wt)
     finally:
         rmtree(root)
