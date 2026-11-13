@@ -15,13 +15,19 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
     pts.push([t, Math.round(left * 10) / 10]);
     if (empty === null && anyRate && left < 0.05) empty = t;
     const r = prof ? ratePerHour[new Date(t * 1000).getHours()] : ratePerHour;
-    let drain = r > 0 ? r / 100 * stepSec / 3600 : 0;
-    // The pool may run out inside this step: record when, before a later reset refills it and hides the first depletion.
-    if (empty === null && drain > 0 && drain >= left / 100 - 0.0005) empty = t + Math.round(stepSec * Math.min(1, left / 100 / drain));
-    for (const s of ss.slice().sort((a, b) => (a.reset || Infinity) - (b.reset || Infinity))) {
-      if (drain <= 0) break;
-      const take = Math.min(s.w * (1 - s.used), drain);
-      s.used += take / s.w; drain -= take;
+    // The step is split at every reset inside it, and the pool's first run-out is recorded where it happens: one before a reset is not hidden
+    // by the refill, and none is reported when a reset comes first.
+    for (let a = t, b; a < t + stepSec; a = b) {
+      b = Math.min(t + stepSec, ...ss.filter(s => s.reset && s.period && s.reset > a).map(s => s.reset));
+      let drain = r > 0 ? r / 100 * (b - a) / 3600 : 0;
+      const l = ss.reduce((n, s) => n + s.w * (1 - s.used), 0);
+      if (empty === null && drain > 0 && drain >= l - 0.0005) empty = a + Math.round((b - a) * Math.min(1, l / drain));
+      for (const s of ss.slice().sort((x, y) => (x.reset || Infinity) - (y.reset || Infinity))) {
+        if (drain <= 0) break;
+        const take = Math.min(s.w * (1 - s.used), drain);
+        s.used += take / s.w; drain -= take;
+      }
+      for (const s of ss) roll(s, b);
     }
   }
   return { pts, empty };

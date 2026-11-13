@@ -35,6 +35,8 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 {
   const r = quotaProject([{ used: 0.95, reset: now + 600, period: W }], 60, now, 3600);
   assert.strictEqual(r.empty, now + 300);
+  // ... and a reset that comes first (2 min, before the 5-min run-out) refills it: no run-out within the hour
+  assert.strictEqual(quotaProject([{ used: 0.95, reset: now + 120, period: W }], 60, now, 3600).empty, null);
 }
 // null reset drains last and a missing period does not hang
 {
