@@ -59,11 +59,16 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaSeat({ label: 'A', email: 'a@x.org' }, true, esc), 'A<small>a@x.org</small>');
   assert.strictEqual(quotaSeat({ label: 'B', email: null }, true, esc), 'B');
   assert.strictEqual(quotaSeat({ label: '<', email: '<e>' }, true, esc), '&lt;<small>&lt;e></small>');
-  assert.strictEqual(quotaSeat({ label: 'D', email: 'd@x.org', badges: ['CLI', 'App'] }, true, esc), 'D<span class="bdg">CLI</span><span class="bdg">App</span><small>d@x.org</small>');
+  const cli = '<span class="bdg cli" role="img" title="Claude Code CLI is on this seat" aria-label="Claude Code CLI is on this seat">CLI</span>';
+  const app = '<span class="bdg app" role="img" title="Desktop app is on this seat" aria-label="Desktop app is on this seat">App</span>';
+  assert.strictEqual(quotaSeat({ label: 'D', email: 'd@x.org', badges: ['CLI', 'App'] }, true, esc), 'D' + cli + app + '<small>d@x.org</small>');
   assert.strictEqual(quotaSeat({ label: 'D', badges: [] }, true, esc), 'D');
-  assert.strictEqual(quotaInUse({ inUse: { cli: 'D', app: 'B' } }), 'CLI on D · App on B');
-  assert.strictEqual(quotaInUse({ inUse: { app: 'A' } }), 'App on A');
-  assert.strictEqual(quotaInUse({}), '');
+  // provider header: the same pills with the seat letter, and a title that names the seat
+  const hcli = '<span class="bdg cli" role="img" title="Claude Code CLI is on seat D" aria-label="Claude Code CLI is on seat D">CLI D</span>';
+  const happ = '<span class="bdg app" role="img" title="Desktop app is on seat B" aria-label="Desktop app is on seat B">App B</span>';
+  assert.strictEqual(quotaInUse({ inUse: { cli: 'D', app: 'B' } }, esc), hcli + happ);
+  assert.strictEqual(quotaInUse({ inUse: { app: 'B' } }, esc), happ);
+  assert.strictEqual(quotaInUse({}, esc), '');
 }
 // banked resets: a cache with credits, one without, a count above the list
 {

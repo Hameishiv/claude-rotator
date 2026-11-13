@@ -23,14 +23,19 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
   return { pts, empty };
 }
 // A seat's name for a table or list: always its letter, the email under it (muted, smaller) when emails are shown. `esc` escapes HTML.
-// Its in-use badges (CLI / App) sit as small pills right after the letter.
+// Its in-use badges (CLI / App) sit as coloured pills right after the letter.
+const QUOTA_BADGE = { CLI: ['cli', 'Claude Code CLI'], App: ['app', 'Desktop app'] };
+const quotaBadge = (b, seat, esc) => {
+  const [cls, who] = QUOTA_BADGE[b] || ['', b], tip = who + (seat ? ' is on seat ' + seat : ' is on this seat');
+  return '<span class="bdg' + (cls ? ' ' + cls : '') + '" role="img" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">' + esc(seat ? b + ' ' + seat : b) + '</span>';
+};
 function quotaSeat(a, emails, esc) {
-  return esc(a.label) + (a.badges || []).map(b => '<span class="bdg">' + esc(b) + '</span>').join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '');
+  return esc(a.label) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '');
 }
-// A provider header's "CLI on D · App on B", or '' when no seat is known to be in use.
-function quotaInUse(p) {
+// A provider header's badges with their seat letter ("CLI D", "App B") as HTML, or '' when no seat is known to be in use.
+function quotaInUse(p, esc) {
   const u = p.inUse || {};
-  return [['cli', 'CLI'], ['app', 'App']].filter(([k]) => u[k]).map(([k, n]) => n + ' on ' + u[k]).join(' · ');
+  return [['cli', 'CLI'], ['app', 'App']].filter(([k]) => u[k]).map(([k, n]) => quotaBadge(n, u[k], esc)).join('');
 }
 // "17d 23h", "5h 12m", "12m": time left until an expiry.
 function quotaIn(sec) {

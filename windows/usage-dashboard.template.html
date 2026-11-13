@@ -6,9 +6,9 @@
 <meta http-equiv="refresh" content="300">
 <title>Quota Management</title>
 <style>
-:root{color-scheme:dark;--ok:#4ade80;--caution:#facc15;--bad:#f87171;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa}
-@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}}
-:root[data-theme="light"]{color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}
+:root{color-scheme:dark;--ok:#4ade80;--caution:#facc15;--bad:#f87171;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa;--bdg-cli:#60a5fa;--bdg-cli-ink:#0b1220;--bdg-app:#a78bfa;--bdg-app-ink:#120a26}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed;--bdg-cli:#1d4ed8;--bdg-cli-ink:#fff;--bdg-app:#6d28d9;--bdg-app-ink:#fff}}
+:root[data-theme="light"]{color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed;--bdg-cli:#1d4ed8;--bdg-cli-ink:#fff;--bdg-app:#6d28d9;--bdg-app-ink:#fff}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1100px;margin:0 auto;padding:16px}
@@ -82,7 +82,10 @@ td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--b
 .lv-bad .pv{font-weight:600}
 .bar{display:block;height:4px;min-width:72px;margin-top:4px;border-radius:2px;background:var(--grid);overflow:hidden}
 .bar i{display:block;height:100%;background:var(--lvc,var(--muted))}
-.bdg{display:inline-block;margin-left:6px;padding:0 7px;border-radius:999px;background:var(--btn);color:var(--ink2);font-size:11px;font-weight:600;line-height:18px;vertical-align:1px}
+.bdg{display:inline-block;margin-left:8px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em;line-height:18px;vertical-align:1px;white-space:nowrap;background:var(--bdg-cli);color:var(--bdg-cli-ink)}
+.bdg.app{background:var(--bdg-app);color:var(--bdg-app-ink)}
+.ph .bdg{margin-left:0;vertical-align:0}
+.inuse{display:inline-flex;flex-wrap:wrap;gap:6px}
 td small{display:block;color:var(--muted);font-size:12px}
 li small{color:var(--muted);font-size:12px;margin-left:6px}
 td.w{color:var(--warn)}
@@ -268,7 +271,7 @@ function accounts(p) {
 
 function panel(p, W) {
   const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0], bk = quotaBankedTotal(p);
-  let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p) ? `<span class="muted">· ${esc(quotaInUse(p))}</span>` : ''}</div>`;
+  let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p, esc) ? `<span class="inuse">${quotaInUse(p, esc)}</span>` : ''}</div>`;
   h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(l.now)}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
   if (p.note) h += `<p class="note">${esc(p.note)}</p>`;
   if (lim) {
