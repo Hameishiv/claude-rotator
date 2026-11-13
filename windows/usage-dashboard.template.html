@@ -43,6 +43,7 @@ select{background:var(--panel);color:var(--ink);padding:9px 12px}
 .range button{background:var(--panel);padding:8px 14px}
 .range button.i{padding:8px 10px;background:none}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--acc);display:inline-block;flex:none}
+#pcerr{box-sizing:border-box;max-width:1068px;margin:16px auto 0}@media(max-width:1100px){#pcerr{margin:16px 16px 0}}
 .pcerr{margin-top:12px;background:var(--panel);border-radius:12px;border-left:4px solid var(--warn);padding:10px 14px;font-size:14px;color:var(--ink2)}
 .drift{margin-top:12px;background:var(--panel);border-radius:12px;padding:6px 14px;font-size:14px}
 .drift summary{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;list-style:none;color:var(--ink2);padding:4px 0}
@@ -119,6 +120,7 @@ dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
 </style>
 </head>
 <body>
+<div id="pcerr" class="pcerr" role="alert" hidden></div>
 <main id="app"></main>
 <dialog id="rsdlg" aria-labelledby="rsT"></dialog>
 <dialog id="swdlg" aria-labelledby="swT"></dialog>
@@ -181,15 +183,12 @@ const ICON = {
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
 
 // The provider cache cannot be read: say why (the server's message names the file and what to do); the reset buttons are held back meanwhile (resetBtn, openReset, openClear).
-const pcacheBanner = m => `<div class="pcerr" role="alert">${esc(m)}</div>`;
-// An alert is announced when it first appears and when its text changes (a new message is a new node). render() rebuilds the page, and a rebuilt alert would be announced
-// again: the banner's node is kept across renders for as long as its message is the same.
-let pcKept = null;
-const pcacheHold = m => pcKept && m && pcKept.m === m ? pcKept.node : null;          // before the page is rebuilt: the node to put back, if the message is unchanged
-function pcacheSwap(app, m, kept) {                                                    // after: put the kept node in place of the new one, or remember the new one
-  const b = app.querySelector('.pcerr');
-  if (!b) { pcKept = null; return; }
-  if (kept) b.replaceWith(kept); else pcKept = { m, node: b };
+// The banner lives OUTSIDE #app, which render() rebuilds: one alert node (#pcerr) whose text is set only when the message changes. An alert is
+// announced when its content changes, so a new message is read out once and an unchanged one is not read again on every render.
+function pcacheShow(el, m) {
+  m = m || '';
+  if (!el || el.dataset.m === m) return;
+  el.dataset.m = m; el.textContent = m; el.hidden = !m;                              // textContent: the message is never parsed as markup
 }
 function driftRow(d) {
   return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Update available from GitHub (${d.n} file${d.n === 1 ? '' : 's'} differ${d.n === 1 ? 's' : ''})</span>` +
@@ -339,14 +338,13 @@ function render() {
   const nextTheme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme];
   const seg = (a, items, cur, dis) => items.map(([v, l]) => `<button data-a="${a}" data-v="${v}" aria-pressed="${v === cur}"${v === dis ? ' disabled title="Typical is a projection input; it has no line over time"' : ''}>${l}</button>`).join('');
   const show = ps.filter(p => ui.tab === 'all' || p.id === ui.tab);
-  const pcHeld = pcacheHold(D.pcacheError);
   app.innerHTML =
     `<div class="top"><button data-a="reload" aria-label="Reload data" title="Reload data (updated ${esc(fmtDT(D.now))})">${ico('reload')}</button>` +
     `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
     `<div class="row t"><h1>Agent Dashboard</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails">${ico('eye')}${ui.emails ? 'Hide emails' : 'Show emails'}</button>` +
     (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh'}</button>` : '') +
-    `</div></div>` + (D.pcacheError ? pcacheBanner(D.pcacheError) : '') + (D.drift ? driftRow(D.drift) : '') +
+    `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
     `<div class="msg" role="status">${esc(msg)}</div>` +
     `<div class="row tabs" role="group" aria-label="Provider"><button data-a="tab" data-v="all" aria-pressed="${ui.tab === 'all'}">${ico('grid')}All <span class="n">${tot}</span></button>` +
     ps.map(p => `<button data-a="tab" data-v="${esc(p.id)}" aria-pressed="${ui.tab === p.id}" style="--acc:var(--c-${esc(p.id)})"><span class="dot"></span>${esc(p.name)} <span class="n">${p.total}</span></button>`).join('') + `</div>` +
@@ -355,7 +353,7 @@ function render() {
     `<label class="lbl">Future usage <select data-a="mult">${MULTS.map(([v, l]) => `<option value="${v}"${v === ui.mult ? ' selected' : ''}>${l}</option>`).join('')}</select></label>` +
     `<div class="range grow"><span class="muted">${esc(fmtD(d0 / 1000))} to ${esc(fmtD(d1 / 1000 - 43200))}</span><button class="i" data-a="shift" data-v="-7" aria-label="Earlier">${ico('left')}</button><button data-a="today">Today</button><button class="i" data-a="shift" data-v="7" aria-label="Later">${ico('right')}</button></div></div>` +
     (show.length ? show.map(p => panel(p, W)).join('') : '<section class="panel"><p class="muted">No credentials found.</p></section>');
-  pcacheSwap(app, D.pcacheError, pcHeld);
+  pcacheShow(document.getElementById('pcerr'), D.pcacheError);
   for (const el of app.querySelectorAll('.chart')) hover(el);
 }
 

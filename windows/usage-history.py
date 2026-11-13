@@ -785,7 +785,7 @@ def app_login(label, run=run_bounded):
         return "org", None
     if state == "expired":
         return "expired", None
-    if state == "unreadable":           # the helper found a saved login and could not read it: persistent, unlike a timeout
+    if state == "unreadable":           # the helper read the saved login and could not decrypt it: lasting, unlike a timeout or "busy" (files not readable just now)
         return "unreadable", None
     return (None, None) if state == "none" else ("fail", None)      # "none": no login for this seat; anything else: the helper could not tell
 
@@ -810,8 +810,8 @@ def token_seats():
 def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
     """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "scope" (403: the token cannot read credits, a
     setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "pending" (it has an app login but the seat's organization is
-    not recorded yet: nothing is sent), "org" (its app login has no entry for the seat's organization: nothing is sent), "unreadable" (its app login is saved but cannot be read: nothing is sent), "none" (no token), "fail" (the call failed, or the
-    app login could not be read: nothing is held). The seat's full app login is used when it has one (seat_token). The token stays in
+    not recorded yet: nothing is sent), "org" (its app login has no entry for the seat's organization: nothing is sent), "unreadable" (its app login is saved but cannot be decrypted: nothing is sent), "none" (no token), "fail" (the call failed, or the
+    helper gave no usable answer just now: nothing is held). The seat's full app login is used when it has one (seat_token). The token stays in
     this function: never logged, stored or returned."""
     tok, why = seat_token(label, login)
     if why in ("expired", "pending", "org", "unreadable", "fail"):
@@ -4016,7 +4016,7 @@ def selftest():
         ee_ = load_pcache()["credits"]["E"]
         assert ee_["note"] == NOTE_APP_ORG and "hold" not in ee_ and "pend" not in ee_ and ee_["next"] == t2_ + CREDITS_EVERY, ee_
         assert st.credits_read("E", t2_ + 1, bad_, force=True, login=lambda l: ("ok", "t")) == "fail" and "note" not in load_pcache()["credits"]["E"]
-        # an app login the helper could not read ("fail"): nothing is sent, no setup-token fallback, no hold, no scope note, the ordinary interval; a pending/org note is cleared
+        # the helper gave no usable answer ("fail": a timeout, or its "busy"): nothing is sent, no setup-token fallback, no hold, no scope note, the ordinary interval; a pending/org note is cleared
         fail_ = lambda l: ("fail", None)
         assert seat_token("E", fail_) == (None, "fail") and read_credits("E", JN, lambda req: 1 / 0, None, fail_) == ("fail", None)
         res_f_ = consume_reset("E", "full", "g1", "r1", lambda req: 1 / 0, None, fail_)

@@ -187,7 +187,7 @@ def roll_back(plan):
         except OSError:
             bad.append(dest)
     for dest, bak in plan:
-        for junk in (dest + ".tmp-sync", bak and bak + ".part"):   # an added file has no backup (bak None): no "None.part" to remove
+        for junk in (bak and bak + ".part", dest + ".tmp-sync"):   # .part first: the .tmp-sync is the record, so it goes last; an added file has no backup (bak None)
             if junk:
                 with contextlib.suppress(OSError):
                     os.remove(junk)
@@ -205,7 +205,7 @@ def update_finished(j):
 
 
 def roll_back_journal(jpath):
-    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose every
+    """Roll back the journal at `jpath` and delete it (a delete that fails leaves it, with a warning). The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose every
     swap happened (no planned .tmp-sync is left) is only deleted: nothing is restored."""
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away

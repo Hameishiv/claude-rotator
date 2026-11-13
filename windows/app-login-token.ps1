@@ -18,8 +18,10 @@ It never refreshes a token and never writes any file. Output, one line of JSON o
                                                   account (its lastKnownAccountUuid is not the seat's owner: a poisoned snapshot,
                                                   the rule claude-app-seat-keepalive.ps1 applies), or no user:profile entry of that
                                                   account
-  {"state":"unreadable","why":"..."}              a login is saved but could not be read or decrypted (not the same as none: the caller
-                                                  must not treat it as "no login")
+  {"state":"busy","why":"..."}                    the login files could not be read just now (a lock, the app rewriting config.json): a
+                                                  passing failure, not "no login"
+  {"state":"unreadable","why":"..."}              a login is saved and was read but could not be decrypted (not the same as none: the
+                                                  caller must not treat it as "no login")
   app-login-token.ps1 -Seat A [-Org <organization uuid>]
   app-login-token.ps1 -SelfTest                   no real file is read: a throwaway key and login in a temp folder
 #>
@@ -29,9 +31,9 @@ param([string]$Seat, [string]$AppDir = (Join-Path $env:APPDATA 'Claude'), [strin
 $ErrorActionPreference = 'Stop'
 (Get-Process -Id $PID).PriorityClass = 'Idle'
 
-function Get-AppKey([string]$Dir) {
+function Get-AppKey([string]$Dir, $ls = $null) {
   Add-Type -AssemblyName System.Security
-  $ls = Get-Content -LiteralPath (Join-Path $Dir 'Local State') -Raw | ConvertFrom-Json
+  if (-not $ls) { $ls = Get-Content -LiteralPath (Join-Path $Dir 'Local State') -Raw | ConvertFrom-Json }
   $ek = [Convert]::FromBase64String($ls.os_crypt.encrypted_key)
   [Security.Cryptography.ProtectedData]::Unprotect($ek[5..($ek.Length - 1)], $null, 'CurrentUser')     # strip 'DPAPI'
 }
@@ -52,6 +54,8 @@ function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$
   $ownerFile = Join-Path $dir 'owner-uuid.txt'       # which account this seat IS, written at --capture (claude-app-rotator.ps1)
   $owner = if (Test-Path -LiteralPath $ownerFile) { (Get-Content -LiteralPath $ownerFile -Raw).Trim() } else { '' }
   if (-not $owner) { return @{ state = 'none'; why = 'no usable app login: the seat has no owner-uuid.txt' } }
+  # Reading the files can fail for a moment (the app rewriting its config.json, a lock): "busy", which the caller treats as a passing failure.
+  # Only the decryption failing, with the files read, is "unreadable": that does not change until the app signs in again.
   try {
     $cfg = Get-Content -LiteralPath $snap -Raw | ConvertFrom-Json -AsHashtable
     if ($cfg['lastKnownAccountUuid'] -and $cfg['lastKnownAccountUuid'] -ne $owner) { return @{ state = 'none'; why = 'no usable app login: the snapshot is another account' } }
@@ -61,8 +65,11 @@ function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$
       if ($lc['lastKnownAccountUuid'] -eq $owner) { $cfg = $lc }        # the live seat: the app's own, fresher copy
     }
     if (-not $cfg['oauth:tokenCacheV2']) { return @{ state = 'none'; why = 'no app login token in it' } }
-    $cache = Unprotect-Blob (Get-AppKey $AppDir) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
-  } catch { return @{ state = 'unreadable'; why = 'app login unreadable' } }
+    $ls = Get-Content -LiteralPath (Join-Path $AppDir 'Local State') -Raw | ConvertFrom-Json
+  } catch { return @{ state = 'busy'; why = 'app login files could not be read just now' } }
+  try {
+    $cache = Unprotect-Blob (Get-AppKey $AppDir $ls) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
+  } catch { return @{ state = 'unreadable'; why = 'app login could not be decrypted' } }
   $now = if ($NowMs) { $NowMs } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
   # entry keys: acct:<account>|<client>:<organization>:https://api.anthropic.com:<scopes>; only this seat's own account counts
   $prof = @(foreach ($k in $cache.Keys) {
@@ -137,6 +144,8 @@ if ($SelfTest) {
     T "the live seat reads the app's own, fresher config" ($c.state -eq 'ok' -and $c.token -eq 'tC-live' -and $c.orgUuid -eq 'o9')
     T 'no saved login -> none' ((Get-AppLogin 'Z' $app $seats $now).state -eq 'none')
     T 'a path in the seat name is refused' ((Get-AppLogin '..\A' $app $seats $now).state -eq 'none')
+    Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b", half-written'
+    T 'a config.json that cannot be parsed just now -> busy, not unreadable' ((Get-AppLogin 'B' $app $seats $now).state -eq 'busy')
     Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b","oauth:tokenCacheV2":"djEwgarbage"}'
     $before = & $hashes
     T 'an undecryptable login -> unreadable, not none' ((Get-AppLogin 'B' $app $seats $now).state -eq 'unreadable')
