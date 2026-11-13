@@ -1699,8 +1699,9 @@ CODEX_WINDOW_KEYS = ("w", "wr", "wp", "s", "sr", "sp", "ts")    # what a rollout
 
 
 def one_shot(now):
-    """Sample once and save (the run with no --serve). The history is loaded after the slow sample, so a reading the server saved meanwhile is
-    compared too, and the sample's Codex seats keep the newest measurement (newest_codex): a stale cache never undoes a newer logged one."""
+    """Sample once and save (the run with no --serve). The history is loaded after the slow sample, and the sample's Codex seats keep the
+    newest measurement in it (newest_codex). The compare is not made under the history lock, so a record written between this load and
+    the save is not compared; at worst that is one older Codex point, which later samples' newest_codex corrects."""
     rec = sample(now)
     hist = load()
     return save(hist, newest_codex(rec, hist), now)
