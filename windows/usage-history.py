@@ -1554,14 +1554,15 @@ def backfill_claude(real, days, now):
 
 def backfill(days):
     """Rebuild past history (flagged b): Claude from the rotate log, Codex from the session logs. Recorded points are never touched."""
-    with hist_lock():                   # load -> write as one step, so a line the running app appends is never dropped
-        hist = _read_hist()[0]
-        real, now = [h for h in hist if not h.get("b")], time.time()
-        claude = backfill_claude(real, days, now)
+    hist = _read_hist()[0]              # the slow part runs unlocked; the lock covers only re-read -> merge -> write
+    real, now = [h for h in hist if not h.get("b")], time.time()
+    claude = backfill_claude(real, days, now)
+    codex, per = import_rollouts(real, now, True)
+    with hist_lock():
+        hist = _read_hist()[0]          # again: a line the running app appended meanwhile is kept
         if claude is None:                  # keep what an earlier backfill rebuilt
             claude = [h for h in hist if h.get("b") and "s" in h]
-        codex, per = import_rollouts(real, now, True)
-        write_all(sorted(real + claude + codex, key=lambda h: h["t"]))
+        write_all(sorted([h for h in hist if not h.get("b")] + claude + codex, key=lambda h: h["t"]))
     say("backfill: codex %d records, %s" % (len(codex), "; ".join("%s %d events from %s" % (k, n, when(f)) for k, (n, f) in sorted(per.items())) or "no events"))
 
 
@@ -2337,6 +2338,25 @@ def selftest():
             _SIG = hist_sig()
             got = save(mem, {"t": NOW}, NOW)
             assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [NOW - 2 * DAY, NOW - DAY, NOW] == [h["t"] for h in got]
+            # --backfill computes unlocked: a line the app appends meanwhile survives its write; rebuilt (b) lines are replaced,
+            # and Claude's earlier ones are kept when the rotate log gives nothing
+            raw([{"t": 10, "s": {}}, {"t": 11, "b": 1, "s": {}}, {"t": 12, "b": 1, "codex": {}}])
+            g, stub = globals(), {"claude": None, "next": 20}
+            def bc(real, days, now):
+                with open(HIST, "a", encoding="utf-8") as fh:      # the app's sample, mid-computation
+                    fh.write(json.dumps({"t": stub["next"], "s": {}}) + chr(10))
+                stub["next"] += 1
+                return stub["claude"]
+            saved = g["backfill_claude"], g["import_rollouts"], g["say"]
+            g["backfill_claude"], g["import_rollouts"], g["say"] = bc, lambda real, now, rebuilt: ([{"t": 13, "b": 1, "codex": {}}], {}), lambda *a: None
+            try:
+                backfill(7)
+                assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [10, 11, 13, 20]
+                stub["claude"] = [{"t": 14, "b": 1, "s": {}}]
+                backfill(7)
+                assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [10, 13, 14, 20, 21] and not os.path.exists(HIST + ".lock")
+            finally:
+                g["backfill_claude"], g["import_rollouts"], g["say"] = saved
         finally:
             HIST = keep
 
