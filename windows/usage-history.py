@@ -1470,22 +1470,16 @@ def rollout_records(events, taken, rebuilt, hist=()):
 
 def newest_codex(rec, hist, new=()):
     """Each Codex seat in sample `rec` keeps the newest measurement (by its own ts) among this sample's cache reading, the rollout points just read
-    (`new`) and the newest earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
+    (`new`) and every earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
     so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note) is left as it is."""
     cur = rec.get("codex")
     if not isinstance(cur, dict):
         return rec
-    seen = set()
-    for h in list(reversed(new)) + list(reversed(hist)):
+    for h in list(new) + list(hist):        # every record, not the first one met: an older record can hold a newer measurement
         for seat, v in (h.get("codex") or {}).items():
             c = cur.get(seat)
-            if seat in seen or not isinstance(c, dict) or not isinstance(v, dict):
-                continue
-            seen.add(seat)
-            if c.get("ts") and (v.get("ts") or 0) > c["ts"]:
+            if isinstance(c, dict) and isinstance(v, dict) and c.get("ts") and (v.get("ts") or 0) > c["ts"]:
                 cur[seat] = dict(v)
-        if seen >= set(cur):
-            break
     return rec
 
 
@@ -2850,6 +2844,10 @@ def selftest():
         got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, new_)["codex"]
         assert got_["A"] == {"ts": N - 30, "w": 0.7} and got_["B"] == {"ts": N - 10, "w": 0.5} and got_["C"] == rec_["codex"]["C"], got_
         assert newest_codex({"t": 1}, hist_, new_) == {"t": 1}
+        # the maximum over every record: a later record holding an older measurement does not hide an earlier record's newer one
+        got_ = newest_codex({"t": N, "codex": {"A": {"ts": N - 900, "w": 0.1}}}, [{"t": N - 50, "codex": {"A": {"ts": N - 40, "w": 0.9}}},
+                                                                         {"t": N - 10, "codex": {"A": {"ts": N - 500, "w": 0.5}}}])["codex"]
+        assert got_["A"] == {"ts": N - 40, "w": 0.9}, got_
         # the sampler's import: nothing on the first run (sets the watermark), then only files modified since, recorded (not b), merged in time order
         keep, HIST, PCACHE = (HIST, PCACHE), os.path.join(td, "h.jsonl"), os.path.join(td, "p.json")
         try:
