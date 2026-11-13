@@ -16,8 +16,10 @@ It never refreshes a token and never writes any file. Output, one line of JSON o
   {"state":"org","why":"..."}                     with -Org: the account has user:profile entries, but none for that organization
   {"state":"none","why":"..."}                    no usable app login: none saved, no owner-uuid.txt, a snapshot of another
                                                   account (its lastKnownAccountUuid is not the seat's owner: a poisoned snapshot,
-                                                  the rule claude-app-seat-keepalive.ps1 applies), no user:profile entry of that
-                                                  account, or unreadable
+                                                  the rule claude-app-seat-keepalive.ps1 applies), or no user:profile entry of that
+                                                  account
+  {"state":"unreadable","why":"..."}              a login is saved but could not be read or decrypted (not the same as none: the caller
+                                                  must not treat it as "no login")
   app-login-token.ps1 -Seat A [-Org <organization uuid>]
   app-login-token.ps1 -SelfTest                   no real file is read: a throwaway key and login in a temp folder
 #>
@@ -60,7 +62,7 @@ function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$
     }
     if (-not $cfg['oauth:tokenCacheV2']) { return @{ state = 'none'; why = 'no app login token in it' } }
     $cache = Unprotect-Blob (Get-AppKey $AppDir) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
-  } catch { return @{ state = 'none'; why = 'app login unreadable' } }
+  } catch { return @{ state = 'unreadable'; why = 'app login unreadable' } }
   $now = if ($NowMs) { $NowMs } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
   # entry keys: acct:<account>|<client>:<organization>:https://api.anthropic.com:<scopes>; only this seat's own account counts
   $prof = @(foreach ($k in $cache.Keys) {
@@ -137,7 +139,7 @@ if ($SelfTest) {
     T 'a path in the seat name is refused' ((Get-AppLogin '..\A' $app $seats $now).state -eq 'none')
     Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b","oauth:tokenCacheV2":"djEwgarbage"}'
     $before = & $hashes
-    T 'an undecryptable login -> none' ((Get-AppLogin 'B' $app $seats $now).state -eq 'none')
+    T 'an undecryptable login -> unreadable, not none' ((Get-AppLogin 'B' $app $seats $now).state -eq 'unreadable')
     T 'nothing was written' (((& $hashes) -join ',') -eq ($before -join ','))
   } finally { Remove-Item -LiteralPath $td -Recurse -Force -ErrorAction SilentlyContinue }
   if ($fail) { Write-Host "app-login-token selftest: $fail FAILED"; exit 1 }

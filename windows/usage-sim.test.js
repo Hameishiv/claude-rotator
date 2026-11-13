@@ -300,10 +300,19 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const bannerSrc = tpl.slice(tpl.indexOf('const pcacheBanner = '), tpl.indexOf('\nfunction driftRow('));
-  const banner = new Function('esc', bannerSrc + '\nreturn pcacheBanner;')(esc);
+  const { banner, pcacheHold, pcacheSwap } = new Function('esc', bannerSrc + '\nreturn { banner: pcacheBanner, pcacheHold, pcacheSwap };')(esc);
   const html = banner('usage-cache.json <b> cannot be read. Check the seats limits first.');
-  assert.ok(html.includes('role="alert"') && html.includes('usage-cache.json &lt;b> cannot be read. Check the seats limits first.') && !html.includes('<b>'), html);
+  assert.ok(html.includes('role="status"') && !html.includes('role="alert"') && html.includes('usage-cache.json &lt;b> cannot be read. Check the seats limits first.') && !html.includes('<b>'), html);
   assert.ok(tpl.includes("(D.pcacheError ? pcacheBanner(D.pcacheError) : '')"));
+  // the banner node survives a re-render while its message is unchanged (so it is not announced again), and is replaced when the message changes or goes
+  const mkApp = () => { const b = { replaced: null, replaceWith(n) { this.replaced = n; } }; return { b, querySelector: () => b }; };
+  const a1 = mkApp(); assert.strictEqual(pcacheHold('m1'), null); pcacheSwap(a1, 'm1', null);          // first render: its node is remembered
+  const a2 = mkApp(); assert.strictEqual(pcacheHold('m1'), a1.b); pcacheSwap(a2, 'm1', pcacheHold('m1'));
+  assert.strictEqual(a2.b.replaced, a1.b);                                                           // same message: the old node goes back in
+  const a3 = mkApp(); assert.strictEqual(pcacheHold('m2'), null); pcacheSwap(a3, 'm2', null);
+  assert.strictEqual(a3.b.replaced, null);                                                           // changed message: the new node stands
+  const a4 = { querySelector: () => null }; pcacheSwap(a4, '', null);
+  assert.strictEqual(pcacheHold('m2'), null);                                                        // banner gone: nothing is kept
   const btnSrc = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction accounts('));
   const mk = D => new Function('D', 'esc', 'QUOTA_RESET_KINDS', btnSrc + '\nreturn resetBtn;')(D, s => String(s), QUOTA_RESET_KINDS);
   const cl = { id: 'claude', canReset: true }, cx = { id: 'codex', canReset: true };

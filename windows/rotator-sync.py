@@ -14,7 +14,6 @@ Python standard library only. It only ever reads the clone: it never commits, pu
 import argparse
 import contextlib
 import fnmatch
-import hashlib
 import io
 import json
 import os
@@ -191,26 +190,18 @@ def roll_back(plan):
     return done, bad
 
 
-def sha256_file(path):
-    """The sha256 of a file's bytes, or None when it cannot be read."""
-    try:
-        with open(path, "rb") as fh:
-            return hashlib.sha256(fh.read()).hexdigest()
-    except OSError:
-        return None
-
-
 def update_finished(j):
-    """True when the journal's update is already in place: it recorded the sha256 of every file's new content ("new": {dest: hash}) and every planned file has it
-    now. Nothing else is needed to tell: a journal is only left behind when its deletion failed, and a rewrite of it (a "complete" marker) can fail just the same."""
-    plan, new = j.get("files"), j.get("new")
-    return bool(plan) and isinstance(plan, list) and isinstance(new, dict) and all(
-        isinstance(e, list) and e and isinstance(e[0], str) and new.get(e[0]) is not None and sha256_file(e[0]) == new[e[0]] for e in plan)
+    """True when every swap of the journal's pull happened: none of the planned files still has its .tmp-sync (that is also what roll_back counts as swapped).
+    A journal outlives its pull when the delete failed after the pull, or when the pull was killed (before its first swap, or part-way through them)."""
+    plan = j.get("files")
+    if not isinstance(plan, list):
+        return True
+    return not any(isinstance(e, list) and e and isinstance(e[0], str) and os.path.exists(e[0] + ".tmp-sync") for e in plan)
 
 
 def roll_back_journal(jpath):
-    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose update
-    is already in place (every planned file has its recorded new content: only the deletion failed) is deleted and nothing is restored."""
+    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose every
+    swap happened (no planned .tmp-sync is left) is only deleted: nothing is restored."""
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away
     j = load_json(jpath)
@@ -225,7 +216,7 @@ def roll_back_journal(jpath):
 
 def drop_journal(jpath, tries=3, pause=0.2):
     """Delete a pull's journal, trying `tries` times (a Windows handle without share-delete is usually gone a moment later); one that still cannot be deleted is
-    warned about, never an error (an update that is already in place must still report success): the next --check deletes it once it sees the update is in place."""
+    warned about, never an error (an update that is already in place must still report success)."""
     for n in range(tries):
         try:
             os.remove(jpath)
@@ -236,7 +227,8 @@ def drop_journal(jpath, tries=3, pause=0.2):
             err = e
             if n + 1 < tries:
                 time.sleep(pause)
-    sys.stderr.write("rotator-sync: warning: could not delete the update journal %s (%s: %s); delete it by hand, or the next --check will\n" % (jpath, type(err).__name__, err))
+    sys.stderr.write("rotator-sync: warning: could not delete the update journal %s (%s: %s); delete it by hand, or the next --check deletes it, since no swap is left to undo\n"
+                     % (jpath, type(err).__name__, err))
 
 
 def say_recovered(res):
@@ -311,7 +303,12 @@ def pull_locked(repo, live, ref, state, jpath):
     # backup, and any failure puts back every file already swapped (and removes the ones added) before it is reported. Added files go in first,
     # so a new file a changed one imports is there before it; the plan is journaled before the first swap, so a killed pull is rolled back
     # by the next --pull or --check.
-    staged, new_hash = [], {}
+    for dirpath, _, names in os.walk(live):             # a killed run's leftover staged copies; this pull holds the journal's lock, so none belongs to a running one
+        for n in names:
+            if n.endswith(".tmp-sync"):
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(dirpath, n))
+    staged = []
     try:
         for rel in missing + differing:
             dest = os.path.join(live, *rel.split("/"))
@@ -320,15 +317,14 @@ def pull_locked(repo, live, ref, state, jpath):
             with open(dest + ".tmp-sync", "wb") as fh:
                 fh.write(data)
             staged.append((rel, dest))
-            new_hash[dest] = hashlib.sha256(data).hexdigest()
     except BaseException:
-        for _, dest in staged:
+        for rel in missing + differing:                 # the ones staged, and the one that failed half-written
             with contextlib.suppress(OSError):
-                os.remove(dest + ".tmp-sync")
+                os.remove(os.path.join(live, *rel.split("/")) + ".tmp-sync")
         raise
     plan = [(dest, "%s.bak-sync-%s" % (dest, stamp) if rel in differing else None) for rel, dest in staged]
     if plan:
-        write_state(jpath, {"files": plan, "new": new_hash})      # "new": what each file will hold, so a recovery can tell that the update is already in place
+        write_state(jpath, {"files": plan})
     try:
         for dest, bak in plan:
             if bak:
@@ -338,7 +334,7 @@ def pull_locked(repo, live, ref, state, jpath):
         err = None
     except OSError as e:
         err, (_, bad) = e, roll_back(plan)
-    drop_journal(jpath)                                 # a delete that fails is a warning: recovery sees from "new" that the update is in place
+    drop_journal(jpath)                                 # a delete that fails is a warning: with no .tmp-sync left, recovery only deletes the journal
     if err:
         e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
@@ -351,9 +347,10 @@ def pull_locked(repo, live, ref, state, jpath):
         print("rotator-sync: nothing to pull, live already matches the ref")
     if any(rel == SERVER_FILE for rel, _ in staged):
         print("rotator-sync: the usage dashboard's files changed; the page is already the new one, but the running server is still the old code: restart it now so the two match "
-              "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s')" % (DASHBOARD_TASK, DASHBOARD_TASK))
+              "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s'), and reload any open dashboard windows" % (DASHBOARD_TASK, DASHBOARD_TASK))
     elif any(rel in PAGE_FILES for rel, _ in staged):
-        print("rotator-sync: the usage dashboard's page changed; it is already the new one, and no restart is needed")
+        print("rotator-sync: the usage dashboard's page is updated (reload any open dashboard windows); if usage-history.py changed in an earlier pull and the dashboard "
+              "was not restarted since, restart it (Task Scheduler task \"%s\")" % DASHBOARD_TASK)
     if any(rel in PROXY_FILES for rel, _ in staged):
         # the rotate proxy imported rotator_access.py at start; its task relaunches it within a minute once it is stopped
         print("rotator-sync: the rotate proxy's files changed; stop the running proxy (Task Scheduler task \"%s\") and it is "
@@ -555,7 +552,9 @@ def selftest():
               and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
         # a stale journal is rolled back by a --pull itself, under the lock that pull already holds (the lock is not re-entrant)
         write(os.path.join(live, "stale-added.txt"), b"added by a killed pull\n")
-        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None]]})
+        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None], [os.path.join(live, "pending.txt"), None]]})   # the second was never swapped
+        write(os.path.join(live, "pending.txt.tmp-sync"), b"staged by the killed pull\n")
+        write(os.path.join(live, "orphan.txt.tmp-sync"), b"left by a pull killed while staging (no journal names it)\n")
         write(os.path.join(live, "b.py"), before_["b.py"])
         for n in os.listdir(live):
             if ".bak-sync-" in n:
@@ -567,12 +566,14 @@ def selftest():
         check("pull restored the files", compare(repo, live, "HEAD") == ([], []))
         check("a pull rolls back a stale journal first (and does not deadlock on its own lock)",
               not os.path.exists(os.path.join(live, "stale-added.txt")) and not os.path.exists(jp_))
+        check("... and a pull removes the staged copies a killed run left, named by a journal or not",
+              not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
         check("pull backed up what it overwrote", sum(n.startswith("b.py.bak-sync-") for n in names) == 1
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
         check("state reset after pull", load_json(state)["differing"] == [])
         # a pull whose every swap succeeded but whose journal can be neither deleted nor rewritten (os.remove and os.replace on it both fail, as a Windows handle without
-        # share-delete makes them): the delete is retried, then a warning, exit 0, and the next --check sees from the journal's recorded hashes that the update is in place
+        # share-delete makes them): the delete is retried, then a warning, exit 0; the next --check sees that no planned file still has its .tmp-sync (every swap happened)
         write(os.path.join(live, "b.py"), b"a local edit\n")
         real_remove, real_replace2, removes_ = os.remove, os.replace, []
 
@@ -595,22 +596,47 @@ def selftest():
             os.remove, os.replace = real_remove, real_replace2
         check("a journal that cannot be deleted after a successful pull is a warning, not a failure, and the delete was retried",
               rc_j == 0 and "warning: could not delete the update journal" in buf.getvalue() and compare(repo, live, "HEAD") == ([], []) and len(removes_) == 3)
-        check("... and it is left in place with the hash of every new file", os.path.exists(jp_) and load_json(jp_).get("files") and load_json(jp_).get("new")
-              and "complete" not in load_json(jp_))
+        check("... and the warning ends with what happens to the journal", buf.getvalue().rstrip().endswith("the next --check deletes it, since no swap is left to undo")
+              and os.path.exists(jp_) and load_json(jp_).get("files") and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        write(os.path.join(live, "b.py"), b"the user edited this after the pull\n")       # so "is the file still the new content?" is the wrong question
         live_before_ = {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))}
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             recover(state)
-        check("the next --check deletes that journal and restores nothing", not os.path.exists(jp_) and buf.getvalue() == ""
-              and compare(repo, live, "HEAD") == ([], [])
+        check("the next --check deletes that journal, restores nothing and keeps the user's edit", not os.path.exists(jp_) and buf.getvalue() == ""
               and {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))} == live_before_)
-        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None]]})
+        # a planned file still staged means that swap did not happen: rolled back (a journal an older version wrote, which also recorded hashes, is judged the same way)
+        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None], [os.path.join(live, "pending.txt"), None]]})
         write(os.path.join(live, "stale-added.txt"), b"x\n")
+        write(os.path.join(live, "pending.txt.tmp-sync"), b"staged\n")
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             recover(state)
-        check("... while a journal whose files do not hold their recorded new content is still rolled back", not os.path.exists(jp_) and not os.path.exists(os.path.join(live, "stale-added.txt"))
-              and "recovered an interrupted update" in buf.getvalue())
+        check("... while a journal with a planned file still staged is rolled back", not os.path.exists(jp_) and not os.path.exists(os.path.join(live, "stale-added.txt"))
+              and not os.path.exists(os.path.join(live, "pending.txt.tmp-sync")) and "recovered an interrupted update" in buf.getvalue())
+        # a pull killed before its first swap: every planned file is still staged, so none is touched and the temps and journal go
+        write(os.path.join(live, "b.py"), b"print(7)\n")
+        swaps.clear()
+
+        def killing_first(src, dst, *a, **kw):
+            if str(src).endswith(".tmp-sync"):
+                swaps.append(dst)
+                raise KeyboardInterrupt
+            return real_replace(src, dst, *a, **kw)
+        os.replace = killing_first
+        try:
+            cmd_pull(repo, live, "HEAD", state)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.replace = real_replace
+        check("a pull killed before its first swap leaves its journal and its staged copies", os.path.exists(jp_) and len(swaps) == 1
+              and sum(n.endswith(".tmp-sync") for n in os.listdir(live)) >= 1 and open(os.path.join(live, "b.py"), "rb").read() == b"print(7)\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            recover(state)
+        check("... and recovery rolls it back: the live file is untouched, temps and journal gone",
+              not os.path.exists(jp_) and open(os.path.join(live, "b.py"), "rb").read() == b"print(7)\n" and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
         for n in os.listdir(live):
             if ".bak-sync-" in n:
                 os.remove(os.path.join(live, n))
@@ -722,14 +748,15 @@ def selftest():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc_3 = cmd_pull(repo2, live2, "HEAD", st2)
-        check("a pull that replaces only the page says no restart is needed and names no task", rc_3 == 0 and "no restart is needed" in buf.getvalue()
-              and DASHBOARD_TASK not in buf.getvalue() and "restart it now" not in buf.getvalue())
+        check("a pull that replaces only the page says to reload open windows, and to restart only if an earlier pull's usage-history.py was not yet restarted",
+              rc_3 == 0 and "reload any open dashboard windows" in buf.getvalue() and "changed in an earlier pull" in buf.getvalue() and "restart it now" not in buf.getvalue())
         write(os.path.join(live2, "usage-dashboard.template.html"), b"old\n")
         write(os.path.join(live2, "usage-history.py"), b"old\n")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             cmd_pull(repo2, live2, "HEAD", st2)
-        check("... and one that replaces the server file too says to restart", DASHBOARD_TASK in buf.getvalue() and "no restart is needed" not in buf.getvalue())
+        check("... and one that replaces the server file too says to restart, and to reload open windows", "restart it now" in buf.getvalue() and "reload any open dashboard windows" in buf.getvalue()
+              and "changed in an earlier pull" not in buf.getvalue())
         # Idle priority: from Normal, this script lowers itself; the profile's rotator-sync function starts it at Idle and its shell
         # goes back to its own priority afterwards (a copy of the function runs a stand-in script that prints its own class)
         if os.name == "nt":

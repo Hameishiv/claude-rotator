@@ -181,7 +181,15 @@ const ICON = {
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
 
 // The provider cache cannot be read: say why (the server's message names the file and what to do); the reset buttons are held back meanwhile (resetBtn, openReset, openClear).
-const pcacheBanner = m => `<div class="pcerr" role="alert">${esc(m)}</div>`;
+const pcacheBanner = m => `<div class="pcerr" role="status">${esc(m)}</div>`;
+// render() rebuilds the page, and a rebuilt live region can be announced again: the banner's node is kept across renders for as long as its message is the same.
+let pcKept = null;
+const pcacheHold = m => pcKept && m && pcKept.m === m ? pcKept.node : null;          // before the page is rebuilt: the node to put back, if the message is unchanged
+function pcacheSwap(app, m, kept) {                                                    // after: put the kept node in place of the new one, or remember the new one
+  const b = app.querySelector('.pcerr');
+  if (!b) { pcKept = null; return; }
+  if (kept) b.replaceWith(kept); else pcKept = { m, node: b };
+}
 function driftRow(d) {
   return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Update available from GitHub (${d.n} file${d.n === 1 ? '' : 's'} differ${d.n === 1 ? 's' : ''})</span>` +
     `<span class="dl">${d.checked ? `<span>Checked ${esc(ago(d.checked))}</span>` : ''}<b>Details</b></span></summary><div class="dd">` +
@@ -330,6 +338,7 @@ function render() {
   const nextTheme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme];
   const seg = (a, items, cur, dis) => items.map(([v, l]) => `<button data-a="${a}" data-v="${v}" aria-pressed="${v === cur}"${v === dis ? ' disabled title="Typical is a projection input; it has no line over time"' : ''}>${l}</button>`).join('');
   const show = ps.filter(p => ui.tab === 'all' || p.id === ui.tab);
+  const pcHeld = pcacheHold(D.pcacheError);
   app.innerHTML =
     `<div class="top"><button data-a="reload" aria-label="Reload data" title="Reload data (updated ${esc(fmtDT(D.now))})">${ico('reload')}</button>` +
     `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
@@ -345,6 +354,7 @@ function render() {
     `<label class="lbl">Future usage <select data-a="mult">${MULTS.map(([v, l]) => `<option value="${v}"${v === ui.mult ? ' selected' : ''}>${l}</option>`).join('')}</select></label>` +
     `<div class="range grow"><span class="muted">${esc(fmtD(d0 / 1000))} to ${esc(fmtD(d1 / 1000 - 43200))}</span><button class="i" data-a="shift" data-v="-7" aria-label="Earlier">${ico('left')}</button><button data-a="today">Today</button><button class="i" data-a="shift" data-v="7" aria-label="Later">${ico('right')}</button></div></div>` +
     (show.length ? show.map(p => panel(p, W)).join('') : '<section class="panel"><p class="muted">No credentials found.</p></section>');
+  pcacheSwap(app, D.pcacheError, pcHeld);
   for (const el of app.querySelectorAll('.chart')) hover(el);
 }
 
