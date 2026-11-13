@@ -1281,11 +1281,19 @@ def codex_events(cdir, now, since, known):
     return sorted((e for e in own if e[0] >= now - KEEP_DAYS * DAY), key=lambda e: e[0])
 
 
-def rollout_records(events, taken, rebuilt):
+def rollout_records(events, taken, rebuilt, hist=()):
     """History records from attributed events: one per 5 minutes, each carrying every seat seen so far at its newest state;
-    none in a 5-minute bucket listed in `taken` (a recorded point is never overwritten). `rebuilt` flags them b like the Claude backfill."""
-    state, recs = {}, []
+    none in a 5-minute bucket listed in `taken` (a recorded point is never overwritten). `rebuilt` flags them b like the Claude backfill.
+    A seat's state starts from (and is refreshed by) the latest earlier `hist` record when that reading is newer, so a seat idle in the logs
+    stays in records that build_limit reads as the whole pool."""
+    prior = sorted((h for h in hist if isinstance(h.get("codex"), dict)), key=lambda h: h["t"])
+    state, recs, i = {}, [], 0
     for t, seat, wins in events:
+        while i < len(prior) and prior[i]["t"] <= t:
+            for s, v in prior[i]["codex"].items():
+                if isinstance(v, dict) and (v.get("ts") or prior[i]["t"]) > (state.get(s) or {}).get("ts", -1):
+                    state[s] = dict(v, ts=v.get("ts") or prior[i]["t"])
+            i += 1
         st = state.setdefault(seat, {})
         for w, (used, reset, period) in wins.items():
             st[w], st[w + "r"], st[w + "p"] = used, reset, period
@@ -1316,7 +1324,7 @@ def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
     for t, seat, _ in ev:
         n, first = per.get(seat, (0, t))
         per[seat] = (n + 1, min(first, t))
-    return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt), per
+    return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt, hist), per
 
 
 _ROLL = {}      # rollout path -> ((mtime, size), parsed events): a log is parsed again only when it changed
@@ -2474,6 +2482,14 @@ def selftest():
         recs2, _ = import_rollouts(taken, N, False, 0, td)
         assert len(recs2) == len(recs) - 1 and all("b" not in r and r["t"] // 300 != (N - 3600) // 300 for r in recs2)
         assert import_rollouts([], N, False, N - 50, td)[0] == [] and import_rollouts([], N, False, N - 200, td)[1]["B"][0] == 2
+        # after a sampling gap only A is active in the logs: B keeps its last recorded reading (refreshed by a newer record), never vanishes
+        ph = [{"t": N - 1000, "codex": {"A": {"w": 0.1, "ts": N - 1000}, "B": {"w": 0.4, "wr": N + 9, "ts": N - 1000}}},
+              {"t": N + 200, "codex": {"A": {"w": 0.1, "ts": N - 1000}, "B": {"w": 0.5, "wr": N + 9, "ts": N + 200}}}]
+        pr = rollout_records([(N, "A", {"w": (0.2, N + 99, WEEK)}), (N + 400, "A", {"w": (0.3, N + 99, WEEK)})], set(), False, ph)
+        assert [r["t"] for r in pr] == [N, N + 400] and [set(r["codex"]) for r in pr] == [{"A", "B"}] * 2
+        assert [r["codex"]["B"]["w"] for r in pr] == [0.4, 0.5] and [r["codex"]["A"]["w"] for r in pr] == [0.2, 0.3]
+        pz = [r for r in import_rollouts([{"t": N - 3600, "codex": {"Z": {"w": 0.7, "ts": N - 3600}}}], N, False, 0, td)[0] if r["t"] > N - 3600]
+        assert pz and all(r["codex"]["Z"] == {"w": 0.7, "ts": N - 3600} for r in pz)                     # the import passes the history in
         # imported records feed the dashboard: pooled weekly history per seat, and a codex-only newest record does not hide Claude
         hh = sorted([{"t": N - 9000, "s": {"X": {"w": 0.1, "wr": N + 9999}}}] + recs, key=lambda h: h["t"])
         cb = build(hh, N, {}, False, {})
