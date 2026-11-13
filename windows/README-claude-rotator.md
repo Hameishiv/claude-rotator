@@ -378,7 +378,9 @@ errors, so this usually shows up as a pause, not a failure.
   as the proxy does) for the seat the stopping session ran on, found by matching its
   `CLAUDE_CODE_OAUTH_TOKEN` against the seats' `token.txt` (never `.active`, which another session may
   have moved), so the `--now` check takes its refusal path, fallback included. A session without that
-  variable (an app-spawned one) marks nothing (`session_seat`, `mark_refused`; `test-stopfailure-rotate.py`).
+  variable (an app-spawned one) marks nothing, and neither does one going through the rotate proxy
+  (`ANTHROPIC_BASE_URL` at its loopback port): the proxy swaps in the active seat's token, so it records
+  refusals itself (`session_seat`, `via_proxy`, `mark_refused`; `test-stopfailure-rotate.py`).
 - **Rate cap.** The watcher refuses a 4th rotation inside 10 min (`$RotateCapCount`/
   `$RotateCapWindow`), logs `RATE CAP`, and returns 3. Three rotations that fast mean every seat is
   failing.

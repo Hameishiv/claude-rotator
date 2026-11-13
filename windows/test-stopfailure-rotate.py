@@ -115,6 +115,8 @@ def test_refusal_marks_the_sessions_seat():
     sink = os.path.join(root, "fired.txt")
     script = os.path.join(HERE, "stopfailure-rotate.py")
     env = dict(os.environ, CLAUDE_ROTATOR_TEST_SINK=sink, CLAUDE_ROTATOR_TEST_ROOT=root, CLAUDE_CODE_OAUTH_TOKEN="tok-B")
+    env.pop("ANTHROPIC_BASE_URL", None)             # a direct session
+    env.pop("CLAUDE_ROTATE_PROXY_PORT", None)
     keep = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "tok-B"
     try:
@@ -139,6 +141,19 @@ def test_refusal_marks_the_sessions_seat():
     check("the active seat A is not marked", not os.path.exists(os.path.join(root, "A", "access-disabled.json")))
     check("the marker holds no token", "tok-" not in open(mb, encoding="utf-8").read() if os.path.exists(mb) else False)
     check("the token files are untouched", open(os.path.join(root, "B", "token.txt"), encoding="utf-8").read() == "tok-B\n")
+    # through the rotate proxy the inherited token is not the seat that refused (the proxy swaps tokens): the proxy owns attribution
+    os.remove(mb)
+    if os.path.exists(sink):
+        os.remove(sink)
+    env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:18484"
+    run({"error": "oauth_org_not_allowed"})
+    deadline = time.time() + 15
+    while time.time() < deadline and not os.path.exists(sink):
+        time.sleep(0.05)
+    check("a proxied session marks no seat, and the check still runs", not os.path.exists(mb) and os.path.exists(sink))
+    env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+    run({"error": "oauth_org_not_allowed"})
+    check("a direct session with an explicit API URL is still marked", os.path.exists(mb))
 
 
 def test_seat_dirs_not_letters():

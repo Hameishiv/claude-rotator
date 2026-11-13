@@ -13,6 +13,9 @@ On an access refusal it first writes the rotator's refusal marker (<seat>/access
 the file and fields claude-rotate-proxy.py writes) for the seat THIS session ran on: the one whose
 token.txt holds the session's CLAUDE_CODE_OAUTH_TOKEN, never whatever .active says now. The check
 then takes its refusal path for that seat, including the fallback when probes time out.
+A session that goes through the rotate proxy (ANTHROPIC_BASE_URL at its loopback port) is not
+marked here: the proxy swaps in the active seat's token on every request, so the inherited token
+says nothing about which seat refused, and the proxy records refusals itself.
 Always exits 0: a broken backstop must never break a session.
 """
 import json
@@ -20,6 +23,7 @@ import os
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -54,6 +58,16 @@ def session_seat(root=None):
         except OSError:
             continue
     return None
+
+
+def via_proxy():
+    """True when this session talks to the local rotate proxy (ANTHROPIC_BASE_URL at its loopback port): the proxy owns refusal attribution."""
+    try:
+        u = urlsplit((os.environ.get("ANTHROPIC_BASE_URL") or "").strip())
+        port = int(os.environ.get("CLAUDE_ROTATE_PROXY_PORT") or 18484)
+        return (u.hostname or "") in ("127.0.0.1", "localhost", "::1") and u.port == port
+    except ValueError:
+        return False
 
 
 def mark_refused(label, code, root=None):
@@ -145,7 +159,7 @@ def main():
     if not why:
         return
     # A test run (the sink) never marks a real seat: only with its own sandbox root.
-    if why in ACCESS_TOKENS and (os.environ.get("CLAUDE_ROTATOR_TEST_ROOT") or not os.environ.get("CLAUDE_ROTATOR_TEST_SINK")):
+    if why in ACCESS_TOKENS and not via_proxy() and (os.environ.get("CLAUDE_ROTATOR_TEST_ROOT") or not os.environ.get("CLAUDE_ROTATOR_TEST_SINK")):
         try:
             seat = session_seat()
             if seat:
