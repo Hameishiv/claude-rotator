@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaSeat, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaSeat, quotaInUse, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -59,6 +59,11 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaSeat({ label: 'A', email: 'a@x.org' }, true, esc), 'A<small>a@x.org</small>');
   assert.strictEqual(quotaSeat({ label: 'B', email: null }, true, esc), 'B');
   assert.strictEqual(quotaSeat({ label: '<', email: '<e>' }, true, esc), '&lt;<small>&lt;e></small>');
+  assert.strictEqual(quotaSeat({ label: 'D', email: 'd@x.org', badges: ['CLI', 'App'] }, true, esc), 'D<span class="bdg">CLI</span><span class="bdg">App</span><small>d@x.org</small>');
+  assert.strictEqual(quotaSeat({ label: 'D', badges: [] }, true, esc), 'D');
+  assert.strictEqual(quotaInUse({ inUse: { cli: 'D', app: 'B' } }), 'CLI on D · App on B');
+  assert.strictEqual(quotaInUse({ inUse: { app: 'A' } }), 'App on A');
+  assert.strictEqual(quotaInUse({}), '');
 }
 // banked resets: a cache with credits, one without, a count above the list
 {

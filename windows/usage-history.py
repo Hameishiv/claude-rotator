@@ -64,6 +64,7 @@ PROVIDERS = {
     "grok": ("xAI", [("w", "Weekly", WEEK)], [("w", "Weekly credits")]),
     "gemini": ("Gemini", None, None),      # its windows are whatever the language server reports
 }
+BADGE = {"cli": "CLI", "app": "App"}     # which seat is in use: the key under a provider's "inUse" -> the pill on the seat
 PROVIDER_NOTE = {"grok": "Cursor's Grok usage counts against this same xAI quota."}
 
 
@@ -106,6 +107,49 @@ def read_seat(label):
     return {"ts": ts, "s": _f(d.get("s5_util")), "sr": _f(d.get("s5_reset")),
             "w": _f(d.get("w7_util")), "wr": _f(d.get("w7_reset")),
             "f": _f(fab.get("oi7_util")), "fr": _f(fab.get("oi7_reset"))}
+
+
+def _read(path):
+    """A small text file's content, trimmed; '' when it cannot be read."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def app_seat(app_root=None, appdata=None):
+    """The seat the Claude desktop app is on, as Get-AppSeatLabel in claude-cli-account.ps1 finds it: %APPDATA%\\Claude\\config.json's lastKnownAccountUuid
+    matched against <seat>/owner-uuid.txt (or `uuid=<id>` in meta.txt) under ~/.claude-app-seats, else that folder's .active. Read-only; None when unknown."""
+    app_root = app_root or os.path.join(HOME, ".claude-app-seats")
+    appdata = appdata or os.environ.get("APPDATA")
+    uuid = ""
+    if appdata:
+        try:
+            with open(os.path.join(appdata, "Claude", "config.json"), encoding="utf-8-sig") as fh:
+                uuid = str(json.load(fh).get("lastKnownAccountUuid") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+    if uuid:
+        for d in sorted(glob.glob(os.path.join(app_root, "*"))):
+            if os.path.basename(d).startswith(".") or not os.path.isdir(d):
+                continue
+            if _read(os.path.join(d, "owner-uuid.txt")) == uuid or "uuid=" + uuid in _read(os.path.join(d, "meta.txt")):
+                return os.path.basename(d)
+    return _read(os.path.join(app_root, ".active")) or None
+
+
+def in_use(cli_root=None, app_root=None, appdata=None, codex_dir=None):
+    """{provider: {"cli": seat, "app": seat}} for the seats in use right now (a missing one is left out). Claude: the CLI's ~/.claude-cli-accounts/.active
+    and the desktop app's seat. Codex: the desktop app and the CLI share ~/.codex/auth.json, so only "app", the label in ~/.codex/.active-account."""
+    out = {"claude": {}, "codex": {}}
+    cli = _read(os.path.join(cli_root or ROOT, ".active"))
+    app = app_seat(app_root, appdata)
+    cx = _read(os.path.join(codex_dir or os.path.join(HOME, ".codex"), ".active-account"))
+    for prov, k, v in (("claude", "cli", cli), ("claude", "app", app), ("codex", "app", cx)):
+        if v:
+            out[prov][k] = v
+    return out
 
 
 def read_claude():
@@ -631,6 +675,7 @@ def build_provider(hist, pid, emails, now, extra):
         return None
     name, wins, lims = prov_spec(pid, seats)
     accounts = []
+    use = {k: v for k, v in ((extra.get("inUse") or {}).get(pid) or {}).items() if k in BADGE and v in seats}      # only a seat this provider shows
     for label in sorted(seats):
         s = seats[label]
         a = {"label": label, "email": (emails.get(pid) or {}).get(label), "ok": s.get("ok") is not False,
@@ -645,6 +690,7 @@ def build_provider(hist, pid, emails, now, extra):
                 w["assumed"] = True         # the reset passed and nothing has been read since: 0 is rolled forward, not measured
             a["windows"].append(w)
         a["ok"] = a["ok"] and bool(a["windows"])
+        a["badges"] = [BADGE[k] for k, v in use.items() if v == label]
         bs = next((x for x in (seats_of(h, pid).get(label) or {} for h in reversed(hist)) if x.get("banked") is not None), {})   # imported log records carry no credits
         if bs:                              # a credit past its expiry is gone, even if the cache is older than that
             live = [x for x in bs.get("bankedList") or [] if x["expiresAt"] > now]
@@ -654,6 +700,8 @@ def build_provider(hist, pid, emails, now, extra):
     limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
     out = {"id": pid, "name": name, "total": len(accounts), "loaded": sum(a["ok"] for a in accounts),
            "accounts": accounts, "limits": limits}
+    if use:
+        out["inUse"] = use
     if pid == "codex":
         out["canReset"] = bool(extra.get("canReset"))      # the redeem script exists: the page may offer Apply reset
     note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
@@ -765,7 +813,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None}
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use()}
 
 
 def load():
@@ -1717,6 +1765,39 @@ def selftest():
             return fake(argv, **kw)
         raise OSError("gone")
     assert run_reset("A", "/x", 1, once) == ({"outcome": "redeemed", "text": "Reset applied to seat A."}, None)         # the follow-up read failing keeps the result
+
+    # 5: which seat is in use - the desktop app's seat by uuid (owner-uuid.txt, then meta.txt), else its .active; the CLI's .active; Codex's .active-account
+    with tempfile.TemporaryDirectory() as td:
+        ar, cr, ad, cx = (os.path.join(td, n) for n in ("app", "cli", "appdata", "codex"))
+        for d in (os.path.join(ar, "A"), os.path.join(ar, "B"), os.path.join(ar, "C"), os.path.join(ad, "Claude"), cr, cx):
+            os.makedirs(d)
+        open(os.path.join(ar, "A", "owner-uuid.txt"), "w").write("u-1" + os.linesep)
+        open(os.path.join(ar, "B", "meta.txt"), "w").write("name=x" + os.linesep + "uuid=u-2" + os.linesep)
+        open(os.path.join(ar, "C", "owner-uuid.txt"), "w").write("u-3")
+        open(os.path.join(ar, ".active"), "w").write(" C" + os.linesep)
+        os.makedirs(os.path.join(ar, ".hidden"))
+        open(os.path.join(ar, ".hidden", "owner-uuid.txt"), "w").write("u-9")
+        open(os.path.join(cr, ".active"), "w", encoding="utf-8-sig").write("D\n")
+        open(os.path.join(cx, ".active-account"), "w").write("A")
+        def cfg(u):
+            json.dump({"lastKnownAccountUuid": u}, open(os.path.join(ad, "Claude", "config.json"), "w"))
+        cfg("u-1")
+        assert app_seat(ar, ad) == "A"
+        cfg("u-2")
+        assert app_seat(ar, ad) == "B"                                                       # found in meta.txt
+        cfg("u-nope")
+        assert app_seat(ar, ad) == "C"                                                       # unknown uuid: the folder's .active
+        cfg("u-9")
+        assert app_seat(ar, ad) == "C"                                                       # a dot folder is not a seat
+        assert app_seat(ar, os.path.join(td, "none")) == "C" and app_seat(os.path.join(td, "none"), ad) is None
+        cfg("u-2")
+        assert in_use(cr, ar, ad, cx) == {"claude": {"cli": "D", "app": "B"}, "codex": {"app": "A"}}
+        assert in_use(os.path.join(td, "x"), os.path.join(td, "x"), ad, os.path.join(td, "x")) == {"claude": {}, "codex": {}}
+    ub = build([{"t": 5, "s": {"A": {"w": 0.1, "wr": 9, "ts": 5}, "B": {"w": 0.2, "wr": 9, "ts": 5}}, "codex": {"A": {"w": 0.1, "wr": 9, "wp": WEEK, "ts": 5}}}], 6, {}, False,
+               {"inUse": {"claude": {"cli": "B", "app": "B"}, "codex": {"app": "A", "cli": "Z"}}})["providers"]
+    assert [a["badges"] for a in ub[0]["accounts"]] == [[], ["CLI", "App"]] and ub[0]["inUse"] == {"cli": "B", "app": "B"} and [a["badges"] for a in ub[1]["accounts"]] == [["App"]] and ub[1]["inUse"] == {"app": "A"}
+    ub = build([{"t": 5, "s": {"A": {"w": 0.1, "wr": 9, "ts": 5}}}], 6, {}, False, {"inUse": {"claude": {"cli": "Q"}}})["providers"][0]
+    assert ub["accounts"][0]["badges"] == [] and "inUse" not in ub                          # a seat the provider does not list shows nothing
 
     # Host guard
     assert host_ok("127.0.0.1:8787", 8787) and host_ok("localhost:8787", 8787)
