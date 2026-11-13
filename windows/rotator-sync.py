@@ -195,8 +195,11 @@ def recover(state):
         return
     try:
         with state_lock(jpath, wait=0):
+            if not os.path.exists(jpath):
+                return                                  # the pull finished meanwhile and took its journal away
             done, bad = roll_back([tuple(e) for e in load_json(jpath).get("files") or []])
-            os.remove(jpath)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(jpath)
     except TimeoutError:
         return
     sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (done, "; restore by hand: " + ", ".join(bad) if bad else ""))
@@ -245,7 +248,16 @@ def cmd_pull(repo, live, ref, state):
         raise
     plan = [(dest, "%s.bak-sync-%s" % (dest, stamp) if rel in differing else None) for rel, dest in staged]
     jpath = state + ".pull-journal.json"
-    with state_lock(jpath):
+    try:
+        lock = state_lock(jpath)
+        lock.__enter__()
+    except TimeoutError:                                # another pull holds it: this one stops, its staged copies cleaned up
+        for _, dest in staged:
+            with contextlib.suppress(OSError):
+                os.remove(dest + ".tmp-sync")
+        sys.stderr.write("rotator-sync: another update is running; nothing was changed\n")
+        return 1
+    try:
         if plan:
             write_state(jpath, {"files": plan})
         try:
@@ -259,6 +271,8 @@ def cmd_pull(repo, live, ref, state):
             err, (_, bad) = e, roll_back(plan)
         with contextlib.suppress(OSError):
             os.remove(jpath)
+    finally:
+        lock.__exit__(None, None, None)
     if err:
         e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
@@ -425,6 +439,41 @@ def selftest():
         check("the next --check rolls the interrupted update back", not os.path.exists(state + ".pull-journal.json")
               and {n: open(os.path.join(live, n), "rb").read() for n in before_} == before_ and not os.path.exists(os.path.join(live, "missing.txt"))
               and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        # a journal that vanishes as recovery takes the lock (its pull just finished) is no error; a pull that cannot get the journal's lock
+        # (another pull) stops with nothing changed and its staged copies removed
+        real_lock, jp_ = state_lock, state + ".pull-journal.json"
+        write_state(jp_, {"files": []})
+
+        @contextlib.contextmanager
+        def vanishing(path, wait=30):
+            with real_lock(path, wait):
+                with contextlib.suppress(OSError):
+                    os.remove(jp_)
+                yield
+        globals()["state_lock"] = vanishing
+        try:
+            recover(state)
+            ok_ = True
+        except Exception:
+            ok_ = False
+        finally:
+            globals()["state_lock"] = real_lock
+        check("a journal that vanishes under the lock is no error", ok_)
+        write(os.path.join(live, "b.py"), b"print(5)\n")
+        held_, go_ = threading.Event(), threading.Event()
+        th_ = threading.Thread(target=holder_)
+        th_.start()
+        held_.wait(5)
+        globals()["state_lock"] = lambda path, wait=30: real_lock(path, 0.3 if path == jp_ else wait)
+        try:
+            rc_ = cmd_pull(repo, live, "HEAD", state)
+        finally:
+            globals()["state_lock"] = real_lock
+            go_.set()
+            th_.join()
+        check("a pull blocked by another pull changes nothing and leaves no temp", rc_ == 1 and open(os.path.join(live, "b.py"), "rb").read() == b"print(5)\n"
+              and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        write(os.path.join(live, "b.py"), before_["b.py"])
         for n in os.listdir(live):
             if ".bak-sync-" in n:
                 os.remove(os.path.join(live, n))
