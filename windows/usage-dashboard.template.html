@@ -256,7 +256,7 @@ function chart(p, lim, W) {
 }
 
 // A reading over 3 h old is a muted warning (Codex readings go stale between codex-usage runs); over 24 h the stronger one.
-const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 86400 ? ' class="w" title="Reading is over a day old"' : s > 10800 ? ' class="w3" title="Reading is over 3 hours old"' : ''; };
+const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 10800 ? ' class="w" title="Reading is over 3 hours old"' : s > 3600 ? ' class="w3" title="Reading is over an hour old"' : ''; };
 // A reset time more than 6 days away would read like the weekday just gone ("Thu" on a Friday): give it its date.
 const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
 const resetBtn = (p, a) => D.app && p.canReset && a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
