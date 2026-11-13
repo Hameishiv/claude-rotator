@@ -96,9 +96,28 @@ const QUOTA_RESET_KINDS = {
   weekly: { noun: 'weekly reset', win: 'w', refills: 'Refills your weekly limit.' },
   session: { noun: '5-hour reset', win: 's', refills: 'Refills your 5-hour limit.' },
 };
+// The switch buttons (app mode only). A seat's roles come from the server (a.switch: the roles whose rotator can use the seat, minus the one it already
+// holds); the header button only when the provider's rotator is there (p.best). Codex's header button runs the rotator's --rotate, which takes the NEXT
+// saved seat, so it is not called "Best". `busy` disables every one while an action runs.
+const QUOTA_SWITCH = {
+  claude: { cli: ['Use for CLI', 'Switch the Claude CLI to this seat'], app: ['Use for App', 'Switch the Claude desktop app to this seat'],
+    best: ['Best seat', 'Switch the Claude CLI to the seat with the most headroom'] },
+  codex: { both: ['Use for CLI + App', 'Switch Codex (CLI and app, one shared login) to this seat'],
+    best: ['Next seat', 'Switch Codex to the next saved seat in order (it does not rank seats by headroom)'] },
+};
+// Which actions ask first: the ones that close an app. The Claude CLI switch and its Best seat run on one click.
+const quotaSwitchAsks = (pid, role) => pid === 'codex' || role === 'app';
+function quotaSwitchBtn(pid, role, seat, busy, esc) {
+  const b = (QUOTA_SWITCH[pid] || {})[role];
+  if (!b) return '';
+  return '<button class="sw" data-a="sw" data-p="' + esc(pid) + '" data-r="' + esc(role) + '"' + (seat ? ' data-v="' + esc(seat) + '"' : '') +
+    ' title="' + esc(busy ? 'Another action is running' : b[1]) + '"' + (busy ? ' disabled' : '') + '>' + esc(b[0]) + '</button>';
+}
+const quotaSwitchBtns = (p, a, busy, esc) => (a.switch || []).map(r => quotaSwitchBtn(p.id, r, a.label, busy, esc)).join('');
+const quotaBestBtn = (p, busy, esc) => p.best ? quotaSwitchBtn(p.id, 'best', '', busy, esc) : '';
 // Sum of banked resets over a provider's seats, or null when none of them reports any.
 function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS, QUOTA_SWITCH, quotaSwitchAsks, quotaSwitchBtn, quotaSwitchBtns, quotaBestBtn };

@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS } = require('./usage-sim.js');
+const { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS, QUOTA_SWITCH, quotaSwitchAsks, quotaSwitchBtn, quotaSwitchBtns, quotaBestBtn } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -175,5 +175,22 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.strictEqual(quotaLevel('grok', { used: 1 }), 'bad');
   assert.strictEqual(quotaLevel('gemini', { used: 0.9 }), 'warn');
   assert.strictEqual(quotaLevel('gemini', { used: null }), '');
+}
+// switch buttons: the server's roles per seat, the header button only with p.best, one click only for the Claude CLI ones, all disabled while busy
+{
+  const e = s => String(s).replace(/"/g, '&quot;');
+  const cl = { id: 'claude', best: true }, cx = { id: 'codex' };
+  assert.strictEqual(quotaSwitchBtns(cl, { label: 'B', switch: ['cli', 'app'] }, false, e),
+    '<button class="sw" data-a="sw" data-p="claude" data-r="cli" data-v="B" title="Switch the Claude CLI to this seat">Use for CLI</button>' +
+    '<button class="sw" data-a="sw" data-p="claude" data-r="app" data-v="B" title="Switch the Claude desktop app to this seat">Use for App</button>');
+  assert.strictEqual(quotaSwitchBtns(cl, { label: 'B' }, false, e), '');
+  assert.strictEqual(quotaSwitchBtns(cx, { label: 'A', switch: ['both', 'cli'] }, true, e),
+    '<button class="sw" data-a="sw" data-p="codex" data-r="both" data-v="A" title="Another action is running" disabled>Use for CLI + App</button>');   // an unknown role draws nothing
+  assert.strictEqual(quotaBestBtn(cl, false, e), '<button class="sw" data-a="sw" data-p="claude" data-r="best" title="Switch the Claude CLI to the seat with the most headroom">Best seat</button>');
+  assert.strictEqual(quotaBestBtn(cx, false, e), '');
+  assert.ok(quotaBestBtn({ id: 'codex', best: true }, false, e).includes('>Next seat<'));
+  assert.strictEqual(quotaSwitchBtn('grok', 'best', '', false, e), '');
+  assert.deepStrictEqual([['claude', 'cli'], ['claude', 'best'], ['claude', 'app'], ['codex', 'both'], ['codex', 'best']].map(([p, r]) => quotaSwitchAsks(p, r)), [false, false, true, true, true]);
+  assert.deepStrictEqual(Object.keys(QUOTA_SWITCH.claude), ['cli', 'app', 'best']);
 }
 console.log('usage-sim tests passed');

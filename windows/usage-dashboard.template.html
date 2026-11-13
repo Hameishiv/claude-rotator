@@ -100,6 +100,9 @@ td.nt{color:var(--warn);white-space:normal;min-width:220px}
 .empty{margin-top:12px;padding:14px 16px;border-radius:12px;background:var(--bg);color:var(--ink2)}
 .empty p{margin:0}.empty p+p{margin-top:6px}
 .rs{display:block;margin-top:6px;padding:4px 10px;font-size:13px;color:var(--ink)}
+.sw{padding:4px 10px;font-size:13px;color:var(--ink)}
+td .sw{display:block;margin-top:6px}td .sw:first-child{margin-top:0}
+.ph .sw{white-space:nowrap}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--grid);border-radius:16px;padding:20px;width:min(460px,calc(100vw - 32px));font:inherit}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 dialog h2{font-size:19px;margin:0 0 14px;line-height:1.25}
@@ -116,6 +119,7 @@ dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
 <body>
 <main id="app"></main>
 <dialog id="rsdlg" aria-labelledby="rsT"></dialog>
+<dialog id="swdlg" aria-labelledby="swT"></dialog>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <script id="data" type="application/json">__DATA__</script>
 <script>__SIM__</script>
@@ -138,6 +142,8 @@ const ui = {
   lim: (() => { try { return JSON.parse(store.get('lim', '{}')) || {}; } catch (e) { return {}; } })()
 };
 let off = 0, busy = false, msg = '', charts = {};
+let sw = null;   // the switch in progress or awaiting confirmation: {pid, role, seat, busy}
+const swBusy = () => busy || !!(sw && sw.busy);
 const closed = {}; // provider id -> accounts <details> was collapsed by the viewer
 
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -275,7 +281,7 @@ function accounts(p) {
   const wl = {}, ids = [];
   for (const a of p.accounts) for (const w of a.windows) if (!wl[w.id]) { wl[w.id] = w.label; ids.push(w.id); }
   ids.sort((a, b) => 'swfm'.indexOf(a) - 'swfm'.indexOf(b));
-  const anyNote = p.limits.length && p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null;
+  const anyNote = p.limits.length && p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null, anySw = D.app && p.accounts.some(a => (a.switch || []).length);
   const rows = p.accounts.map(a => {
     const cells = ids.map(id => {
       const w = a.windows.find(x => x.id === id);
@@ -283,14 +289,14 @@ function accounts(p) {
       const lv = quotaLevel(p.id, w), pct = w.used == null ? null : Math.round(w.used * 100);
       return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtRS(w.reset))}</small>` : ''}</td>`;
     }).join('');
-    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk"${bkTitle(a)}>${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk"${bkTitle(a)}>${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anySw ? `<td>${quotaSwitchBtns(p, a, swBusy(), esc)}</td>` : ''}${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');
-  return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anySw ? '<th>Switch</th>' : ''}${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
 }
 
 function panel(p, W) {
   const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0], bk = quotaBankedTotal(p);
-  let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p, esc) ? `<span class="inuse">${quotaInUse(p, esc)}</span>` : ''}</div>`;
+  let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p, esc) ? `<span class="inuse">${quotaInUse(p, esc)}</span>` : ''}${D.app ? quotaBestBtn(p, swBusy(), esc) : ''}</div>`;
   h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(sh(l.now, l))}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
   if (p.note) h += `<p class="note">${esc(p.note)}</p>`;
   if (lim) {
@@ -438,7 +444,50 @@ async function doReset() {
   toast(text, outcome); loadData();
 }
 
+// The rotator actions. The Claude CLI ones run on the click; the others ask first (they close an app). The server runs the rotator and answers with its
+// exit code and last line; the data is reloaded so the badges move.
+function usedNow(a) {
+  const u = id => { const w = a.windows.find(x => x.id === id); return w && w.used != null ? Math.round(w.used * 100) + '%' : null; };
+  return [['s', '5 h'], ['w', 'Weekly'], ['f', 'Fable']].map(([id, l]) => u(id) && l + ' ' + u(id)).filter(Boolean).join(' · ') || '–';
+}
+function openSwitch(pid, role, seat) {
+  if (swBusy() || (sw && $('swdlg').open)) return;          // a non-busy leftover from a closed dialog does not block (its close event may still be queued)
+  const p = (D.providers || []).find(x => x.id === pid), a = p && seat && p.accounts.find(x => x.label === seat);
+  if (!p || (seat && !a)) return;
+  sw = { pid, role, seat, busy: false };
+  if (!quotaSwitchAsks(pid, role)) return doSwitch();
+  const seatRow = a ? `<dt>Seat</dt><dd>${esc(seat)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd><dt>Used now</dt><dd>${esc(usedNow(a))}</dd>` : '';
+  const now = p.inUse && p.inUse.app;
+  const [title, warn, go] = pid === 'claude'
+    ? [`Switch the Claude app to seat ${esc(seat)}?`, 'Quitting the Claude app ends the sessions running in it.', 'Quit and switch']
+    : [role === 'best' ? 'Switch Codex (CLI and app) to the next seat?' : `Switch Codex (CLI and app) to seat ${esc(seat)}?`, 'The Codex app will close and reopen.', 'Switch Codex'];
+  const d = $('swdlg');
+  d.innerHTML = `<h2 id="swT">${title}</h2><dl>${seatRow}${role === 'best' && now ? `<dt>Now on</dt><dd>${esc(now)}</dd>` : ''}</dl>` +
+    `<p class="warn">${esc(warn)}</p><div class="dact"><button data-a="swcancel" autofocus>Cancel</button><button class="primary" data-a="swgo">${esc(go)}</button></div>`;
+  d.showModal();
+}
+async function doSwitch() {
+  if (!sw || sw.busy) return;
+  sw.busy = true;
+  const d = $('swdlg'), go = d.open && d.querySelector('[data-a="swgo"]');
+  if (d.open) { for (const b of d.querySelectorAll('button')) b.disabled = true; go.textContent = 'Switching…'; }
+  render();
+  let text = 'Switch failed: could not reach the app.', outcome = 'error';
+  try {
+    const r = await fetch('/api/switch', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(sw.seat ? { provider: sw.pid, role: sw.role, seat: sw.seat } : { provider: sw.pid, role: sw.role }) });
+    const j = await r.json().catch(() => ({}));
+    text = j.text || 'Switch failed (' + r.status + ').'; outcome = j.outcome || 'error';
+  } catch (e) {}
+  sw = null;
+  if (d.open) d.close();
+  toast(text, outcome); loadData();
+}
+
 function act(a, v, el) {
+  if (a === 'sw') return openSwitch(el.dataset.p, el.dataset.r, v);
+  if (a === 'swcancel') { sw = null; return $('swdlg').close(); }
+  if (a === 'swgo') return doSwitch();
   if (a === 'reset') return openReset(el.dataset.p, v, el.dataset.k);
   if (a === 'rscancel') return $('rsdlg').close();
   if (a === 'rsgo') return doReset();
@@ -462,6 +511,9 @@ document.addEventListener('click', e => { const b = e.target.closest('button[dat
 $('rsdlg').addEventListener('cancel', e => { if (rs && rs.busy) e.preventDefault(); });          // Esc must not hide a reset that is in flight
 $('rsdlg').addEventListener('close', () => { if (rs && !rs.busy) rs = null; });
 $('rsdlg').addEventListener('click', e => { if (e.target === e.currentTarget && rs && !rs.busy) e.currentTarget.close(); });     // a click on the backdrop
+$('swdlg').addEventListener('cancel', e => { if (sw && sw.busy) e.preventDefault(); });          // Esc must not hide a switch that is running
+$('swdlg').addEventListener('close', e => { if (sw && !sw.busy && !e.currentTarget.open) sw = null; });
+$('swdlg').addEventListener('click', e => { if (e.target === e.currentTarget && sw && !sw.busy) e.currentTarget.close(); });
 document.addEventListener('change', e => { if (e.target.dataset && e.target.dataset.a === 'mult') act('mult', e.target.value, e.target); });
 document.addEventListener('toggle', e => { const d = e.target; if (d.tagName === 'DETAILS' && d.dataset.p) closed[d.dataset.p] = !d.open; }, true);
 let rt, lastW = innerWidth;
