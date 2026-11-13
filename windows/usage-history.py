@@ -2183,14 +2183,16 @@ class Store:
         finally:
             self.refreshing.release()
 
-    def codex_usage_wait(self, p):
-        """The waiter for a Codex usage command that outlived SWITCH_TIMEOUT: wait for it with no upper bound, sample again so its caches are read,
-        then `refreshing` back, whatever happens."""
+    def codex_usage_wait(self, p, handler=None):
+        """The waiter for a Codex usage command that outlived SWITCH_TIMEOUT: wait for it with no upper bound (and for the refresh `handler` event,
+        so the lock outlives the request's own work too), sample again so its caches are read, then `refreshing` back, whatever happens."""
         try:
             try:
                 p.wait()
             except Exception as e:   # shortcut: whatever happens, the lock must come back
                 applog("refresh: lost track of the Codex usage command: %s" % type(e).__name__)
+            if handler is not None:
+                handler.wait()
             self.take(force=True)
             applog("refresh: Codex usage command finished (exit %s)" % p.returncode)
         except Exception as e:   # shortcut: same broad catch as the handlers
@@ -2314,12 +2316,15 @@ def make_handler(store, port):
                 return self.switch()
             if not store.refreshing.acquire(blocking=False):
                 return self.send(409, "a refresh is already running")
-            handed = False
+            handed, mine = False, threading.Event()
             try:
                 cmd = codex_usage_argv()
                 err, p = run_codex_usage(cmd) if cmd else (None, None)     # first, so this refresh's sample reads its caches
                 if err:
                     applog("refresh: %s" % err)
+                if p is not None:               # never killed: from here its waiter owns the lock, whatever happens below, until it and this request end
+                    handed = True
+                    threading.Thread(target=store.codex_usage_wait, args=(p, mine), daemon=True).start()
                 try:
                     rc = probe_claude()
                 except (OSError, subprocess.SubprocessError) as e:
@@ -2327,15 +2332,14 @@ def make_handler(store, port):
                 blob = store.take(force=True)
                 applog("refresh: claude probe -> %s, codex -> %s, %d providers" % (rc, "still running" if p else err or ("updated" if cmd else "not set up"),
                                                                                   len(blob["providers"])))
-                if p is not None:               # never killed: a waiter keeps the lock until it ends, then samples again
-                    handed = True
-                    threading.Thread(target=store.codex_usage_wait, args=(p,), daemon=True).start()
+                if handed:
                     return self.js(202, dict(blob, refreshNote=CODEX_STILL))
                 self.js(200, blob)
             except Exception as e:   # shortcut: broad catch so one bad request never kills the server thread
                 applog("refresh error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"error": type(e).__name__})
             finally:
+                mine.set()
                 if not handed:
                     store.refreshing.release()
 
@@ -2975,6 +2979,46 @@ def selftest():
         wst.refreshing.acquire()
         wst.codex_usage_wait(p_)
         assert p_.returncode == 0 and took == [True] and not wst.refreshing.locked() and seen_[-1] is None     # waited with no limit, sampled, lock back
+        # /api/refresh with a Codex command still running: even when the request's own sample fails, the lock is held until the command ends
+        gate_ = threading.Event()
+
+        class Slow_:
+            returncode = None
+
+            def wait(self, timeout=None):
+                gate_.wait(10)
+                self.returncode = 0
+        rst = Store.__new__(Store)
+        rst.lock, rst.refreshing, rst.blob = threading.RLock(), threading.Lock(), {}
+        boom_ = []
+
+        def take_(force=False):
+            boom_.append(force)
+            if len(boom_) == 1:
+                raise RuntimeError("sample failed")
+        rst.take = take_
+        keep_r = {k: globals()[k] for k in ("codex_usage_argv", "run_codex_usage", "probe_claude")}
+        rsrv = __import__("http.server").server.ThreadingHTTPServer(("127.0.0.1", 0), __import__("http.server").server.BaseHTTPRequestHandler)
+        rport = rsrv.server_address[1]
+        rsrv.RequestHandlerClass = make_handler(rst, rport)
+        threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+        try:
+            globals().update(codex_usage_argv=lambda cfg=None: ["codex-usage"], run_codex_usage=lambda argv, popen=None: (None, Slow_()), probe_claude=lambda: 0)
+            cn_ = __import__("http.client").client.HTTPConnection("127.0.0.1", rport, timeout=10)
+            cn_.request("POST", "/api/refresh", b"", {"Host": "127.0.0.1:%d" % rport, "X-Quota-App": "1"})
+            st_ = cn_.getresponse().status
+            cn_.close()
+            time.sleep(0.3)
+            assert st_ == 500 and rst.refreshing.locked()                      # the sample failed, the Codex command still runs: the lock stays
+            gate_.set()
+            end_ = time.time() + 5
+            while rst.refreshing.locked() and time.time() < end_:
+                time.sleep(0.02)
+            assert not rst.refreshing.locked() and len(boom_) == 2             # the command ended: the waiter sampled again and gave the lock back
+        finally:
+            globals().update(keep_r)
+            rsrv.shutdown()
+            rsrv.server_close()
         open(cfg, "w").write(json.dumps({"codexRedeemScript": scr}))
         assert redeem_script(cfg) == scr
         open(cfg, "w").write(json.dumps({"codexRedeemScript": os.path.join(td, "missing.py")}))
