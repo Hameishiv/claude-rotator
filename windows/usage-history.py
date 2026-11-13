@@ -2428,7 +2428,7 @@ def selftest():
     def raising(argv, **kw):
         raise OSError("nope")
     assert claude_version(JN + 3 * CREDITS_EVERY, raising, lambda n: "c") == CLI_FALLBACK and claude_version(JN + 6 * CREDITS_EVERY, ok_run, lambda n: None) == CLI_FALLBACK
-    _ver[:] = [0, ""]
+    _ver[:] = [JN + 99 * CREDITS_EVERY, "2.1.400"]                                        # pinned: the schedule below must not run the real `claude --version`
     # the schedule, against a temp seat root and provider cache
     keep_root, keep_pc, jd = ROOT, PCACHE, tempfile.mkdtemp()
     try:
@@ -2486,6 +2486,7 @@ def selftest():
         assert "banked" not in build([{"t": JN, "s": {"A": {"w": 0.1, "wr": JN + 9, "ts": JN}}}], JN, {}, False, {})["providers"][0]["accounts"][0]
     finally:
         globals()["ROOT"], globals()["PCACHE"] = keep_root, keep_pc
+        _ver[:] = [0, ""]
         __import__("shutil").rmtree(jd, ignore_errors=True)
     # icons: a valid PNG signature and an ICO header
     assert png(16)[:8] == b"\x89PNG\r\n\x1a\n" and ico(png(16))[:6] == b"\0\0\1\0\1\0"

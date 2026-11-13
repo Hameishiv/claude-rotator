@@ -725,6 +725,14 @@ the last 21 days; the older and the newer half of them (by time), each measured 
 more than 30 % away from the current weight; then rounded (`nice_weight`) to the nearest 0.5 below 3, to a whole number from 3 up, and no suggestion if that
 is the weight the seat already has. The suggestion's line and the copied fragment are `quotaSuggest` and `quotaFragment` in `usage-sim.js` (`usage-sim.test.js`).
 
+**Banked resets (Claude).** The Claude table's `Banked resets` column shows the reset credits each seat holds: a count, then one muted line per credit
+(`Fable reset · expires <date> (in N d)`), and the header chip adds them up. They come from Claude Code's own usage call
+(`GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1` with the seat's `token.txt`), which is **undocumented** and **rate-limited**, so the
+dashboard's sampler (`Store.credits_tick` and `Store.credits_read` in `usage-history.py`, parsed by `parse_cedar`, selftest block J) reads one seat per
+5-minute tick and each seat at most once every **6 hours**; a 429 or a sign-in error holds that seat for 6 hours, any other failure keeps the last good reading.
+This read changes nothing. The token is sent only in that request's header and is never logged or stored. A seat that was read and holds no credits shows an
+empty cell, one never read `–`; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off.
+
 ## Keeping the install in sync (`rotator-sync`)
 
 The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:
