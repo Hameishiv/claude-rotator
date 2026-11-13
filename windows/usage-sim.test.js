@@ -256,4 +256,14 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Resend the pending full reset to seat A?') && dlg.innerHTML.includes('>Resend full reset</button>')
     && dlg.innerHTML.includes('cannot use a second reset') && !dlg.innerHTML.includes("can't be undone"), dlg.innerHTML);
 }
+// the update notice speaks to an end user: what is out of date and the one command that fixes it; no --push
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const src = tpl.slice(tpl.indexOf('function driftRow(d) {'), tpl.indexOf('\nfunction applyTheme('));
+  const driftRow = new Function('closed', 'ico', 'esc', 'ago', src + '\nreturn driftRow;')({}, () => '', s => String(s), String);
+  const two = driftRow({ n: 2, names: ['a.ps1', 'b.py'], checked: 5 });
+  assert.ok(two.includes('Update available from GitHub (2 files differ)') && two.includes('<code>rotator-sync --pull</code>') && two.includes('<li>a.ps1</li>'), two);
+  assert.ok(driftRow({ n: 1, names: ['a.ps1'] }).includes('(1 file differs)'));
+  assert.ok(!/--push|--check/.test(tpl.slice(tpl.indexOf('function driftRow(d) {'), tpl.indexOf('\nfunction applyTheme('))));
+}
 console.log('usage-sim tests passed');

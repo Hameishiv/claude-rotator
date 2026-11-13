@@ -180,11 +180,11 @@ const ICON = {
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
 
 function driftRow(d) {
-  return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Rotator files out of sync with GitHub (${d.n})</span>` +
+  return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Update available from GitHub (${d.n} file${d.n === 1 ? '' : 's'} differ${d.n === 1 ? 's' : ''})</span>` +
     `<span class="dl">${d.checked ? `<span>Checked ${esc(ago(d.checked))}</span>` : ''}<b>Details</b></span></summary><div class="dd">` +
-    `<p>The rotator scripts running on this PC differ from the published repo. Until they match, a fix made in one place is missing from the other.</p>` +
+    `<p>The rotator files on this PC differ from the latest version on GitHub:</p>` +
     `<ul>${d.names.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` +
-    `<p>Run <code>rotator-sync --check</code> to see the differences; <code>rotator-sync --pull</code> takes the repo's version, <code>rotator-sync --push &lt;branch&gt;</code> sends yours.</p></div></details>`;
+    `<p>To update, open a terminal in the rotator folder and run <code>rotator-sync --pull</code>. It downloads the new versions and keeps a backup of every file it replaces (<code>&lt;name&gt;.bak-sync-&lt;date&gt;</code>). Your own settings (<code>rotator.local.json</code>) are never touched.</p></div></details>`;
 }
 
 function applyTheme() {

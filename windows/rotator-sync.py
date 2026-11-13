@@ -3,14 +3,12 @@
 
   --check [--quiet]   compare every file under windows/ at the ref with the live folder
   --pull              copy differing / missing files from the ref into the live folder (backs up first)
-  --push <branch>     commit the live files changed since the commit --pull installed, onto a new worktree of the
-                      freshly fetched ref; refuses (and names the files) when the ref also changed one of them
   --selftest          run the built-in checks
 
 Config (rotator.local.json next to this script, all keys optional):
   repoClone  path of a local clone of the repo        (or pass --repo)
   liveDir    folder the rotator runs from             (default: the folder this script is in)
-Python standard library only. Never pushes and never opens a PR.
+Python standard library only. It only ever reads the clone: it never commits, pushes or opens a PR.
 """
 import argparse
 import contextlib
@@ -154,7 +152,7 @@ def update_state(state, change):
 
 
 def resolve(repo, ref):
-    """The commit `ref` names now. Pull and push resolve it once, after fetching, so a fetch running meanwhile cannot move what they compare and write."""
+    """The commit `ref` names now. --pull resolves it once, after fetching, so a fetch running meanwhile cannot move what it compares and writes."""
     return git(repo, "rev-parse", "--verify", ref + "^{commit}").stdout.decode().strip()
 
 
@@ -201,61 +199,6 @@ def cmd_pull(repo, live, ref, state):
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
     record(repo, live, ref, state, at)
-    update_state(state, lambda st: st.__setitem__("installed", at))        # --push exports changes relative to this
-    return 0
-
-
-def match_style(live_bytes, repo_bytes_):
-    """Give the live bytes the repo file's line endings and BOM, so a push diff shows only the real change."""
-    body = live_bytes[len(BOM):] if live_bytes.startswith(BOM) else live_bytes
-    body = body.replace(b"\r\n", b"\n")
-    if b"\r\n" in repo_bytes_:
-        body = body.replace(b"\n", b"\r\n")
-    return (BOM if repo_bytes_.startswith(BOM) else b"") + body
-
-
-def cmd_push(repo, live, ref, state, branch, worktree):
-    """Export only what was changed live since the installed commit, onto the freshly fetched ref, so a hotfix to one
-    file never carries a rollback of the ref's newer change to another."""
-    base = load_json(state).get("installed")
-    if not base or git(repo, "cat-file", "-e", base + "^{commit}", check=False).returncode:
-        sys.stderr.write("rotator-sync: no installed commit recorded (or it is not in the clone): run --pull first\n")
-        return 2
-    maybe_fetch(repo, ref, state, force=True)
-    at = resolve(repo, ref)
-    changed, clash = [], []
-    for rel in sorted(repo_files(repo, base)):
-        path = os.path.join(live, *rel.split("/"))
-        if not os.path.isfile(path):
-            continue        # shortcut: a file deleted live is not exported; delete it in the repo by hand
-        with open(path, "rb") as fh:
-            if norm(fh.read()) == norm(repo_bytes(repo, base, rel)):
-                continue
-        changed.append(rel)
-        up = git(repo, "show", "%s:%s%s" % (at, PREFIX, rel), check=False)
-        if up.returncode or norm(up.stdout) != norm(repo_bytes(repo, base, rel)):
-            clash.append(rel)
-    if not changed:
-        print("rotator-sync: no live file changed since the installed commit %s, nothing to push" % base[:9])
-        return 0
-    if clash:
-        sys.stderr.write("rotator-sync: refusing to push: %s also changed since the installed commit %s:\n" % ("%s (%s)" % (ref, at[:9]), base[:9]))
-        for rel in clash:
-            sys.stderr.write("  both changed: %s\n" % rel)
-        return 1
-    if not worktree:
-        root = r"C:\Dev\Temp" if os.path.isdir(r"C:\Dev\Temp") else tempfile.gettempdir()
-        worktree = os.path.join(root, "wt-rotator-push-" + branch.replace("/", "-"))
-    git(repo, "worktree", "add", "-b", branch, worktree, at)
-    for rel in changed:
-        with open(os.path.join(live, *rel.split("/")), "rb") as fh:
-            data = match_style(fh.read(), repo_bytes(repo, at, rel))
-        with open(os.path.join(worktree, "windows", *rel.split("/")), "wb") as fh:
-            fh.write(data)
-    git(worktree, "add", "--", *["windows/" + r for r in changed])
-    git(worktree, "commit", "-q", "-m", "Sync live changes: " + ", ".join(changed))
-    print("committed %d file(s) on branch %s: %s" % (len(changed), branch, ", ".join(changed)))
-    print("worktree: " + worktree)
     return 0
 
 
@@ -316,11 +259,7 @@ def selftest():
         os.remove(os.path.join(live, "fixtures", "f.json"))
         check("missing-live inside a subfolder", compare(repo, live, "HEAD") == (["b.py"], ["fixtures/f.json"]))
 
-        # --push needs the commit --pull installed: without one it refuses and creates nothing
         write(os.path.join(live, "a.ps1"), b"one\nTWO\n")
-        wt = os.path.join(root, "wt-push")
-        check("push before any pull is refused", cmd_push(repo, live, "HEAD", state, "hotfix", wt) == 2 and not os.path.exists(wt))
-
         # --pull gets the repo bytes before it touches a live file: a git failure leaves the live script whole
         real_rb, seen = repo_bytes, []
 
@@ -349,30 +288,9 @@ def selftest():
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
         check("state reset after pull", load_json(state)["differing"] == [])
-        check("pull recorded the installed commit", load_json(state).get("installed") == git(repo, "rev-parse", "HEAD").stdout.decode().strip())
 
-        # --push exports only what changed live since the installed commit, onto the ref as it is now
-        write(os.path.join(repo, "windows", "a.ps1"), b"one\r\nthree\r\n")      # upstream changes a.ps1 after the install
-        git(repo, "add", "--", "windows/a.ps1")
-        git(repo, "commit", "-q", "-m", "upstream")
-        write(os.path.join(live, "b.py"), b"print(3)\n")                         # live hotfixes, LF
-        write(os.path.join(live, "c.ps1"), b"y\n")
-        write(os.path.join(live, "a.ps1"), b"one\nlocal\n")
-        check("a file changed both live and upstream is refused", cmd_push(repo, live, "HEAD", state, "clash", wt) == 1 and not os.path.exists(wt)
-              and git(repo, "show-ref", "--verify", "--quiet", "refs/heads/clash", check=False).returncode != 0)
-        write(os.path.join(live, "a.ps1"), b"one\r\ntwo\r\n")                    # back to what was installed
-        before = git(repo, "rev-parse", "HEAD").stdout
-        check("push exit 0", cmd_push(repo, live, "HEAD", state, "hotfix", wt) == 0)
-        check("push leaves the clone's HEAD alone", git(repo, "rev-parse", "HEAD").stdout == before)
-        check("push committed only the live changes, on the new branch", git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == b"hotfix"
-              and git(wt, "show", "--name-only", "--format=", "HEAD").stdout.split() == [b"windows/b.py", b"windows/c.ps1"])
-        with open(os.path.join(wt, "windows", "a.ps1"), "rb") as fh:
-            check("upstream's newer a.ps1 is not rolled back", fh.read() == b"one\r\nthree\r\n")
-        with open(os.path.join(wt, "windows", "c.ps1"), "rb") as fh:
-            check("pushed CRLF file kept its CRLF", fh.read() == b"y\r\n")
-        git(repo, "worktree", "remove", "--" + "force", wt)
-
-        # the ref is resolved once per operation: a fetch moving it mid-pull or mid-push changes neither what --pull records nor the push's base
+        # the ref is resolved once: a fetch moving it mid-pull does not change what --pull installs
+        write(os.path.join(live, "b.py"), b"print(3)\n")
         real_git, real_compare, real_rb, moved = git, compare, repo_bytes, []
 
         def move(rel, data):        # another process's fetch lands a new upstream commit
@@ -388,56 +306,39 @@ def selftest():
 
         def racing_rb(*a):
             globals()["repo_bytes"] = real_rb
-            move("missing.txt", b"moved\n")
+            move("b.py", b"print(9)\n")             # a file this pull is replacing
             return real_rb(*a)
 
-        def racing_git(repo_, *args, **kw):
-            if args[:2] == ("worktree", "add"):
-                move("a.ps1", b"one\r\nupstream two\r\n")
-            return real_git(repo_, *args, **kw)
         before = git(repo, "rev-parse", "HEAD").stdout.decode().strip()
         globals()["compare"] = racing_compare
         try:
             cmd_pull(repo, live, "HEAD", state)
         finally:
             globals().update(compare=real_compare, repo_bytes=real_rb)
-        check("a fetch mid-pull: the commit it installed is recorded", len(moved) == 1 and load_json(state)["installed"] == before
-              and compare(repo, live, before) == ([], []))
-        write(os.path.join(live, "a.ps1"), b"one\nhot\n")
-        globals()["git"] = racing_git
-        try:
-            check("push exit 0", cmd_push(repo, live, "HEAD", state, "hotfix2", wt) == 0)
-        finally:
-            globals()["git"] = real_git
-        check("a fetch mid-push: the branch is built on the commit it checked", len(moved) == 2
-              and git(wt, "rev-parse", "HEAD~1").stdout.decode().strip() == moved[0])
-        git(repo, "worktree", "remove", "--" + "force", wt)
-
-        # state updates are locked read-modify-writes through a temp file of their own: a --check overlapping a --pull keeps its `installed`
+        check("a fetch mid-pull: live is exactly the commit it resolved", len(moved) == 1 and compare(repo, live, before) == ([], []))
+        # state updates are locked read-modify-writes through a temp file of their own: an overlapping --check keeps what another run wrote
         os.mkdir(state + ".tmp")                     # the old shared temp name, taken: a write must not depend on it
         check("state written past a taken .tmp name", cmd_check(repo, live, "HEAD", state, True) in (0, 1) and load_json(state)["checked"] > 0)
         import threading
-        held, inst = threading.Event(), load_json(state)["installed"]
+        held = threading.Event()
 
-        def pull_side():                             # --pull: reads the state under the lock, then writes `installed` a moment later
+        def fetch_side():                            # another run: reads the state under the lock, then writes `fetched` a moment later
             with state_lock(state):
                 st_ = load_json(state)
                 held.set()
                 time.sleep(0.4)
-                st_["installed"] = "f" * 40
+                st_["fetched"] = 12345
                 write_state(state, st_)
         st0 = load_json(state)
         st0.update(checked=0, ref="old")
         write_state(state, st0)
-        th = threading.Thread(target=pull_side)
+        th = threading.Thread(target=fetch_side)
         th.start()
         held.wait(5)
         record(repo, live, "HEAD", state)            # the dashboard's --check meanwhile
         th.join()
         st = load_json(state)
-        check("an overlapping --check neither loses `installed` nor its own result", st["installed"] == "f" * 40 and st["checked"] > 0 and st["ref"].startswith("HEAD "))
-        st["installed"] = inst
-        write_state(state, st)
+        check("an overlapping --check neither loses the other run's write nor its own result", st["fetched"] == 12345 and st["checked"] > 0 and st["ref"].startswith("HEAD "))
     finally:
         rmtree(root)
     print("rotator-sync selftest: all passed")
@@ -449,13 +350,11 @@ def main(argv=None):
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--check", action="store_true")
     g.add_argument("--pull", action="store_true")
-    g.add_argument("--push", metavar="BRANCH")
     g.add_argument("--selftest", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="with --check: print nothing")
     ap.add_argument("--repo", help="local clone of the repo (default: repoClone in rotator.local.json)")
     ap.add_argument("--live", help="the rotator folder (default: liveDir in rotator.local.json, else this script's folder)")
     ap.add_argument("--ref", default="origin/main")
-    ap.add_argument("--worktree", help="with --push: where to create the worktree")
     ap.add_argument("--state", default=DEFAULT_STATE, help="drift state file")
     a = ap.parse_args(argv)
     if a.selftest:
@@ -467,9 +366,7 @@ def main(argv=None):
     live = a.live or cfg.get("liveDir") or HERE
     if a.check:
         return cmd_check(repo, live, a.ref, a.state, a.quiet)
-    if a.pull:
-        return cmd_pull(repo, live, a.ref, a.state)
-    return cmd_push(repo, live, a.ref, a.state, a.push, a.worktree)
+    return cmd_pull(repo, live, a.ref, a.state)
 
 
 if __name__ == "__main__":
