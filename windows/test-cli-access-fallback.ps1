@@ -3,6 +3,9 @@ test-cli-access-fallback.ps1 — mocked regression tests for subscription-disabl
 
 No live API calls. Seat letters are not reserved: A is eligible unless the desktop app's
 current identity is A, or A's own probe was an explicit 403. .inactive is not a candidate.
+No real machine state either: Set-UserEnvFast (HKCU:\Environment + the WM_SETTINGCHANGE broadcast)
+and Ping-ActiveSessions (prompt injection into running sessions) are mocked, the run aborts before
+any rotation if either mock is not the live definition, and the process environment is restored.
 
   pwsh -NoProfile -File windows/test-cli-access-fallback.ps1
 #>
@@ -13,8 +16,13 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
   else { $script:fail++; Write-Host "  FAIL  $name  $detail" -ForegroundColor Red }
 }
 
+$envKeep = @{}
+foreach ($n in 'USERPROFILE','APPDATA','CLAUDE_ROTATOR_SELFTEST','CLAUDE_ROTATOR_SKIP_APP_SYNC','CLAUDE_CODE_OAUTH_TOKEN') {
+  $envKeep[$n] = [Environment]::GetEnvironmentVariable($n, 'Process')
+}
 $root = Join-Path ([IO.Path]::GetTempPath()) ("cli-access-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root -Force | Out-Null
+try {
 $env:USERPROFILE = $root
 $env:APPDATA = Join-Path $root 'AppData'
 $env:CLAUDE_ROTATOR_SELFTEST = '1'
@@ -53,6 +61,19 @@ $global:ClaudeRotatorProbeOverride = {
 }
 
 . (Join-Path $PSScriptRoot 'claude-cli-account.ps1')
+
+# The rotation under test would write fake tokens into HKCU:\Environment, broadcast them, and type a
+# continuation prompt into running sessions. These two replace the functions that do it.
+$script:envWrites = @(); $script:pings = @()
+function Set-UserEnvFast { param([string]$Name, [string]$Value) <# MOCK-NO-MACHINE-STATE #> $script:envWrites += ,@($Name, $Value) }
+function Ping-ActiveSessions { param([string]$Message) <# MOCK-NO-MACHINE-STATE #> $script:pings += $Message }
+foreach ($fn in 'Set-UserEnvFast','Ping-ActiveSessions') {
+  if ((Get-Command $fn -CommandType Function).Definition -notmatch 'MOCK-NO-MACHINE-STATE') {
+    Write-Host "ABORT: $fn is not the mock; refusing to run rotations that would touch HKCU or running sessions" -ForegroundColor Red
+    exit 2
+  }
+}
+$hkcuBefore = (Get-ItemProperty -Path 'HKCU:\Environment' -Name $EnvName -ErrorAction SilentlyContinue).$EnvName
 
 function Reset-Case {
   $script:probes = @{}
@@ -238,7 +259,15 @@ $py = (Get-Content (Join-Path $PSScriptRoot 'claude-rotate-proxy.py') -Raw) + (G
 Check 'rotator has no hardcoded app-only seat' ($src -notmatch 'AppOnly|reserved app-only')
 Check 'proxy and hook do not exclude label A' ($py -notmatch '== ["'']A["'']|label == "A"')
 
-Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+# --- the mocks took every machine-wide effect: the rotations above wrote nothing to HKCU and pinged no real session ---
+Check 'rotations persisted the token through the mock only' (@($script:envWrites | Where-Object { $_[0] -eq $EnvName }).Count -ge 1) ("writes=$($script:envWrites.Count)")
+Check 'access rotation pinged sessions through the mock only' ($script:pings.Count -ge 1) ("pings=$($script:pings.Count)")
+$hkcuAfter = (Get-ItemProperty -Path 'HKCU:\Environment' -Name $EnvName -ErrorAction SilentlyContinue).$EnvName
+Check 'HKCU:\Environment is untouched' ($hkcuAfter -eq $hkcuBefore)
+} finally {
+  foreach ($n in $envKeep.Keys) { [Environment]::SetEnvironmentVariable($n, $envKeep[$n], 'Process') }
+  Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+}
 if ($fail) { Write-Host "`n$fail FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "`nALL PASSED" -ForegroundColor Green
 exit 0
