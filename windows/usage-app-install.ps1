@@ -1,5 +1,5 @@
 <#
-  Installs the local Quota Management app: a logon task that runs `usage-history.py --serve` (no console window,
+  Installs the local Agent Dashboard app: a logon task that runs `usage-history.py --serve` (no console window,
   via pythonw.exe) and a Start-menu shortcut that opens it as a standalone app window.
     usage-app-install.ps1              install / reinstall
     usage-app-install.ps1 -Uninstall   remove the task and the shortcut
@@ -13,8 +13,9 @@ $dir = $PSScriptRoot
 $script = Join-Path $dir 'usage-history.py'
 $taskName = 'Claude usage dashboard'
 $oldTask = 'Claude usage history'
-$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Quota Management.lnk'
-$oldLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Quota.lnk'
+$menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+$lnk = Join-Path $menu 'Agent Dashboard.lnk'
+$oldLnks = @((Join-Path $menu 'Quota Management.lnk'), (Join-Path $menu 'Quota.lnk'))     # the app's earlier names
 $url = "http://127.0.0.1:$Port/"
 
 function Remove-Task($name) {
@@ -26,8 +27,8 @@ function Remove-Task($name) {
 
 if ($Uninstall) {
     Remove-Task $taskName
-    foreach ($l in $lnk, $oldLnk) { if (Test-Path $l) { Remove-Item $l } }
-    Write-Host 'Quota Management app removed.'
+    foreach ($l in @($lnk) + $oldLnks) { if (Test-Path $l) { Remove-Item $l } }
+    Write-Host 'Agent Dashboard app removed.'
     return
 }
 
@@ -40,7 +41,7 @@ if ($LASTEXITCODE) { throw 'icon generation failed' }
 
 Remove-Task $oldTask
 Remove-Task $taskName
-if (Test-Path $oldLnk) { Remove-Item $oldLnk }
+foreach ($l in $oldLnks) { if (Test-Path $l) { Remove-Item $l } }
 
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$script`" --serve --port $Port" -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
@@ -68,4 +69,4 @@ $sh.Arguments = "--app=$url"
 $sh.IconLocation = Join-Path $state 'usage-app\icon.ico'
 $sh.Save()
 
-Write-Host 'Open Start, type Quota Management, right-click it, Pin to taskbar.'
+Write-Host 'Open Start, type Agent Dashboard, right-click it, Pin to taskbar.'

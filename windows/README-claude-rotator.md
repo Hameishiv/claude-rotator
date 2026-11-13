@@ -681,9 +681,12 @@ adds `/seats` (runs `claude-cli-account.ps1 --status`). A `command.run` hook ans
 no model turn; the status run itself is the usual live read (~5s, tiny probes). Built 2026-11-01,
 tested headless with `claude -p --plugin-dir <mod folder> "/seats"`. Needs Claude Code 2.1.287+.
 
-## Usage dashboard (`usage-history.py`)
+## Agent Dashboard (`usage-history.py`)
 
-The `Claude usage history` scheduled task runs `usage-history.py` every 5 minutes. It reads each
+The Agent Dashboard is a local app. `usage-app-install.ps1` registers the logon task `Claude usage dashboard`,
+which runs `usage-history.py --serve` on `127.0.0.1:8787` at Idle CPU priority, and adds the Start-menu shortcut
+`Agent Dashboard` that opens the page as an app window (install and `-Uninstall` also remove the shortcuts of the
+app's earlier names, `Quota Management` and `Quota`). Every 5 minutes it reads each
 seat's `usage-cache[-fable].json` (it never probes), appends a line to
 `~/.claude-cli-accounts/.usage-history.jsonl` (35 days kept), and rewrites
 `~/.claude-cli-accounts/usage-dashboard.html` from `usage-dashboard.template.html`. The page shows

@@ -1686,7 +1686,7 @@ def host_ok(host, port):
 
 
 def manifest():
-    return {"name": "Quota Management", "short_name": "Quota Management", "start_url": "/", "display": "standalone",
+    return {"name": "Agent Dashboard", "short_name": "Agent Dashboard", "start_url": "/", "display": "standalone",
             "background_color": "#0c0a09", "theme_color": "#0c0a09",
             "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
                       {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
@@ -2465,7 +2465,7 @@ def selftest():
     assert g["w"] == 0.22 and g["wp"] == WEEK and g["wr"] - 1_700_000_000 > 0, g
     assert parse_grok({"error": 1}) is None and parse_grok(None) is None
     assert "cursor" not in PROVIDERS and not any(n in globals() for n in ("fetch_cursor", "parse_cursor"))     # A: Cursor is gone
-    assert PROVIDERS["grok"][0] == "xAI" and PROVIDERS["gemini"][0] == "Gemini" and manifest()["name"] == "Quota Management" and "same xAI quota" in PROVIDER_NOTE["grok"]
+    assert PROVIDERS["grok"][0] == "xAI" and PROVIDERS["gemini"][0] == "Gemini" and manifest()["name"] == manifest()["short_name"] == "Agent Dashboard" and "same xAI quota" in PROVIDER_NOTE["grok"]
 
     # A: history lines and the provider cache lose the retired cursor key, on disk
     global HIST, PCACHE, _SIG

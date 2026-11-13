@@ -282,4 +282,12 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.strictEqual(btn({ app: true }, false, () => ''), '<button class="primary" data-a="refresh">Refresh</button>');
   assert.ok(!tpl.includes('Refresh all credentials'));
 }
+// the app is called "Agent Dashboard" everywhere a user sees its name; the installer clears the shortcuts of its earlier names
+{
+  const rd = f => require('fs').readFileSync(require('path').join(__dirname, f), 'utf8');
+  const tpl = rd('usage-dashboard.template.html'), ins = rd('usage-app-install.ps1');
+  assert.ok(tpl.includes('<title>Agent Dashboard</title>') && tpl.includes('<h1>Agent Dashboard</h1>') && !/Quota Management/.test(tpl));
+  assert.ok(ins.includes("'Agent Dashboard.lnk'") && ins.includes("'Quota Management.lnk'") && ins.includes("'Quota.lnk'")
+    && /foreach \(\$l in @\(\$lnk\) \+ \$oldLnks\)/.test(ins) && /foreach \(\$l in \$oldLnks\)/.test(ins) && ins.includes("$taskName = 'Claude usage dashboard'"));
+}
 console.log('usage-sim tests passed');

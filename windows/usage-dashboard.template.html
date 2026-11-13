@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="300">
-<title>Quota Management</title>
+<title>Agent Dashboard</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#0c0a09">
@@ -329,7 +329,7 @@ function render() {
   app.innerHTML =
     `<div class="top"><button data-a="reload" aria-label="Reload data" title="Reload data (updated ${esc(fmtDT(D.now))})">${ico('reload')}</button>` +
     `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
-    `<div class="row t"><h1>Quota Management</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
+    `<div class="row t"><h1>Agent Dashboard</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails">${ico('eye')}${ui.emails ? 'Hide emails' : 'Show emails'}</button>` +
     (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh'}</button>` : '') +
     `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
