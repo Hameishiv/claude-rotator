@@ -1596,6 +1596,9 @@ def rollout_files(cdir, now, since):
     return out
 
 
+IMPORT_RETRIES = 3        # consecutive failed imports before the watermark moves past them anyway
+
+
 def rollout_events(path):
     """(t, {window id: (used fraction, reset, period)}) for each usable token_count line, read streaming; bad lines are skipped."""
     try:
@@ -1608,17 +1611,17 @@ def rollout_events(path):
                     p = j["payload"]
                     rl = p["rate_limits"] if p["type"] == "token_count" else None
                     t = _fromiso(j["timestamp"]).timestamp()
-                except (ValueError, KeyError, TypeError):
-                    continue
-                if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
-                    continue            # another limit family (e.g. "premium") is not the plan's quota
-                wins = {}
-                for part in ("primary", "secondary"):
-                    x = rl.get(part)
-                    w = CODEX_WIN.get(int(_f(x.get("window_minutes")) or 0)) if isinstance(x, dict) else None
-                    used, reset = (_f(x.get("used_percent")), _f(x.get("resets_at"))) if w else (None, None)
-                    if used is not None and reset:
-                        wins[w[0]] = (used / 100, int(reset), w[1])
+                    if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
+                        continue        # another limit family (e.g. "premium") is not the plan's quota
+                    wins = {}
+                    for part in ("primary", "secondary"):
+                        x = rl.get(part)
+                        w = CODEX_WIN.get(int(_f(x.get("window_minutes")) or 0)) if isinstance(x, dict) else None
+                        used, reset = (_f(x.get("used_percent")), _f(x.get("resets_at"))) if w else (None, None)
+                        if used is not None and reset:
+                            wins[w[0]] = (used / 100, int(reset), w[1])
+                except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
+                    continue            # one bad line (a non-finite number, deep nesting) is skipped, never the whole import
                 if wins:
                     yield int(t), wins
     except OSError:
@@ -2236,8 +2239,13 @@ class Store:
         try:
             new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
-            applog("codex import error: %s: %s" % (type(e).__name__, e))
-            return None
+            self._import_fails = getattr(self, "_import_fails", 0) + 1
+            applog("codex import error (%d in a row): %s: %s" % (self._import_fails, type(e).__name__, e))
+            if self._import_fails < IMPORT_RETRIES:
+                return None      # retried next tick from the same watermark
+            self._import_fails = 0
+            return []            # still failing: give up on these logs, so one that always fails cannot pin the watermark for good
+        self._import_fails = 0
         if mark:
             self.mark_import(now)
         return new
@@ -3307,6 +3315,18 @@ def selftest():
             finally:
                 globals()["sample"], globals()["import_rollouts"], time.time = keep_s, keep_ir, real_time
             assert st.hist[-1]["t"] == K_ + 3 * BUCKET5 and load_pcache()["codex_import"] == wm_, "a failed import moved the watermark"
+            try:                                                    # an import that keeps failing stops pinning the watermark after IMPORT_RETRIES
+                globals()["import_rollouts"] = lambda *a, **k: (_ for _ in ()).throw(OverflowError("x"))
+                got_ = [st.read_rollouts(K_ + 3 * BUCKET5, mark=False) for _ in range(IMPORT_RETRIES - 1)]
+            finally:
+                globals()["import_rollouts"] = keep_ir
+            assert got_[:-1] == [None] * (IMPORT_RETRIES - 2) and got_[-1] == [] and st._import_fails == 0, got_
+            bl_ = os.path.join(tempfile.mkdtemp(), "r.jsonl")       # one non-finite line is skipped; the good line beside it still counts
+            ln_ = lambda r: json.dumps({"timestamp": "2026-11-13T10:00:00Z", "payload": {"type": "token_count", "rate_limits": {"primary": {"window_minutes": 300, "used_percent": 40, "resets_at": r}}}})
+            with open(bl_, "w", encoding="utf-8") as fh:
+                fh.write(ln_(1e999).replace("Infinity", "1e999") + chr(10) + ln_(float("nan")) + chr(10) + ln_(1800000000) + chr(10))
+            ev_ = list(rollout_events(bl_))
+            assert len(ev_) == 1 and list(ev_[0][1].values())[0][1] == 1800000000, ev_
             # a point already on disk (a failed earlier append, a --backfill) is not appended twice
             n_ = len(st.hist)
             dup_ = {"t": K_ + 3 * BUCKET5 + 40, "codex": {"A": {"ts": K_ + 3 * BUCKET5 + 40, "w": 0.66}}}
@@ -4488,8 +4508,9 @@ def selftest():
             except PcacheError:
                 pass
             assert open(PCACHE, "rb").read() == bad_
+            st.hist = []                                            # this Store was built bare (no history loaded)
             rr_ = st.read_rollouts(JN, rd_)
-            assert (rr_ is None or isinstance(rr_, list)) and open(PCACHE, "rb").read() == bad_      # the sampler's import logs it and carries on (None: it failed, the watermark stays)
+            assert rr_ == [] and open(PCACHE, "rb").read() == bad_      # the sampler's import logs it and carries on
             copies_ = glob.glob(PCACHE + ".bad-*")
             assert len(copies_) == 1 and open(copies_[0], "rb").read() == bad_, copies_            # the same bad file is copied once
             os.remove(copies_[0])
