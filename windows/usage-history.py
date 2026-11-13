@@ -351,10 +351,12 @@ def parse_grok(j):
         cfg = j["config"]
         cp = cfg["currentPeriod"]
         start, end = (_fromiso(cp[k]).timestamp() for k in ("start", "end"))
-        used = float(cfg["creditUsagePercent"]) / 100
+        used = _f(cfg["creditUsagePercent"])
     except (KeyError, TypeError, ValueError):
         return None
-    return {"w": used, "wr": int(end), "wp": int(end - start)}
+    if used is None:
+        return None
+    return {"w": used / 100, "wr": int(end), "wp": int(end - start)}
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -485,7 +487,10 @@ def parse_gemini(j, now):
             q = c.get("quotaInfo") if isinstance(c, dict) else None
             if not isinstance(q, dict) or not q.get("resetTime"):
                 continue                # no quota on this model
-            frac = round(float(q.get("remainingFraction") or 0), 4)     # proto3 JSON leaves a zero out
+            frac = _f(q.get("remainingFraction") or 0)                  # proto3 JSON leaves a zero out, and writes NaN as "NaN"
+            if frac is None:
+                continue
+            frac = round(frac, 4)
             reset = int(_fromiso(q["resetTime"]).timestamp())
             fam = re.sub(r"\s*\((?:Low|Medium|High|XHigh)\)\s*$", "", str(c["label"])).strip()
             fams = groups.setdefault((frac, reset), [])
@@ -1486,6 +1491,18 @@ def file_lock(path, wait=LOCK_WAIT):
         fh.close()
 
 
+def finite(o):
+    """o with every NaN/infinity removed (a dict drops the key, a list holds None): bare NaN is not JSON, and the page's JSON.parse rejects it.
+    Applied wherever records are written or served, and to records read back, so a value no parser caught still cannot break the page."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: finite(v) for k, v in o.items() if not (isinstance(v, float) and not math.isfinite(v))}
+    if isinstance(o, list):
+        return [finite(v) for v in o]
+    return o
+
+
 def _read_hist():
     """(history oldest first with Cursor's retired key stripped in memory, whether any was stripped); notes the file's signature."""
     global _SIG
@@ -1494,7 +1511,7 @@ def _read_hist():
         with open(HIST, encoding="utf-8") as fh:
             for line in fh:
                 try:
-                    hist.append(json.loads(line))
+                    hist.append(finite(json.loads(line)))
                 except ValueError:
                     pass  # a torn last line from a run that was killed mid-write
     except OSError:
@@ -1522,7 +1539,7 @@ def write_all(hist):
     global _SIG
     tmp = HIST + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(json.dumps(h, separators=(",", ":")) + "\n" for h in hist)
+        fh.writelines(json.dumps(finite(h), separators=(",", ":")) + "\n" for h in hist)
     os.replace(tmp, HIST)
     _SIG = hist_sig()
 
@@ -1531,7 +1548,7 @@ def append_lines(recs):
     """Append recs to HIST; the caller holds hist_lock()."""
     global _SIG
     with open(HIST, "a", encoding="utf-8") as fh:
-        fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in recs)
+        fh.writelines(json.dumps(finite(r), separators=(",", ":")) + "\n" for r in recs)
     _SIG = hist_sig()
 
 
@@ -1557,7 +1574,7 @@ def page_html(data):
                 return fh.read()
         except OSError:
             return ""
-    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    blob = json.dumps(finite(data), separators=(",", ":")).replace("</", "<\\/")
     sim = read("usage-sim.js")
     # one pass, so neither inserted text can be re-scanned for the other placeholder
     return re.sub(r"__DATA__|__SIM__", lambda m: blob if m.group() == "__DATA__" else sim, read("usage-dashboard.template.html"))
@@ -2062,12 +2079,12 @@ def codex_seat_from_read(rl, now):
     secondary slot is the weekly window and the primary the 5-hour one; a lone primary is the weekly."""
     def slot(k):
         w = rl.get(k) if isinstance(rl, dict) else None
-        return w if isinstance(w, dict) and _f(w.get("used_percent")) is not None else None
+        return w if isinstance(w, dict) and "used_percent" in w else None       # present even when its value is bad, so the slots never shift
     p, s = slot("primary"), slot("secondary")
     weekly, session = (s, p) if s else (p, None)
     seat = {"ts": int(now)}
     for wid, w, per in (("w", weekly, WEEK), ("s", session, 18000)):
-        if w:
+        if w and _f(w["used_percent"]) is not None:
             seat[wid], seat[wid + "r"], seat[wid + "p"] = _f(w["used_percent"]) / 100, _f(w.get("resets_at")), per
     if len(seat) == 1:
         return None
@@ -2579,7 +2596,7 @@ def make_handler(store, port):
             self.wfile.write(body)
 
         def js(self, code, obj):
-            self.send(code, json.dumps(obj, separators=(",", ":")), "application/json")
+            self.send(code, json.dumps(finite(obj), separators=(",", ":")), "application/json")
 
         def do_GET(self):
             if not host_ok(self.headers.get("Host"), port):
@@ -3345,7 +3362,17 @@ def selftest():
                          + ln_(1800000000).replace('"window_minutes": 300', '"window_minutes": NaN') + chr(10))
             ev_ = list(rollout_events(bl_))
             assert len(ev_) == 1 and list(ev_[0][1].values())[0][1] == 1800000000, ev_
-            assert all(r_[2] is None or math.isfinite(r_[2]) for r_ in rollout_tokens(bl_)), rollout_tokens(bl_)   # the token parser reads the same lines
+            wk_ = lambda u, r, i: json.dumps({"timestamp": "2026-11-13T10:00:00Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": i, "output_tokens": 5}},
+                                                "rate_limits": {"primary": {"window_minutes": 10080, "used_percent": u, "resets_at": r}}}})
+            with open(bl_, "a", encoding="utf-8") as fh:
+                fh.write(wk_(float("nan"), 1800000000, 10) + chr(10) + wk_(20, 1e999, 10).replace("Infinity", "1e999") + chr(10) + wk_(20, 1800000000, float("nan")) + chr(10)
+                         + wk_(20, 1800000000, 10) + chr(10))
+            tk_ = rollout_tokens(bl_)                                # the token parser reads the same lines, weekly window included
+            assert all(v_ is None or math.isfinite(v_) for r_ in tk_ for v_ in r_[2:]), tk_
+            assert any(r_[2] == 20 and r_[3] == 1800000000 and r_[4] == 15 for r_ in tk_), tk_
+            assert parse_grok({"config": {"currentPeriod": {"start": "2026-11-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}, "creditUsagePercent": "NaN"}}) is None
+            assert finite({"a": float("nan"), "b": [float("inf"), 1.5], "c": {"d": float("-inf"), "e": 2}}) == {"b": [None, 1.5], "c": {"e": 2}}
+            assert codex_seat_from_read({"primary": {"used_percent": 30, "resets_at": 1800000000}, "secondary": {"used_percent": "NaN", "resets_at": 1}}, 5)["sp"] == 18000
             # a point already on disk (a failed earlier append, a --backfill) is not appended twice
             n_ = len(st.hist)
             dup_ = {"t": K_ + 3 * BUCKET5 + 40, "codex": {"A": {"ts": K_ + 3 * BUCKET5 + 40, "w": 0.66}}}
