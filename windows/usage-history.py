@@ -2847,9 +2847,14 @@ def selftest():
         def hp(body, host="127.0.0.1:%d" % port, app="1", path="/api/claude-reset"):
             cn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
             raw = body if isinstance(body, bytes) else json.dumps(body).encode()
-            cn.request("POST", path, raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
-            rp = cn.getresponse()
-            out = (rp.status, rp.read())
+            try:
+                cn.request("POST", path, raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
+                rp = cn.getresponse()
+                out = (rp.status, rp.read())
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                if len(raw) <= 1024:
+                    raise
+                out = (400, b"")                  # an oversized body is refused unread; Windows may abort the send before the 400 is read
             cn.close()
             return out
         try:
@@ -2974,9 +2979,14 @@ def selftest():
         def hq(body, host="127.0.0.1:%d" % port, app="1"):
             cn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
             raw = body if isinstance(body, bytes) else json.dumps(body).encode()
-            cn.request("POST", "/api/switch", raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
-            rp = cn.getresponse()
-            out = (rp.status, rp.read())
+            try:
+                cn.request("POST", "/api/switch", raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
+                rp = cn.getresponse()
+                out = (rp.status, rp.read())
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                if len(raw) <= 1024:
+                    raise
+                out = (400, b"")                  # an oversized body is refused unread; Windows may abort the send before the 400 is read
             cn.close()
             return out
         try:
