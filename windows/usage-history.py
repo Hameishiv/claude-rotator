@@ -253,18 +253,19 @@ LS_PS = ("$ErrorActionPreference='SilentlyContinue';"       # the IDE's language
 
 
 LS_ADMIN = "Antigravity is running as administrator, so its quota can't be read. Start it from a normal (non-admin) window."
-LS_OFF = "Antigravity isn't running — open it to update"
+LS_AGY = "Open the Antigravity app to read Gemini quota (the agy CLI doesn't share it)"     # agy.exe hosts a server but its csrf token is not on its command line
+LS_OFF = "Antigravity isn't running — open the Antigravity app to update"
 
 
 def parse_ls_procs(text):
-    """The probe's JSON -> [(csrf token, [listening ports])]; a process with a command line but no token or no port is dropped.
+    """The probe's JSON -> [(csrf token, [listening ports])]; a process with a token but no port is dropped.
     A process whose command line is empty (Windows hides it from a normal process when the target runs as administrator)
-    comes back as (None, []), once. Tokens are never logged."""
+    comes back as (None, []), once; one whose command line is readable but carries no token (agy.exe) as ("", []), once. Tokens are never logged."""
     try:
         j = json.loads(text)
     except (TypeError, ValueError):
         return []
-    out, hidden = [], False
+    out, hidden, bare = [], False, False
     for p in [j] if isinstance(j, dict) else j if isinstance(j, list) else []:
         if not isinstance(p, dict):
             continue
@@ -273,9 +274,10 @@ def parse_ls_procs(text):
         m = re.search(r"--csrf_token[=\s]+(\S+)", cmd)
         ports = p.get("Ports")
         ports = [x for x in (ports if isinstance(ports, list) else [ports]) if isinstance(x, int)]
+        bare = bare or bool(cmd) and not m
         if m and ports:
             out.append((m.group(1).strip("\"'"), ports))
-    return out + [(None, [])] if hidden else out
+    return out + [(None, [])] * hidden + [("", [])] * bare
 
 
 def ls_probe():
@@ -355,15 +357,15 @@ def parse_gemini(j, now):
 
 def read_gemini(now, probe=ls_probe, query=query_ls):
     """(seat, note): the seat from the running Antigravity language server, else None with why - LS_ADMIN when a process exists
-    whose command line cannot be read, LS_OFF when none is running or no port answers."""
-    hidden = False
+    whose command line cannot be read, LS_AGY when only a tokenless agy.exe is there, LS_OFF when none is running or no port answers."""
+    hidden = bare = False
     for csrf, ports in probe():
-        hidden = hidden or csrf is None
+        hidden, bare = hidden or csrf is None, bare or csrf == ""
         for port in ports if csrf else []:
             seat = parse_gemini(query(port, csrf), now)
             if seat:
                 return seat, ""
-    return None, LS_ADMIN if hidden else LS_OFF
+    return None, LS_ADMIN if hidden else LS_AGY if bare else LS_OFF
 
 
 def gemini_email():
@@ -1280,7 +1282,7 @@ def selftest():
     assert len(parse_gemini(gj, 1)["n"]) == 4                                 # a different reset is its own limit
     assert parse_gemini({"userStatus": {}}, 1) is None and parse_gemini(None, 1) is None and parse_gemini({"userStatus": {"cascadeModelConfigData": {"clientModelConfigs": []}}}, 1) is None
     procs = '[{"ProcessId":1,"CommandLine":"x.exe --a b --csrf_token tok1 --c","Ports":[4000,4001]},{"ProcessId":2,"CommandLine":"x.exe","Ports":[5]},{"ProcessId":3,"CommandLine":"--csrf_token t3","Ports":9},{"ProcessId":4,"CommandLine":"--csrf_token=t4","Ports":[7]}]'
-    assert parse_ls_procs(procs) == [("tok1", [4000, 4001]), ("t3", [9]), ("t4", [7])] and parse_ls_procs("") == [] and parse_ls_procs("null") == []
+    assert parse_ls_procs(procs) == [("tok1", [4000, 4001]), ("t3", [9]), ("t4", [7]), ("", [])] and parse_ls_procs("") == [] and parse_ls_procs("null") == []
     tried = []
     def fq(port, csrf):
         tried.append((port, csrf))
@@ -1290,12 +1292,20 @@ def selftest():
     # 4: a process (the IDE server or agy.exe) whose command line is empty/unreadable means it runs as administrator; nothing else is tried to read its token
     adm = '[{"ProcessId":9,"CommandLine":null,"Ports":[3]},{"ProcessId":10,"CommandLine":"","Ports":[]}]'
     assert parse_ls_procs(adm) == [(None, [])] and parse_ls_procs('{"ProcessId":9,"CommandLine":"  ","Ports":[3]}') == [(None, [])]
-    assert parse_ls_procs('[{"ProcessId":9,"CommandLine":"agy.exe --hub","Ports":[3]}]') == []                      # readable but no token: nothing to ask
+    assert parse_ls_procs('[{"ProcessId":9,"CommandLine":"agy.exe --hub","Ports":[3]}]') == [("", [])]              # readable but no token: nothing to ask, but it is running
+    assert parse_ls_procs('[{"CommandLine":"a --csrf_token t","Ports":[]}]') == []                                  # a token but no port: dropped
     tried.clear()
     assert read_gemini(7, lambda: parse_ls_procs(adm), fq) == (None, LS_ADMIN) and tried == []
     assert read_gemini(7, lambda: parse_ls_procs('[' + adm[1:-1] + ',{"CommandLine":"x --csrf_token=t5","Ports":[4001]}]'), fq)[0]["ts"] == 7      # a readable server still wins
+    # 1: agy.exe alone (readable command line, no token) -> the Antigravity-app note; with a hidden process the administrator note wins; with a tokened server that answers, the seat
+    agy = '{"ProcessId":11,"CommandLine":"agy.exe --hub","Ports":[6]}'
+    tried.clear()
+    assert read_gemini(7, lambda: parse_ls_procs("[" + agy + "]"), fq) == (None, LS_AGY) and tried == []
+    assert read_gemini(7, lambda: parse_ls_procs("[" + agy + "," + adm[1:-1] + "]"), fq) == (None, LS_ADMIN)
+    assert read_gemini(7, lambda: parse_ls_procs("[" + agy + ',{"CommandLine":"x --csrf_token=t5","Ports":[4001]}]'), fq)[0]["ts"] == 7
+    assert read_gemini(7, lambda: parse_ls_procs("[" + agy + ',{"CommandLine":"x --csrf_token=t5","Ports":[4000]}]'), fq) == (None, LS_AGY)       # server there but silent
     assert LS_ADMIN == "Antigravity is running as administrator, so its quota can't be read. Start it from a normal (non-admin) window."
-    assert LS_OFF == "Antigravity isn't running — open it to update" and "agy.exe" in LS_PS and "language_server_windows_x64.exe" in LS_PS and "Start-Process" not in LS_PS and "RunAs" not in LS_PS
+    assert LS_AGY == "Open the Antigravity app to read Gemini quota (the agy CLI doesn't share it)" and LS_OFF == "Antigravity isn't running — open the Antigravity app to update" and "agy.exe" in LS_PS and "language_server_windows_x64.exe" in LS_PS and "Start-Process" not in LS_PS and "RunAs" not in LS_PS
     gh = [{"t": 1000 + 300 * i, "gemini": {"antigravity": dict(g, ts=1000 + 300 * i)}} for i in range(4)]
     gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": LS_OFF}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
     assert gb["id"] == "gemini" and gb["name"] == "Gemini" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
