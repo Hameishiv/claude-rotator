@@ -9,6 +9,7 @@ from file:// with no server. The 'Claude usage dashboard' scheduled task runs --
   usage-history.py             sample + render
   usage-history.py --render    render only
   usage-history.py --backfill [--days N]   rebuild past Claude history from .rotate-log.txt (default 7 days)
+  usage-history.py --backtest            projection error of the Typical, 3h and 24h rates over the recorded history
   usage-history.py --serve [--port 8787]   local app: page, /api/data, POST /api/refresh, sampler thread
   usage-history.py --make-icons            write the app icons into <state dir>\\usage-app\\
   usage-history.py --selftest              run the checks
@@ -47,6 +48,7 @@ ICONS = os.path.join(STATE, "usage-app")
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEEP_DAYS = 35
 WEEK = 7 * 86400
+DAY = 86400
 WINDOWS = (1, 3, 6, 24)     # hours of history a burn rate is measured over
 BUCKET = 900                # hist is thinned to one point per 15 minutes
 DRIFT_EVERY = 6 * 3600      # rotator-sync --check runs at most this often
@@ -498,6 +500,60 @@ def burn(hist, key, hours, now, pid="claude"):
     return burn_p(prep(hist, key, pid), hours, now)
 
 
+def hour_profile(rows, wid, pid="claude", gap=DAY):
+    """Typical-day profile: expected %/h of one account for each local hour of the day (24 numbers) and its mean, or None with under 24 h of history.
+    Each step between two consecutive records (reset-aware, as burn is) is spread over the hours it spans by time; the profile for an hour is the
+    use that fell in it divided by the time covered for that hour in days, so a day with no records for an hour does not count as a day of zero use.
+    A step longer than `gap` is skipped (its use cannot be placed); an hour with under 30 min covered gets the overall mean."""
+    drop, cov = [0.0] * 24, [0.0] * 24
+    for a, b in zip(rows, rows[1:]):
+        ta, tb = a["t"], b["t"]
+        if tb <= ta or tb - ta > gap:
+            continue
+        d = _step(seats_of(a, pid), seats_of(b, pid), wid) * 100
+        t = ta
+        while t < tb:
+            lt = time.localtime(t)
+            nxt = min(tb, t + 3600 - lt.tm_min * 60 - lt.tm_sec)
+            drop[lt.tm_hour] += d * (nxt - t) / (tb - ta)
+            cov[lt.tm_hour] += nxt - t
+            t = nxt
+    if sum(cov) < DAY:
+        return None
+    mean = sum(drop) * 3600 / sum(cov)
+    prof = [drop[h] * 3600 / cov[h] if cov[h] >= 1800 else mean for h in range(24)]
+    return prof, sum(prof) / 24
+
+
+def project(seats, rate, now, horizon=14 * DAY, step=600):
+    """Python twin of quotaProject in usage-sim.js (pooled quota left, soonest-reset seat drains first); `rate` is %/h of one account, or 24 of them by local hour."""
+    ss = [{"used": s.get("used") or 0, "reset": s.get("reset") or None, "period": s["period"] if (s.get("period") or 0) > 0 else 0} for s in seats]
+    for s in ss:
+        while s["reset"] and s["period"] and s["reset"] <= now:
+            s["reset"] += s["period"]
+    pts, empty, anyrate = [], None, (any(r > 0 for r in rate) if isinstance(rate, list) else rate > 0)
+    t = now
+    while t <= now + horizon:
+        for s in ss:
+            while s["reset"] and s["period"] and s["reset"] <= t:
+                s["used"] = 0
+                s["reset"] += s["period"]
+        left = sum(1 - s["used"] for s in ss) * 100
+        pts.append((t, round(left, 1)))
+        if empty is None and anyrate and left < 0.05:
+            empty = t
+        r = rate[time.localtime(t).tm_hour] if isinstance(rate, list) else rate
+        drain = r / 100 * step / 3600 if r > 0 else 0
+        for s in sorted(ss, key=lambda s: s["reset"] or math.inf):
+            if drain <= 0:
+                break
+            take = min(1 - s["used"], drain)
+            s["used"] += take
+            drain -= take
+        t += step
+    return pts, empty
+
+
 def _roll(r, period, now):
     """The next reset after `now`, moving a stale one forward by whole periods."""
     if r and period and r <= now:
@@ -546,6 +602,9 @@ def build_limit(hist, latest, pid, wid, label, now, dflt):
     first = rows[0]["t"]
     lim = {"id": wid, "label": label, "cap": n * 100, "now": round(rem, 1), "hist": [last[k] for k in sorted(last)],
            "burn": {}, "drain": {}, "seats": []}
+    prof = hour_profile(rows, wid, pid)
+    if prof:
+        lim["profile"], lim["typical"] = [round(x, 2) for x in prof[0]], round(prof[1], 2)
     for w in WINDOWS:
         lim["burn"][str(w)] = _num(burn_p(p, w, now))
         pts = []
@@ -606,6 +665,63 @@ def build(hist, now, emails=None, app=False, extra=None):
     if d and d.get("differing"):
         out["drift"] = {"n": len(d["differing"]), "names": [str(x) for x in d["differing"]], "checked": int(_f(d.get("checked")) or 0) or None}
     return out
+
+
+BT_TARGETS = (("claude", "w", "Claude all models"), ("claude", "f", "Claude Fable"), ("codex", "w", "Codex weekly"))
+BT_METHODS = ("typical", "3h", "24h")
+
+
+def backtest(hist, targets=BT_TARGETS, every=6 * 3600, ahead=DAY):
+    """How well each rate method projects 24 h ahead: {target label: {"n": origins, method: mean absolute error in pooled % points}}.
+    An origin is every 6 h grid point with at least 24 h of history behind it and `ahead` of recorded history after it. Each method projects
+    from the state at the origin with quotaProject's rules (typical: the hour profile of the history before the origin only; 3h, 24h: that burn
+    held flat); the error at an origin is the mean |projected - recorded| over the recorded points in the next `ahead`, the figure is the mean over origins."""
+    out = {}
+    for pid, wid, label in targets:
+        rows = [h for h in hist if remaining(h, wid, pid=pid)[1]]
+        if len(rows) < 2:
+            continue
+        ts, dflt = [h["t"] for h in rows], {w: p for w, _, p in PROVIDERS[pid][1]}
+        p, lefts = prep(rows, wid, pid), [remaining(h, wid, pid=pid)[0] for h in rows]
+        errs = {m: [] for m in BT_METHODS}
+        t0 = (ts[0] + DAY) // every * every + every
+        while t0 + ahead <= ts[-1]:
+            i = bisect.bisect_right(ts, t0) - 1
+            actual = [(ts[j] - t0, lefts[j]) for j in range(i + 1, bisect.bisect_right(ts, t0 + ahead))]
+            prof = hour_profile(rows[:i + 1], wid, pid) if t0 - ts[i] <= 6 * 3600 else None
+            rates = {"typical": prof and prof[0], "3h": burn_p(p, 3, t0), "24h": burn_p(p, 24, t0)}
+            if len(actual) >= 8 and all(r is not None for r in rates.values()):
+                seats = []
+                for s in seats_of(rows[i], pid).values():
+                    u = util_at(s, wid, t0)
+                    if u is not None:
+                        per = s.get(wid + "p") or dflt[wid]
+                        seats.append({"used": u, "reset": _roll(s.get(wid + "r"), per, t0), "period": per})
+                for m, r in rates.items():
+                    pts = project(seats, r, t0, ahead)[0]
+                    errs[m].append(sum(abs(pts[round(dt / 600)][1] - v) for dt, v in actual) / len(actual))
+            t0 += every
+        if errs["typical"]:
+            out[label] = dict({"n": len(errs["typical"]), "errs": errs}, **{m: sum(e) / len(e) for m, e in errs.items()})
+    return out
+
+
+def backtest_table(res):
+    """Plain-text table of backtest(): per target and over all origins, then the method with the lowest overall error."""
+    rows = [("Limit", "Origins") + BT_METHODS]
+    allerr = {m: [] for m in BT_METHODS}
+    for label, r in res.items():
+        rows.append((label, str(r["n"])) + tuple("%.1f" % r[m] for m in BT_METHODS))
+        for m in BT_METHODS:
+            allerr[m] += r["errs"][m]
+    if not allerr["typical"]:
+        return "no limit has enough history to backtest", None
+    mean = {m: sum(e) / len(e) for m, e in allerr.items()}
+    best = min(BT_METHODS, key=lambda m: mean[m])
+    rows.append(("All (per origin)", str(len(allerr["typical"]))) + tuple("%.1f" % mean[m] for m in BT_METHODS))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    lines = ["  ".join(c.ljust(w[i]) if i == 0 else c.rjust(w[i]) for i, c in enumerate(r)) for r in rows]
+    return chr(10).join(lines + ["mean absolute error in pooled %% points over 24 h; lowest overall: %s" % best]), best
 
 
 def seat_emails(root, fallback):
@@ -710,7 +826,6 @@ def render(data):
 
 CODEX_WIN = {10080: ("w", WEEK), 300: ("s", 18000)}     # window_minutes -> (window id, period s), as parse_codex does
 SLOP = 120                                              # s: how far apart two resets_at may be and still be the same window
-DAY = 86400
 
 
 def rollout_files(cdir, now, since):
@@ -1465,6 +1580,28 @@ def selftest():
     again = sorted([h for h in merged if not h.get("b")] + backfill_records(log, latest, L - 8 * 86400, L)[0], key=lambda h: h["t"])
     assert again == merged
 
+    # 3: typical-day profile and the backtest, on two synthetic weeks (local midnight start) that use 1 %/h of one account in local hours 9-16 only
+    base, u, syn = time.mktime((2026, 1, 5, 0, 0, 0, 0, 0, -1)), 0.0, []
+    for k in range(14 * 288):
+        t = int(base + k * 300)
+        u = 0.0 if k % 2016 == 0 else u + (0.01 / 12 if 9 <= time.localtime(t - 300).tm_hour < 17 else 0)
+        syn.append({"t": t, "s": {"A": {"w": u, "wr": base + (k // 2016 + 1) * WEEK, "ts": t}}})
+    prof, typ = hour_profile(syn, "w")
+    assert all(abs(prof[h] - 1.0) < 0.05 for h in range(9, 17)) and all(prof[h] < 0.05 for h in list(range(9)) + list(range(17, 24))), prof
+    assert abs(typ - 8 / 24) < 0.02 and hour_profile(syn[:200], "w") is None                 # under 24 h of history: no profile
+    assert hour_profile([syn[0], dict(syn[0], t=syn[0]["t"] + 30 * 3600)], "w") is None         # a step longer than a day cannot be placed
+    sl = build(syn, syn[-1]["t"], {}, False)["providers"][0]["limits"][0]
+    assert len(sl["profile"]) == 24 and sl["typical"] == round(typ, 2) and "profile" not in build(syn[:200], syn[199]["t"], {}, False)["providers"][0]["limits"][0]
+    mid = base
+    two = lambda: [{"used": 0, "reset": mid + 30 * DAY, "period": WEEK}] * 2
+    flat, only0 = project(two(), 50, mid, 5 * 3600), project(two(), [100] + [0] * 23, mid, 5 * 3600)         # twins of the node test cases
+    assert flat[1] == mid + 14400 and project(two(), [50] * 24, mid, 5 * 3600) == flat and only0[1] is None and dict(only0[0])[mid + 3600] == 100.0 and only0[0][-1][1] == 100.0
+    assert project(two(), [100, 50] + [0] * 22, mid, 7200)[0][-1] == (mid + 7200, 50.0)
+    bt = backtest(syn, (("claude", "w", "x"),))["x"]
+    assert bt["n"] >= 40 and bt["typical"] < 1 and bt["typical"] * 5 < min(bt["3h"], bt["24h"]), bt          # the profile follows the day, a flat burn cannot
+    table, best = backtest_table({"x": bt})
+    assert best == "typical" and "lowest overall: typical" in table and backtest_table({})[1] is None
+
     # build: 15-minute downsample, generic windows, drain
     now = L + 5 * 3600
     hist = []
@@ -1516,6 +1653,9 @@ def main():
         return int(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
     if "--backfill" in sys.argv:
         return backfill(arg("--days", 7))
+    if "--backtest" in sys.argv:
+        say(backtest_table(backtest(load()))[0])
+        return 0
     if "--serve" in sys.argv:
         return serve(arg("--port", 8787))
     now = time.time()

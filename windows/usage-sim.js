@@ -1,5 +1,7 @@
-// Pooled-quota projection shared by the dashboard and its tests. Same semantics as the v1 Python project().
+// Pooled-quota projection shared by the dashboard and its tests. Same semantics as the v1 Python project() and usage-history.py's project().
+// `ratePerHour` is %/h of one account, or an array of 24 of them indexed by the local hour of each step (the typical-day profile).
 function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec = 600) {
+  const prof = Array.isArray(ratePerHour), anyRate = prof ? ratePerHour.some(r => r > 0) : ratePerHour > 0;
   // period must be > 0 or a roll-forward would never end; a seat without one just stops resetting.
   const ss = seats.map(s => ({ used: s.used || 0, reset: s.reset || null, period: s.period > 0 ? s.period : 0 }));
   const roll = (s, t) => { while (s.reset && s.period && s.reset <= t) { s.used = 0; s.reset += s.period; } };
@@ -9,8 +11,9 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
     for (const s of ss) roll(s, t);
     const left = ss.reduce((a, s) => a + (1 - s.used), 0) * 100;
     pts.push([t, Math.round(left * 10) / 10]);
-    if (empty === null && ratePerHour > 0 && left < 0.05) empty = t;
-    let drain = ratePerHour > 0 ? ratePerHour / 100 * stepSec / 3600 : 0;
+    if (empty === null && anyRate && left < 0.05) empty = t;
+    const r = prof ? ratePerHour[new Date(t * 1000).getHours()] : ratePerHour;
+    let drain = r > 0 ? r / 100 * stepSec / 3600 : 0;
     for (const s of ss.slice().sort((a, b) => (a.reset || Infinity) - (b.reset || Infinity))) {
       if (drain <= 0) break;
       const take = Math.min(1 - s.used, drain);

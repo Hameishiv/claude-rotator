@@ -35,6 +35,23 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   const r = quotaProject([{ used: 0, reset: null, period: 0 }], 100, now, 7200);
   assert.strictEqual(r.empty, now + 3600);
 }
+// typical-day profile: a 24-array is read by the local hour of each step. Seats and a profile that drains only in local hour 0.
+{
+  const mid = new Date(2026, 0, 5, 0, 0, 0).getTime() / 1000;      // a local midnight, so the test holds in any timezone
+  const prof = Array(24).fill(0); prof[0] = 100;
+  const two = () => [{ used: 0, reset: mid + 30 * 86400, period: W }, { used: 0, reset: mid + 30 * 86400, period: W }];
+  let r = quotaProject(two(), prof, mid, 5 * 3600);
+  assert.strictEqual(r.pts.find(p => p[0] === mid + 3600)[1], 100);       // one seat's worth drained in hour 0, then nothing
+  assert.strictEqual(r.pts[r.pts.length - 1][1], 100);
+  assert.strictEqual(r.empty, null);
+  r = quotaProject(two(), Array(24).fill(50), mid, 5 * 3600);                // flat array == the number 50
+  assert.strictEqual(r.empty, mid + 14400);       // 200 % pool at 50 %/h
+  assert.deepStrictEqual(r.pts, quotaProject(two(), 50, mid, 5 * 3600).pts);
+  assert.strictEqual(quotaProject(two(), Array(24).fill(0), mid, 3600).empty, null);
+  // the array drains hour by hour: 100 %/h in hour 0 and 50 %/h in hour 1 -> 1 seat + 0.5 seat gone by the end of hour 1
+  const p2 = Array(24).fill(0); p2[0] = 100; p2[1] = 50;
+  assert.strictEqual(quotaProject(two(), p2, mid, 7200).pts.find(p => p[0] === mid + 7200)[1], 50);
+}
 // seat name: the letter always, the email under it only when shown and known
 {
   const esc = s => String(s).replace(/</g, '&lt;');
