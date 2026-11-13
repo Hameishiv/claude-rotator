@@ -6,9 +6,9 @@
 <meta http-equiv="refresh" content="300">
 <title>Quota Management</title>
 <style>
-:root{color-scheme:dark;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa}
-@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}}
-:root[data-theme="light"]{color-scheme:light;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}
+:root{color-scheme:dark;--ok:#4ade80;--caution:#facc15;--bad:#f87171;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}}
+:root[data-theme="light"]{color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1100px;margin:0 auto;padding:16px}
@@ -77,6 +77,11 @@ summary{cursor:pointer;color:var(--muted);padding:4px 0}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap}
 th{color:var(--muted);font-weight:500}
+td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--bad)}
+.pv{color:var(--lvc,var(--ink))}
+.lv-bad .pv{font-weight:600}
+.bar{display:block;height:4px;min-width:72px;margin-top:4px;border-radius:2px;background:var(--grid);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--lvc,var(--muted))}
 .bdg{display:inline-block;margin-left:6px;padding:0 7px;border-radius:999px;background:var(--btn);color:var(--ink2);font-size:11px;font-weight:600;line-height:18px;vertical-align:1px}
 td small{display:block;color:var(--muted);font-size:12px}
 li small{color:var(--muted);font-size:12px;margin-left:6px}
@@ -253,7 +258,8 @@ function accounts(p) {
     const cells = ids.map(id => {
       const w = a.windows.find(x => x.id === id);
       if (!w) return '<td>–</td>';
-      return `<td>${w.used == null ? '–' : Math.round(w.used * 100) + '%'}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtWT(w.reset))}</small>` : ''}</td>`;
+      const lv = quotaLevel(p.id, w), pct = w.used == null ? null : Math.round(w.used * 100);
+      return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtWT(w.reset))}</small>` : ''}</td>`;
     }).join('');
     return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${a.readAt && D.now - a.readAt > 86400 ? ' class="w"' : ''}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');

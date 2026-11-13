@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaSeat, quotaInUse, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaSeat, quotaInUse, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -79,5 +79,13 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaBankedCell({ banked: 2 }, now, fmt, id), '2<small>Expiry not supplied for 2</small>');
   assert.strictEqual(quotaBankedTotal({ accounts: [two, { banked: 1 }, {}] }), 3);
   assert.strictEqual(quotaBankedTotal({ accounts: [{}, {}] }), null);
+}
+// status levels: Claude by the API's status (unknown is neutral), the others by the displayed percentage
+{
+  assert.deepStrictEqual(['allowed', 'allowed_warning', 'rejected', undefined, 'odd'].map(stat => quotaLevel('claude', { used: 0.99, stat })), ['ok', 'warn', 'bad', '', '']);
+  assert.deepStrictEqual([0, 0.84, 0.845, 0.85, 0.994, 0.995, 1].map(used => quotaLevel('codex', { used })), ['ok', 'ok', 'warn', 'warn', 'warn', 'bad', 'bad']);
+  assert.strictEqual(quotaLevel('grok', { used: 1 }), 'bad');
+  assert.strictEqual(quotaLevel('gemini', { used: 0.9 }), 'warn');
+  assert.strictEqual(quotaLevel('gemini', { used: null }), '');
 }
 console.log('usage-sim tests passed');

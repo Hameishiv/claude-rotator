@@ -106,7 +106,8 @@ def read_seat(label):
     fab = next((r[1] for r in reversed(rows) if _f(r[1].get("oi7_util")) is not None), {})
     return {"ts": ts, "s": _f(d.get("s5_util")), "sr": _f(d.get("s5_reset")),
             "w": _f(d.get("w7_util")), "wr": _f(d.get("w7_reset")),
-            "f": _f(fab.get("oi7_util")), "fr": _f(fab.get("oi7_reset"))}
+            "f": _f(fab.get("oi7_util")), "fr": _f(fab.get("oi7_reset")),
+            "st": d.get("s5_stat"), "wt": d.get("w7_stat"), "ft": fab.get("oi7_stat")}      # the API's own status per window: allowed, allowed_warning, rejected
 
 
 def _read(path):
@@ -686,6 +687,8 @@ def build_provider(hist, pid, emails, now, extra):
                 continue
             period = s.get(wid + "p") or dp
             w = {"id": wid, "label": wlabel, "used": u, "reset": None if s.get(wid + "r") is None else int(_roll(s[wid + "r"], period, now))}
+            if isinstance(s.get(wid + "t"), str) and not (s.get(wid + "r") and now >= s[wid + "r"]):
+                w["stat"] = s[wid + "t"]            # a status read before the window reset says nothing about the new one
             if s.get(wid + "r") and now >= s[wid + "r"] > (s.get("ts") or 0):
                 w["assumed"] = True         # the reset passed and nothing has been read since: 0 is rolled forward, not measured
             a["windows"].append(w)
@@ -1902,6 +1905,21 @@ def selftest():
     assert stale["limits"][0]["now"] == 100.0 and stale["accounts"][0]["windows"][0] == {"id": "w", "label": "Weekly", "used": 0.0, "reset": L - 10 + WEEK, "assumed": True}
     fresh = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L + 10, "ts": L - 99}, "B": {"w": 0.3, "wr": L - 10, "ts": L - 5}}}], L, {}, False)["providers"][0]["accounts"]
     assert "assumed" not in fresh[0]["windows"][0] and "assumed" not in fresh[1]["windows"][0]      # reset still ahead / read after the reset: a real value
+    # 6: the API status per window travels with the seat into the blob, and not past the window's reset
+    sa = build([{"t": L, "s": {"A": {"w": 0.9, "wr": L + 10, "ts": L - 5, "wt": "allowed_warning", "st": "rejected", "ft": None}, "B": {"w": 0.3, "wr": L - 10, "ts": L - 99, "wt": "rejected"}}}], L, {}, False)["providers"][0]["accounts"]
+    assert sa[0]["windows"][0]["stat"] == "allowed_warning" and "stat" not in sa[1]["windows"][0]
+    keep_root, rd = ROOT, tempfile.mkdtemp()
+    try:
+        globals()["ROOT"] = rd
+        os.makedirs(os.path.join(rd, "A"))
+        for fn, ts_, dd in (("usage-cache.json", 100, {"s5_util": .1, "s5_reset": 9, "w7_util": .5, "w7_reset": 9, "s5_stat": "allowed", "w7_stat": "allowed_warning", "oi7_stat": None}),
+                            ("usage-cache-fable.json", 90, {"oi7_util": .2, "oi7_reset": 9, "oi7_stat": "rejected", "s5_stat": "x", "w7_stat": "y"})):
+            json.dump({"ts": ts_, "data": dict(dd, ok=True, access="ok")}, open(os.path.join(rd, "A", fn), "w"))
+        rs_ = read_seat("A")
+        assert (rs_["st"], rs_["wt"], rs_["ft"], rs_["f"]) == ("allowed", "allowed_warning", "rejected", 0.2), rs_      # s/w from the newest read, Fable's from the one that carries it
+    finally:
+        globals()["ROOT"] = keep_root
+        __import__("shutil").rmtree(rd, ignore_errors=True)
     assert stale["limits"][0]["burn"] == {"1": None, "3": None, "6": None, "24": None} and stale["limits"][0]["drain"]["1"] == []
     assert build([], L)["providers"] == [] and build([], L)["first"] is None
     # the page keeps both placeholders from being re-scanned and escapes </

@@ -44,9 +44,17 @@ function quotaBankedCell(a, now, fmt, esc) {
   return a.banked + l.map(c => '<small>' + esc(c.title) + ' · expires ' + esc(fmt(c.expiresAt)) + ' (in ' + quotaIn(c.expiresAt - now) + ')</small>').join('') +
     (miss > 0 ? '<small>Expiry not supplied for ' + miss + '</small>' : '');
 }
+// A table cell's status level: 'ok' | 'warn' | 'bad', or '' when unknown. Claude's comes from the API's own status for the window (allowed, allowed_warning,
+// rejected); the others from the used fraction as displayed: capped at 100 %, a warning from 85 % (the Codex rotator's bar).
+function quotaLevel(pid, w) {
+  if (pid === 'claude') return { allowed: 'ok', allowed_warning: 'warn', rejected: 'bad' }[w.stat] || '';
+  if (w.used == null) return '';
+  const p = Math.round(w.used * 100);
+  return p >= 100 ? 'bad' : p >= 85 ? 'warn' : 'ok';
+}
 // Sum of banked resets over a provider's seats, or null when none of them reports any.
 function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaInUse, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaSeat, quotaInUse, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
