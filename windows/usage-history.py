@@ -2057,9 +2057,12 @@ class Store:
             if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
                 return None
             e["next"] = int(now + CREDITS_EVERY)
+            e["gen"] = gen = (e.get("gen") or 0) + 1        # a later read of this seat (say a forced one after a reset) makes this one stale
         state, rd = read_credits(label, now, fetch, ver or claude_version(now), login)
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
+            if e.get("gen") != gen:
+                return "stale"                          # a read started after this one owns the seat's entry: this answer is older, dropped
             if state == "ok":
                 e.update(ts=rd["ts"], eligible=rd["eligible"], grants=rd["grants"])
                 e.pop("note", None), e.pop("hold", None), e.pop("nextId", None)
@@ -3495,6 +3498,19 @@ def selftest():
         assert st.credits_read("C", JN + 4 * CREDITS_EVERY, fx, force=True, login=lambda l: ("ok", "secret-appC")) == "ok" and calls[-1][1] == "Bearer secret-appC"
         assert st.credits_read("C", JN + 5 * CREDITS_EVERY, fx, force=True, login=lambda l: ("expired", None)) == "expired" and len(calls) == n_ + 1
         assert load_pcache()["credits"]["C"]["note"] == "app login expired; open the app on this seat to refresh" and "secret-app" not in open(PCACHE).read()
+        # a read started before a later forced re-read (say right after a reset) is stale when it answers: dropped, the newer reading stays
+        gate_, res_ = threading.Event(), []
+
+        def slow_(req):
+            gate_.wait(5)
+            return 200, {"cedar_ember": {"eligible": False}}
+        th_ = threading.Thread(target=lambda: res_.append(st.credits_read("A", JN + 40 * CREDITS_EVERY, slow_, force=True, login=lambda l: (None, None))))
+        th_.start()
+        time.sleep(0.3)
+        assert st.credits_read("A", JN + 40 * CREDITS_EVERY + 1, fx, force=True, login=lambda l: (None, None)) == "ok"
+        gate_.set()
+        th_.join(10)
+        assert res_ == ["stale"] and load_pcache()["credits"]["A"]["eligible"] is True, (res_, load_pcache()["credits"]["A"])
         # app_login: only the same account's saved app login, through the read-only helper; anything odd is no login
         keep_as = APP_SEATS
         globals()["APP_SEATS"] = os.path.join(jd, "app-seats")
