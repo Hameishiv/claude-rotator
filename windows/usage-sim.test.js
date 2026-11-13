@@ -216,7 +216,27 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const resetBtn = new Function('D', 'esc', 'QUOTA_RESET_KINDS', src + '\nreturn resetBtn;')({ app: true }, s => String(s), QUOTA_RESET_KINDS);
   const cx = { id: 'codex', canReset: true };
   assert.ok(resetBtn(cx, { label: 'A', banked: 2 }).includes('>Apply reset</button>'));
-  assert.strictEqual(resetBtn(cx, { label: 'A', banked: 2, resetPending: true }), '<small class="muted">Last reset unconfirmed — checking</small>');
+  assert.strictEqual(resetBtn(cx, { label: 'A', banked: 2, resetPending: true }),
+    '<small class="muted">Last reset unconfirmed</small><button class="rs" data-a="rsclear" data-v="A">Clear</button>');
+  // through accounts(): the reset column stays when nothing is banked anywhere but a seat has a pending claim or an unconfirmed reset
+  const tblSrc = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction panel('));
+  const accounts = new Function('D', 'esc', 'QUOTA_RESET_KINDS', 'quotaBankedTotal', 'quotaBankedCell', 'quotaLevel', 'quotaSwitchBtns', 'swBusy', 'nm', 'bkTitle',
+    'readAge', 'ago', 'fmtRS', 'closed', 'fmtDT', tblSrc + '\nreturn accounts;')({ app: true, now: 1000 }, s => String(s), QUOTA_RESET_KINDS, quotaBankedTotal, () => '–',
+    () => '', () => '', () => false, a => a.label, () => '', () => '', String, String, {}, String);
+  const clT = accounts({ id: 'claude', canReset: true, limits: [], accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true }] }] });
+  assert.ok(clT.includes('<th>Banked resets</th>') && clT.includes('>Resend pending full reset</button>'), clT);
+  const cxT = accounts({ id: 'codex', canReset: true, limits: [], accounts: [{ label: 'B', windows: [], banked: 0, resetPending: true }] });
+  assert.ok(cxT.includes('Last reset unconfirmed') && cxT.includes('data-a="rsclear"'), cxT);
+  assert.ok(!accounts({ id: 'codex', canReset: true, limits: [], accounts: [{ label: 'B', windows: [] }] }).includes('Banked resets'));
+  // the hand clear asks first, with Cancel as the default
+  const clrSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
+  const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
+  const fns = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', clrSrc + '\nreturn { openClear, st: () => rs };')(
+    { now: 1 }, () => dlg, s => String(s), {}, String, String, QUOTA_RESET_KINDS);
+  fns.openClear('B');
+  assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Only clear this after codex-usage shows the reset was not used. Clearing lets you apply a reset on this seat again.')
+    && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg.innerHTML) && fns.st().clear === true, dlg.innerHTML);
+  assert.ok(/rs\.clear \? '\/api\/codex-reset-clear'/.test(tpl) && /a === 'rsclear'\) return openClear\(v\)/.test(tpl));
 }
 // a Claude seat+kind with a pending (unsettled) claim is offered as a resend, even with no credit of that kind listed, and its dialog says so
 {

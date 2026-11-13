@@ -276,14 +276,14 @@ const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a
 // Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
 const resetBtn = (p, a) => !D.app || !p.canReset ? '' : p.id === 'claude'
   ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">${r.pending ? 'Resend pending' : 'Apply'} ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>`).join('')
-  : a.resetPending ? '<small class="muted">Last reset unconfirmed — checking</small>'
+  : a.resetPending ? `<small class="muted">Last reset unconfirmed</small><button class="rs" data-a="rsclear" data-v="${esc(a.label)}">Clear</button>`
   : a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
 function accounts(p) {
   const wl = {}, ids = [];
   for (const a of p.accounts) for (const w of a.windows) if (!wl[w.id]) { wl[w.id] = w.label; ids.push(w.id); }
   ids.sort((a, b) => 'swfm'.indexOf(a) - 'swfm'.indexOf(b));
-  const anyNote = p.limits.length && p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null, anySw = D.app && p.accounts.some(a => (a.switch || []).length);
+  const anyNote = p.limits.length && p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null || p.accounts.some(a => (a.resets || []).length || a.resetPending), anySw = D.app && p.accounts.some(a => (a.switch || []).length);
   const rows = p.accounts.map(a => {
     const cells = ids.map(id => {
       const w = a.windows.find(x => x.id === id);
@@ -414,6 +414,16 @@ function openReset(pid, label, kind) {
     `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">${resend ? 'Resend' : 'Apply'} ${k ? esc(k.noun) : 'reset'}</button></div>`;
   d.showModal();
 }
+// Clear an unconfirmed Codex reset by hand: only once codex-usage shows it was not used. Cancel is the default.
+function openClear(label) {
+  if (rs) return;
+  rs = { pid: 'codex', label, clear: true, busy: false };
+  const d = $('rsdlg');
+  d.innerHTML = `<h2 id="rsT">Clear the unconfirmed reset on seat ${esc(label)}?</h2>` +
+    `<p class="warn">Only clear this after codex-usage shows the reset was not used. Clearing lets you apply a reset on this seat again.</p>` +
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Clear</button></div>`;
+  d.showModal();
+}
 function toast(text, outcome) {
   const t = $('toast'); t.textContent = text; t.dataset.outcome = outcome; t.hidden = false;
   clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, 9000);
@@ -434,11 +444,11 @@ async function doReset() {
   rs.busy = true;
   const d = $('rsdlg'), go = d.querySelector('[data-a="rsgo"]');
   for (const b of d.querySelectorAll('button')) b.disabled = true;
-  go.textContent = 'Applying…';
+  go.textContent = rs.clear ? 'Clearing…' : 'Applying…';
   let text = 'Reset failed: could not reach the app.', outcome = 'error';
   try {
     const cl = rs.pid === 'claude';      // Claude sends the kind only: the server picks the grant
-    const r = await fetch(cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
+    const r = await fetch(rs.clear ? '/api/codex-reset-clear' : cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
       body: JSON.stringify(cl ? { seat: rs.label, kind: rs.kind } : { seat: rs.label }) });
     const j = await r.json().catch(() => ({}));
     text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
@@ -492,6 +502,7 @@ function act(a, v, el) {
   if (a === 'swcancel') { sw = null; return $('swdlg').close(); }
   if (a === 'swgo') return doSwitch();
   if (a === 'reset') return openReset(el.dataset.p, v, el.dataset.k);
+  if (a === 'rsclear') return openClear(v);
   if (a === 'rscancel') return $('rsdlg').close();
   if (a === 'rsgo') return doReset();
   if (a === 'reload') return loadData();

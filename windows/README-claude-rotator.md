@@ -705,9 +705,13 @@ not shown. The script is never killed (it copies refreshed credentials back as i
 gets the answer "still applying", and every other action waits (409) until it exits (`Store.codex_reset`, selftest).
 The script mints a new claim on every run, so before it runs the seat is marked unconfirmed (`codex_pending` in the
 provider cache, with the banked count). A clear answer (`redeemed`, `no_credit`) drops the mark; anything else (a crash,
-unreadable output, the script's own error) keeps it, and the seat shows "Last reset unconfirmed — checking" with no
-Apply button (the server refuses it too) until a reading taken after the attempt carries its banked count: lower means
-it was applied, unchanged means it was not (`codex_reconcile`, run on the read after the reset and on every sample; selftest). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
+unreadable output, the script's own error) keeps it, and the seat shows "Last reset unconfirmed" with no Apply button
+(the server refuses it too). The mark clears by itself only when a reading taken after the attempt shows the banked count
+dropped, meaning it was applied (`codex_reconcile`, run on the read after the reset and on every sample). An unchanged
+count proves nothing, since the first request may still be processing, so the mark stays; its `Clear` button asks first
+(Cancel is the default) and then drops it (`POST /api/codex-reset-clear`, `Store.codex_reset_clear`), which is for after
+codex-usage shows the reset was not used. The reset column stays on show while any seat has a reset action or a pending
+state, even with nothing banked (selftest, `usage-sim.test.js`). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
 A reading over 1 h old is shown in a muted warning colour in the `Read` column, over 3 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
 

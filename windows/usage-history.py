@@ -1781,8 +1781,9 @@ def run_reset(seat, script, popen=subprocess.Popen):
 
 
 def codex_reconcile(readings):
-    """Clear a Codex seat's unconfirmed-reset marker (`codex_pending` in the provider cache) once a reading taken after the attempt ended carries its banked
-    count: lower than before -> it was applied, otherwise it was not. Until then build_provider() keeps that seat's Apply reset off."""
+    """Clear a Codex seat's unconfirmed-reset marker (`codex_pending` in the provider cache) once a reading taken after the attempt ended shows its banked
+    count DROPPED: the reset was applied. An unchanged count proves nothing (the first request may still be processing), so the mark stays until that, or
+    until the user clears it by hand (Store.codex_reset_clear) after checking codex-usage. Until then build_provider() keeps that seat's Apply reset off."""
     if not load_pcache().get("codex_pending"):
         return
     with pcache_txn() as c:
@@ -1790,10 +1791,9 @@ def codex_reconcile(readings):
         for seat, m in list(pend.items()):
             r = readings.get(seat) or {}
             end = m.get("end") or (m.get("at") or 0) + DAY   # shortcut: the app stopped mid-reset and never recorded the end; a day later any reading settles it
-            if (r.get("ts") or 0) <= end or r.get("banked") is None:
+            if (r.get("ts") or 0) <= end or r.get("banked") is None or m.get("banked") is None or r["banked"] >= m["banked"]:
                 continue
-            applied = m.get("banked") is not None and r["banked"] < m["banked"]
-            applog("codex reset: seat %s unconfirmed reset reconciled -> %s (banked %s -> %s)" % (seat, "applied" if applied else "not applied", m.get("banked"), r["banked"]))
+            applog("codex reset: seat %s unconfirmed reset reconciled -> applied (banked %s -> %s)" % (seat, m["banked"], r["banked"]))
             del pend[seat]
 
 
@@ -2006,6 +2006,17 @@ class Store:
         applog("codex reset: seat %s -> still running after %d s; waiting for it" % (seat, RESET_TIMEOUT))
         return {"outcome": "running", "text": RESET_RUNNING}
 
+    def codex_reset_clear(self, seat):
+        """Drop a seat's unconfirmed-reset mark by hand (the caller holds `refreshing`): the user checked codex-usage and the reset was not used."""
+        with self.lock:
+            with pcache_txn() as c:
+                had = (c.get("codex_pending") or {}).pop(seat, None) is not None
+            if had:
+                applog("codex reset: seat %s unconfirmed mark cleared by hand" % seat)
+                self.rebuild(time.time())
+        return {"outcome": "ok", "text": "Cleared. Apply reset is back on seat %s." % seat} if had else \
+            {"outcome": "error", "text": "Seat %s has no unconfirmed reset to clear." % seat}
+
     def codex_reset_job(self, seat, script, popen):
         """The reset itself, then the reading taken after it recorded; the unconfirmed mark dropped when the answer was clear, else given its end time."""
         res, settled, new = run_reset(seat, script, popen)
@@ -2154,12 +2165,14 @@ def make_handler(store, port):
             if not host_ok(self.headers.get("Host"), port):
                 return self.refuse(403, "forbidden")
             path = self.path.split("?")[0]
-            if path not in ("/api/refresh", "/api/codex-reset", "/api/claude-reset", "/api/switch"):
+            if path not in ("/api/refresh", "/api/codex-reset", "/api/codex-reset-clear", "/api/claude-reset", "/api/switch"):
                 return self.refuse(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
                 return self.refuse(403, "forbidden")
             if path == "/api/codex-reset":
                 return self.codex_reset()
+            if path == "/api/codex-reset-clear":
+                return self.codex_reset_clear()
             if path == "/api/claude-reset":
                 return self.claude_reset()
             if path == "/api/switch":
@@ -2204,6 +2217,24 @@ def make_handler(store, port):
             finally:
                 if not handed:
                     store.refreshing.release()
+
+        def codex_reset_clear(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                seat = json.loads(self.rfile.read(n)).get("seat") if 0 < n <= 1024 else None
+            except (ValueError, AttributeError):
+                seat = None
+            if not valid_seat(seat, codex_homes()):
+                return self.js(400, {"outcome": "error", "text": "Unknown Codex seat."})
+            if not store.refreshing.acquire(blocking=False):
+                return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
+            try:
+                self.js(200, store.codex_reset_clear(seat))
+            except Exception as e:   # shortcut: same broad catch as refresh
+                applog("codex reset clear error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"outcome": "error", "text": "Could not clear it: %s." % type(e).__name__})
+            finally:
+                store.refreshing.release()
 
         def claude_reset(self):
             try:
@@ -2818,17 +2849,21 @@ def selftest():
             assert "A" in load_pcache()["codex_pending"]
             codex_reconcile({"A": {"ts": int(pm["end"]) + 2}})                                             # no count: proves nothing
             assert "A" in load_pcache()["codex_pending"]
+            codex_reconcile({"A": {"ts": int(pm["end"]) + 2, "banked": 3}})                                # unchanged: the first request may still be processing
+            assert "A" in load_pcache()["codex_pending"] and "not applied" not in open(APPLOG).read()
             codex_reconcile({"A": {"ts": int(pm["end"]) + 2, "banked": 2}})                                # the count dropped: it was applied
             assert load_pcache()["codex_pending"] == {} and "reconciled -> applied (banked 3 -> 2)" in open(APPLOG).read()
-            # the read straight after an unclear answer settles it at once when the count is unchanged; sample() reconciles too
+            # an unchanged count after the read straight after the reset keeps the mark; only a hand clear (or a drop) lifts it; sample() reconciles too
             cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
             r_ = cst.codex_reset("A", "/x", lambda argv, **kw: Proc(b"?", 1) if "--confirm" in argv else Proc(json.dumps(rd).encode()))
-            assert "unconfirmed" in r_["text"] and load_pcache()["codex_pending"] == {} and "reconciled -> not applied (banked 2 -> 2)" in open(APPLOG).read()
+            assert "unconfirmed" in r_["text"] and "A" in load_pcache()["codex_pending"]
+            assert cst.codex_reset_clear("A") == {"outcome": "ok", "text": "Cleared. Apply reset is back on seat A."} and load_pcache()["codex_pending"] == {}
+            assert cst.codex_reset_clear("A")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
             stub = {k: globals()[k] for k in ("read_claude", "read_codex", "fetch_grok", "read_gemini", "gemini_email")}
             cst.hist = [{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 2}}}]
             cst.codex_reset("A", "/x", crash)
             try:
-                globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({"A": {"ts": int(time.time()) + 5, "w": 0.1, "banked": 2}}, {}),
+                globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({"A": {"ts": int(time.time()) + 5, "w": 0.1, "banked": 1}}, {}),
                                  fetch_grok=lambda now_: (None, None), read_gemini=lambda now_: (None, "x"), gemini_email=lambda: None)
                 sample(time.time(), True)
             finally:
@@ -3398,6 +3433,20 @@ def selftest():
             hs.refreshing.release()
             globals()["credits_enabled"] = lambda cfg=None: False
             assert hp(ok_)[0] == 404 and len(hc) == 1                                                       # the kill switch
+            # the hand clear of an unconfirmed Codex reset: the same guards, single flight with every other action
+            hs.codex_reset_clear = lambda seat: (hc.append(("clear", seat)), {"outcome": "ok", "text": "c"})[1]
+            keep_ch, cp_ = codex_homes, "/api/codex-reset-clear"
+            globals()["codex_homes"] = lambda cdir=None: ["A", "B"]
+            try:
+                assert hp({"seat": "A"}, path=cp_, app=None)[0] == 403 and hp({"seat": "A"}, host="evil.example:%d" % port, path=cp_)[0] == 403
+                assert hp({"seat": "Z"}, path=cp_)[0] == 400 and hp(b"x", path=cp_)[0] == 400 and len(hc) == 1
+                hs.refreshing.acquire()
+                assert hp({"seat": "A"}, path=cp_)[0] == 409 and len(hc) == 1
+                hs.refreshing.release()
+                st_, body_ = hp({"seat": "A"}, path=cp_)
+                assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("clear", "A") and not hs.refreshing.locked()
+            finally:
+                globals()["codex_homes"] = keep_ch
         finally:
             srv.shutdown()
             srv.server_close()
