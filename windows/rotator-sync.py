@@ -794,6 +794,16 @@ def selftest():
             rc_in = main(["--pull", "--repo", repo, "--live", os.path.join(repo, "windows"), "--state", st_in])
         check("--pull inside the clone is refused and changes nothing", rc_in == 1 and "git pull" in buf.getvalue()
               and open(os.path.join(repo, "windows", "b.py"), "rb").read() == b"print(1)\n")
+        # a relative --live reaches the pull (and so the journal) as an absolute path
+        seen_, keep_cp, cwd_ = [], cmd_pull, os.getcwd()
+        globals()["cmd_pull"] = lambda r, lv, *a: seen_.append(lv) or 0
+        os.chdir(root)
+        try:
+            main(["--pull", "--repo", repo, "--live", os.path.relpath(live, root), "--state", st_in])
+        finally:
+            os.chdir(cwd_)
+            globals()["cmd_pull"] = keep_cp
+        check("a relative --live is made absolute before it is journalled", bool(seen_) and os.path.isabs(seen_[0]) and os.path.samefile(seen_[0], live))
         # a pull that replaces a dashboard file says to restart the dashboard
         repo2, live2, st2 = (os.path.join(root, n) for n in ("repo2", "live2", "state2.json"))
         os.makedirs(repo2)
@@ -903,7 +913,8 @@ def main(argv=None):
     repo = a.repo or cfg.get("repoClone")
     if not repo:
         raise SystemExit("rotator-sync: no clone: set repoClone in rotator.local.json or pass --repo")
-    live = a.live or cfg.get("liveDir") or HERE
+    live = os.path.abspath(os.path.expanduser(a.live or cfg.get("liveDir") or HERE))   # the journal stores these paths: a relative one would be
+    # resolved against whatever folder the next --check runs in, which could judge an interrupted update finished and skip its rollback
     if inside_repo(live, repo):
         # Running from the clone itself: the files ARE the clone's working tree, so comparing them with the ref would only report whatever
         # the checkout is behind or ahead by as an "update available", and --pull would overwrite the working tree. `git pull` is the update here.

@@ -3208,6 +3208,8 @@ def selftest():
         got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, new_)["codex"]
         assert got_["A"] == {"ts": N - 30, "w": 0.7} and got_["B"] == {"ts": N - 10, "w": 0.5} and got_["C"] == rec_["codex"]["C"], got_
         assert newest_codex({"t": 1}, hist_, new_) == {"t": 1}
+        src_ = open(os.path.abspath(__file__), encoding="utf-8").read()                 # the one-shot sample (no --serve) reconciles as take() does
+        assert "hist = save(hist, newest_codex(sample(now), hist), now)" in src_
         # the maximum over every record: a later record holding an older measurement does not hide an earlier record's newer one
         got_ = newest_codex({"t": N, "codex": {"A": {"ts": N - 900, "w": 0.1}}}, [{"t": N - 50, "codex": {"A": {"ts": N - 40, "w": 0.9}}},
                                                                          {"t": N - 10, "codex": {"A": {"ts": N - 500, "w": 0.5}}}])["codex"]
@@ -4918,7 +4920,7 @@ def main():
     now = time.time()
     hist = load()
     if "--render" not in sys.argv:
-        hist = save(hist, sample(now), now)
+        hist = save(hist, newest_codex(sample(now), hist), now)     # as the server's take(): a stale cache never undoes a newer logged reading
     render(build(hist, now, load_emails(), extra=load_extra()))
 
 
