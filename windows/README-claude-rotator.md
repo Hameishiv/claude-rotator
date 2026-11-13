@@ -718,7 +718,9 @@ dropped, meaning it was applied (`codex_reconcile`, run on the read after the re
 count proves nothing, since the first request may still be processing, so the mark stays; its `Clear` button asks first
 (Cancel is the default) and then drops it (`POST /api/codex-reset-clear`, `Store.codex_reset_clear`), which is for after
 codex-usage shows the reset was not used. The reset column stays on show while any seat has a reset action or a pending
-state, even with nothing banked (selftest, `usage-sim.test.js`). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself).
+state, even with nothing banked (selftest, `usage-sim.test.js`). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself). Gemini's limits are
+shown one per quota group: a group shared by several models is "Pool 1", "Pool 2"... (no model is named), and only a group
+of exactly one model carries that model's name (`parse_gemini`, selftest).
 A reading over 1 h old is shown in a muted warning colour in the `Read` column, over 3 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
 

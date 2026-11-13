@@ -384,14 +384,15 @@ def query_ls(port, csrf):
     return None
 
 
-def gemini_slug(label):
-    """A short stable window id for a limit label; the crc suffix keeps two long labels with one prefix apart."""
-    return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:20] + "-%04x" % (zlib.crc32(label.encode("utf-8")) & 0xffff)
+def gemini_pool_id(fams):
+    """A stable, neutral window id for one quota group (its models, in order): no model name reaches the page."""
+    return "pool-%08x" % zlib.crc32("|".join(fams).encode("utf-8"))
 
 
 def parse_gemini(j, now):
     """GetUserStatus -> seat dict with one window per (remainingFraction, resetTime) group, or None when the shape is not the expected one.
-    Window id = slug of the label (the distinct model families in the group); seat["n"] maps id -> label."""
+    seat["n"] maps window id -> label. Antigravity gives a group no name of its own, so a group of several models is "Pool 1", "Pool 2"...
+    in the order it lists them, and only a group of exactly one model (a limit of that model alone) is named after it (owner, r11)."""
     from datetime import datetime
     try:
         cfgs = j["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"]
@@ -410,12 +411,12 @@ def parse_gemini(j, now):
         return None
     if not groups:
         return None
-    seat = {"ts": int(now), "n": {}}
+    seat, pools = {"ts": int(now), "n": {}}, {}
     for (frac, reset), fams in groups.items():
-        label = " + ".join(fams)
-        wid = gemini_slug(label)
+        wid = gemini_pool_id(fams)
         if wid in seat["n"] and seat[wid] >= 1 - frac:
-            continue                    # two groups with one label: keep the more used
+            continue                    # two groups of the same models: keep the more used
+        label = fams[0] if len(fams) == 1 else pools.setdefault(wid, "Pool %d" % (len(pools) + 1))
         seat["n"][wid], seat[wid], seat[wid + "r"], seat[wid + "p"] = label, round(1 - frac, 4), reset, 18000
     try:
         plan = j["userStatus"]["planStatus"]["planInfo"]["planName"]
@@ -2574,10 +2575,13 @@ def selftest():
         {"label": "Some Model (no quota)"}, cfg("Gemini Drained", None), cfg("Claude Opus 5.5 (XHigh)", 0.9)]}}}
     g = parse_gemini(gj, 1000)
     rst = 1_794_514_530                                                     # 2026-11-12T20:15:30Z
-    assert [g["n"][w] for w in g["n"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"], g["n"]
+    assert [g["n"][w] for w in g["n"]] == ["Gemini 3.8 Flash", "Pool 1", "Gemini Drained"], g["n"]           # a group of several models is a numbered pool
     f_id, c_id, d_id = g["n"]
     assert (g[f_id], g[c_id], g[d_id]) == (0.0, 0.1, 1.0) and g[c_id + "r"] == g[f_id + "r"] and g[c_id + "p"] == 18000, g
-    assert g["plan"] == "Pro" and g["ts"] == 1000 and f_id == gemini_slug("Gemini 3.8 Flash") and len(c_id) < 30
+    assert g["plan"] == "Pro" and g["ts"] == 1000 and f_id == gemini_pool_id(["Gemini 3.8 Flash"]) and c_id == gemini_pool_id(["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"])
+    assert not re.search(r"(?i)claude|gpt|sonnet|opus", json.dumps(g["n"]))                                # no model of a pool is named, not even in its id
+    gp = parse_gemini({"userStatus": {"cascadeModelConfigData": {"clientModelConfigs": [cfg("M1", 0.5), cfg("M2", 0.5), cfg("M3", 0.2), cfg("M4", 0.2), cfg("Solo", 0.7)]}}}, 1)
+    assert sorted(gp["n"].values()) == ["Pool 1", "Pool 2", "Solo"], gp["n"]
     assert abs(g[c_id + "r"] - __import__("datetime").datetime(2026, 11, 12, 20, 15, 30, tzinfo=__import__("datetime").timezone.utc).timestamp()) == 0
     gj["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"][2]["quotaInfo"]["resetTime"] = "2026-11-12T21:00:00Z"
     assert len(parse_gemini(gj, 1)["n"]) == 4                                 # a different reset is its own limit
@@ -2610,7 +2614,7 @@ def selftest():
     gh = [{"t": 1000 + 300 * i, "gemini": {"antigravity": dict(g, ts=1000 + 300 * i)}} for i in range(4)]
     gb = build(gh, 5000, {"gemini": {"antigravity": "me@x"}}, True, {"notes": {"gemini": {"antigravity": LS_OFF}}, "pnote": {"gemini": "Plan: Pro"}})["providers"][0]
     assert gb["id"] == "gemini" and gb["name"] == "Gemini" and gb["note"] == "Plan: Pro" and gb["total"] == gb["loaded"] == 1
-    assert [x["label"] for x in gb["limits"]] == ["Gemini 3.8 Flash", "Claude Opus 5.5 + Claude Sonnet 5.5 + GPT-OSS 120B", "Gemini Drained"]
+    assert [x["label"] for x in gb["limits"]] == ["Gemini 3.8 Flash", "Pool 1", "Gemini Drained"]
     assert gb["accounts"][0]["email"] == "me@x" and gb["accounts"][0]["note"] == LS_OFF and gb["accounts"][0]["readAt"] == 1900
     assert gb["limits"][1]["seats"][0]["period"] == 18000 and gb["limits"][1]["now"] == 90.0
     gh = [dict(h, t=rst - 3600 + 300 * i) for i, h in enumerate(gh)]
