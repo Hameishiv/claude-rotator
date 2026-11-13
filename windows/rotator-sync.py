@@ -14,6 +14,7 @@ Python standard library only. It only ever reads the clone: it never commits, pu
 import argparse
 import contextlib
 import fnmatch
+import hashlib
 import io
 import json
 import os
@@ -190,13 +191,30 @@ def roll_back(plan):
     return done, bad
 
 
+def sha256_file(path):
+    """The sha256 of a file's bytes, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def update_finished(j):
+    """True when the journal's update is already in place: it recorded the sha256 of every file's new content ("new": {dest: hash}) and every planned file has it
+    now. Nothing else is needed to tell: a journal is only left behind when its deletion failed, and a rewrite of it (a "complete" marker) can fail just the same."""
+    plan, new = j.get("files"), j.get("new")
+    return bool(plan) and isinstance(plan, list) and isinstance(new, dict) and all(
+        isinstance(e, list) and e and isinstance(e[0], str) and new.get(e[0]) is not None and sha256_file(e[0]) == new[e[0]] for e in plan)
+
+
 def roll_back_journal(jpath):
-    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal marked
-    "complete" belongs to an update whose every swap succeeded (only its deletion failed): it is deleted and nothing is restored."""
+    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose update
+    is already in place (every planned file has its recorded new content: only the deletion failed) is deleted and nothing is restored."""
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away
     j = load_json(jpath)
-    if j.get("complete") is True:
+    if update_finished(j):
         drop_journal(jpath)
         return None
     res = roll_back([tuple(e) for e in j.get("files") or []])
@@ -205,16 +223,20 @@ def roll_back_journal(jpath):
     return res
 
 
-def drop_journal(jpath):
-    """Delete a pull's journal; a journal that cannot be deleted is warned about, never an error (an update that is already in place must still report success)."""
-    try:
-        os.remove(jpath)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        sys.stderr.write("rotator-sync: warning: could not delete the update journal %s (%s: %s); delete it by hand%s\n" % (
-            jpath, type(e).__name__, e, "" if os.path.exists(jpath) and load_json(jpath).get("complete") is True else
-            ", or the next --check will put the files back as they were before the update"))
+def drop_journal(jpath, tries=3, pause=0.2):
+    """Delete a pull's journal, trying `tries` times (a Windows handle without share-delete is usually gone a moment later); one that still cannot be deleted is
+    warned about, never an error (an update that is already in place must still report success): the next --check deletes it once it sees the update is in place."""
+    for n in range(tries):
+        try:
+            os.remove(jpath)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            err = e
+            if n + 1 < tries:
+                time.sleep(pause)
+    sys.stderr.write("rotator-sync: warning: could not delete the update journal %s (%s: %s); delete it by hand, or the next --check will\n" % (jpath, type(err).__name__, err))
 
 
 def say_recovered(res):
@@ -271,7 +293,8 @@ def cmd_pull(repo, live, ref, state):
         lock.__exit__(None, None, None)
 
 
-RESTART_FILES = ("usage-history.py", "usage-dashboard.template.html", "usage-sim.js")
+SERVER_FILE = "usage-history.py"                  # the dashboard's server code: a running server keeps the old version until it is restarted
+PAGE_FILES = ("usage-dashboard.template.html", "usage-sim.js")      # re-read on every request: new as soon as they are replaced
 DASHBOARD_TASK = "Claude usage dashboard"           # the logon task usage-app-install.ps1 registers
 PROXY_FILES = ("claude-rotate-proxy.py", "rotator_access.py")   # the long-running proxy loads both at start
 PROXY_TASK = "Claude rotate proxy"
@@ -288,7 +311,7 @@ def pull_locked(repo, live, ref, state, jpath):
     # backup, and any failure puts back every file already swapped (and removes the ones added) before it is reported. Added files go in first,
     # so a new file a changed one imports is there before it; the plan is journaled before the first swap, so a killed pull is rolled back
     # by the next --pull or --check.
-    staged = []
+    staged, new_hash = [], {}
     try:
         for rel in missing + differing:
             dest = os.path.join(live, *rel.split("/"))
@@ -297,6 +320,7 @@ def pull_locked(repo, live, ref, state, jpath):
             with open(dest + ".tmp-sync", "wb") as fh:
                 fh.write(data)
             staged.append((rel, dest))
+            new_hash[dest] = hashlib.sha256(data).hexdigest()
     except BaseException:
         for _, dest in staged:
             with contextlib.suppress(OSError):
@@ -304,7 +328,7 @@ def pull_locked(repo, live, ref, state, jpath):
         raise
     plan = [(dest, "%s.bak-sync-%s" % (dest, stamp) if rel in differing else None) for rel, dest in staged]
     if plan:
-        write_state(jpath, {"files": plan})
+        write_state(jpath, {"files": plan, "new": new_hash})      # "new": what each file will hold, so a recovery can tell that the update is already in place
     try:
         for dest, bak in plan:
             if bak:
@@ -314,12 +338,7 @@ def pull_locked(repo, live, ref, state, jpath):
         err = None
     except OSError as e:
         err, (_, bad) = e, roll_back(plan)
-    if not err and plan:
-        # Every swap succeeded: say so in the journal (an atomic rewrite) BEFORE deleting it, so that a delete that fails cannot make the next --check roll the
-        # successful update back; recovery deletes a complete journal and restores nothing.
-        with contextlib.suppress(OSError):
-            write_state(jpath, {"files": plan, "complete": True})
-    drop_journal(jpath)
+    drop_journal(jpath)                                 # a delete that fails is a warning: recovery sees from "new" that the update is in place
     if err:
         e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
@@ -330,10 +349,11 @@ def pull_locked(repo, live, ref, state, jpath):
         print("%s %s" % ("added   " if rel in missing else "replaced", rel))
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
-    if any(rel in RESTART_FILES for rel, _ in staged):
-        # the page (template + usage-sim.js) is re-read on every request, so it is already new; only usage-history.py's server code waits for a restart
+    if any(rel == SERVER_FILE for rel, _ in staged):
         print("rotator-sync: the usage dashboard's files changed; the page is already the new one, but the running server is still the old code: restart it now so the two match "
               "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s')" % (DASHBOARD_TASK, DASHBOARD_TASK))
+    elif any(rel in PAGE_FILES for rel, _ in staged):
+        print("rotator-sync: the usage dashboard's page changed; it is already the new one, and no restart is needed")
     if any(rel in PROXY_FILES for rel, _ in staged):
         # the rotate proxy imported rotator_access.py at start; its task relaunches it within a minute once it is stopped
         print("rotator-sync: the rotate proxy's files changed; stop the running proxy (Task Scheduler task \"%s\") and it is "
@@ -551,35 +571,45 @@ def selftest():
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
         check("state reset after pull", load_json(state)["differing"] == [])
-        # a pull whose every swap succeeded but whose journal cannot be deleted: it is marked complete first, warns, and the next --check leaves the update in place
+        # a pull whose every swap succeeded but whose journal can be neither deleted nor rewritten (os.remove and os.replace on it both fail, as a Windows handle without
+        # share-delete makes them): the delete is retried, then a warning, exit 0, and the next --check sees from the journal's recorded hashes that the update is in place
         write(os.path.join(live, "b.py"), b"a local edit\n")
-        real_remove = os.remove
+        real_remove, real_replace2, removes_ = os.remove, os.replace, []
 
         def stuck_remove(path, *a, **kw):
             if path == jp_:
+                removes_.append(path)
                 raise PermissionError("in use")
             return real_remove(path, *a, **kw)
-        os.remove = stuck_remove
+
+        def stuck_replace(src, dst, *a, **kw):
+            if dst == jp_ and os.path.exists(jp_):          # the journal's first write goes through; a rewrite of it would not
+                raise PermissionError("in use")
+            return real_replace2(src, dst, *a, **kw)
+        os.remove, os.replace = stuck_remove, stuck_replace
         buf = io.StringIO()
         try:
             with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
                 rc_j = cmd_pull(repo, live, "HEAD", state)
         finally:
-            os.remove = real_remove
-        check("a journal that cannot be deleted after a successful pull is a warning, not a failure",
-              rc_j == 0 and "warning: could not delete the update journal" in buf.getvalue() and compare(repo, live, "HEAD") == ([], []))
-        check("... and it is left marked complete", os.path.exists(jp_) and load_json(jp_).get("complete") is True and load_json(jp_).get("files"))
+            os.remove, os.replace = real_remove, real_replace2
+        check("a journal that cannot be deleted after a successful pull is a warning, not a failure, and the delete was retried",
+              rc_j == 0 and "warning: could not delete the update journal" in buf.getvalue() and compare(repo, live, "HEAD") == ([], []) and len(removes_) == 3)
+        check("... and it is left in place with the hash of every new file", os.path.exists(jp_) and load_json(jp_).get("files") and load_json(jp_).get("new")
+              and "complete" not in load_json(jp_))
+        live_before_ = {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))}
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             recover(state)
-        check("the next --check deletes the complete journal and restores nothing", not os.path.exists(jp_) and buf.getvalue() == ""
-              and compare(repo, live, "HEAD") == ([], []))
+        check("the next --check deletes that journal and restores nothing", not os.path.exists(jp_) and buf.getvalue() == ""
+              and compare(repo, live, "HEAD") == ([], [])
+              and {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))} == live_before_)
         write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None]]})
         write(os.path.join(live, "stale-added.txt"), b"x\n")
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             recover(state)
-        check("... while a journal that is not complete is still rolled back", not os.path.exists(jp_) and not os.path.exists(os.path.join(live, "stale-added.txt"))
+        check("... while a journal whose files do not hold their recorded new content is still rolled back", not os.path.exists(jp_) and not os.path.exists(os.path.join(live, "stale-added.txt"))
               and "recovered an interrupted update" in buf.getvalue())
         for n in os.listdir(live):
             if ".bak-sync-" in n:
@@ -680,6 +710,26 @@ def selftest():
         with contextlib.redirect_stdout(buf):
             cmd_pull(repo2, live2, "HEAD", st2)
         check("... and one that replaces only other files does not", "restart" not in buf.getvalue())
+        # only the page (template / usage-sim.js) replaced: already live, no restart; the server file as well: restart
+        write(os.path.join(repo2, "windows", "usage-dashboard.template.html"), b"t\n")
+        write(os.path.join(repo2, "windows", "usage-sim.js"), b"s\n")
+        git(repo2, "add", "--", "windows/usage-dashboard.template.html", "windows/usage-sim.js")
+        git(repo2, "commit", "-q", "-m", "page")
+        write(os.path.join(live2, "usage-dashboard.template.html"), b"old\n")
+        write(os.path.join(live2, "usage-sim.js"), b"old\n")
+        write(os.path.join(live2, "usage-history.py"), b"new\n")
+        write(os.path.join(live2, "other.ps1"), b"o\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_3 = cmd_pull(repo2, live2, "HEAD", st2)
+        check("a pull that replaces only the page says no restart is needed and names no task", rc_3 == 0 and "no restart is needed" in buf.getvalue()
+              and DASHBOARD_TASK not in buf.getvalue() and "restart it now" not in buf.getvalue())
+        write(os.path.join(live2, "usage-dashboard.template.html"), b"old\n")
+        write(os.path.join(live2, "usage-history.py"), b"old\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_pull(repo2, live2, "HEAD", st2)
+        check("... and one that replaces the server file too says to restart", DASHBOARD_TASK in buf.getvalue() and "no restart is needed" not in buf.getvalue())
         # Idle priority: from Normal, this script lowers itself; the profile's rotator-sync function starts it at Idle and its shell
         # goes back to its own priority afterwards (a copy of the function runs a stand-in script that prints its own class)
         if os.name == "nt":

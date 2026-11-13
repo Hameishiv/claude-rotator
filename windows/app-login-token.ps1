@@ -11,16 +11,18 @@ Where it reads (the same places claude-app-rotator.ps1 and claude-app-seat-keepa
 It never refreshes a token and never writes any file. Output, one line of JSON on stdout:
   {"state":"ok","token":"...","expiresAt":<ms>,"accountUuid":"...","orgUuid":"..."}
                                                   the seat's own account's user:profile entry that expires last, unexpired
+                                                  (with -Org: of that organization only)
   {"state":"expired","expiresAt":<ms>}            every user:profile entry has expired (opening the app on that seat refreshes it)
+  {"state":"org","why":"..."}                     with -Org: the account has user:profile entries, but none for that organization
   {"state":"none","why":"..."}                    no usable app login: none saved, no owner-uuid.txt, a snapshot of another
                                                   account (its lastKnownAccountUuid is not the seat's owner: a poisoned snapshot,
                                                   the rule claude-app-seat-keepalive.ps1 applies), no user:profile entry of that
                                                   account, or unreadable
-  app-login-token.ps1 -Seat A
+  app-login-token.ps1 -Seat A [-Org <organization uuid>]
   app-login-token.ps1 -SelfTest                   no real file is read: a throwaway key and login in a temp folder
 #>
 param([string]$Seat, [string]$AppDir = (Join-Path $env:APPDATA 'Claude'), [string]$SeatRoot = (Join-Path $env:USERPROFILE '.claude-app-seats'),
-      [long]$NowMs = 0, [switch]$SelfTest)
+      [long]$NowMs = 0, [string]$Org = '', [switch]$SelfTest)
 
 $ErrorActionPreference = 'Stop'
 (Get-Process -Id $PID).PriorityClass = 'Idle'
@@ -40,7 +42,7 @@ function Unprotect-Blob([byte[]]$Key, [string]$B64) {
   [Text.Encoding]::UTF8.GetString($pt)
 }
 
-function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$NowMs) {
+function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$NowMs, [string]$Org = '') {
   if ($Seat -notmatch '^[A-Za-z0-9_-]{1,32}$') { return @{ state = 'none'; why = 'not a seat name' } }
   $dir = Join-Path $SeatRoot $Seat
   $snap = Join-Path $dir 'config.json'
@@ -63,12 +65,17 @@ function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$
   # entry keys: acct:<account>|<client>:<organization>:https://api.anthropic.com:<scopes>; only this seat's own account counts
   $prof = @(foreach ($k in $cache.Keys) {
       if ($k -notmatch '^acct:([^|]+)\|[^:]+:([^:]+):https://api\.anthropic\.com:(.+)$') { continue }
-      $acct, $org, $scopes = $Matches[1], $Matches[2], " $($Matches[3]) "
+      $acct, $eorg, $scopes = $Matches[1], $Matches[2], " $($Matches[3]) "
       if ($acct -eq $owner -and $scopes.Contains(' user:profile ') -and $cache[$k].token) {
-        [pscustomobject]@{ token = [string]$cache[$k].token; expiresAt = [double]$cache[$k].expiresAt; org = $org }
+        [pscustomobject]@{ token = [string]$cache[$k].token; expiresAt = [double]$cache[$k].expiresAt; org = $eorg }
       }
-    }) | Sort-Object expiresAt -Descending
+    })
   if (-not $prof) { return @{ state = 'none'; why = 'no user:profile login for this account' } }
+  if ($Org) {         # the seat's organization: the latest entry of ANOTHER organization must not hide this one's, or stand in for it
+    $prof = @($prof | Where-Object { $_.org -eq $Org })
+    if (-not $prof) { return @{ state = 'org'; why = 'no user:profile login for this seat''s organization' } }
+  }
+  $prof = @($prof | Sort-Object expiresAt -Descending)
   if ($prof[0].expiresAt -le $now) { return @{ state = 'expired'; expiresAt = [long]$prof[0].expiresAt } }
   return @{ state = 'ok'; token = $prof[0].token; expiresAt = [long]$prof[0].expiresAt; accountUuid = $owner; orgUuid = $prof[0].org }
 }
@@ -106,12 +113,22 @@ if ($SelfTest) {
       Set-Content -LiteralPath (Join-Path $seats 'P\config.json')
     Set-Content -LiteralPath (Join-Path $seats 'P\owner-uuid.txt') -Value 'u-p' -NoNewline      # P's snapshot is A's account: poisoned
     Copy-Item (Join-Path $seats 'A\config.json') (Join-Path $seats 'N\config.json')                 # N has no owner-uuid.txt
+    New-Item -ItemType Directory -Force -Path (Join-Path $seats 'M') | Out-Null                      # M: one account, two organizations, the other one's login expires later
+    (& $mk 'u-m' @{ 'acct:u-m|c1:o1:https://api.anthropic.com:user:profile' = @{ token = 'tM-o1'; expiresAt = $now + 1000 }; 'acct:u-m|c1:o2:https://api.anthropic.com:user:profile' = @{ token = 'tM-o2'; expiresAt = $now + 9000 } }) |
+      Set-Content -LiteralPath (Join-Path $seats 'M\config.json')
+    Set-Content -LiteralPath (Join-Path $seats 'M\owner-uuid.txt') -Value 'u-m' -NoNewline
     $hashes = { Get-ChildItem $td -Recurse -File | ForEach-Object { (Get-FileHash $_.FullName).Hash } }
     $before = & $hashes
     $a = Get-AppLogin 'A' $app $seats $now
     T "the seat's own unexpired user:profile entry that expires last, never another account's" ($a.state -eq 'ok' -and $a.token -eq 'tA-new' -and $a.expiresAt -eq $now + 9000 -and $a.accountUuid -eq 'u-a' -and $a.orgUuid -eq 'o1')
     T 'a snapshot of another account (poisoned) -> none' ((Get-AppLogin 'P' $app $seats $now).state -eq 'none')
     T 'no owner-uuid.txt -> none' ((Get-AppLogin 'N' $app $seats $now).state -eq 'none')
+    T 'with -Org, only that organization is considered' ((Get-AppLogin 'A' $app $seats $now 'o1').token -eq 'tA-new')
+    $ao = Get-AppLogin 'A' $app $seats $now 'o2'
+    T 'with -Org, an account with entries only for other organizations -> org, no token' ($ao.state -eq 'org' -and -not $ao.token)
+    $co = Get-AppLogin 'C' $app $seats $now 'o9'
+    T 'with -Org, the live config of that organization is used; another organization -> org' ($co.token -eq 'tC-live' -and (Get-AppLogin 'C' $app $seats $now 'o1').state -eq 'org')
+    T 'without -Org the latest-expiring entry of any organization wins; with -Org the seat organization does' ((Get-AppLogin 'M' $app $seats $now).token -eq 'tM-o2' -and (Get-AppLogin 'M' $app $seats $now 'o1').token -eq 'tM-o1' -and (Get-AppLogin 'M' $app $seats $now 'o1').orgUuid -eq 'o1')
     $b = Get-AppLogin 'B' $app $seats $now
     T 'every user:profile entry expired -> expired, no token' ($b.state -eq 'expired' -and -not $b.token)
     $c = Get-AppLogin 'C' $app $seats $now
@@ -128,4 +145,4 @@ if ($SelfTest) {
   exit 0
 }
 
-Get-AppLogin $Seat $AppDir $SeatRoot $NowMs | ConvertTo-Json -Compress
+Get-AppLogin $Seat $AppDir $SeatRoot $NowMs $Org | ConvertTo-Json -Compress

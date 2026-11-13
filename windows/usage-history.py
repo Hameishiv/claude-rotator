@@ -60,6 +60,65 @@ DRIFT_EVERY = 6 * 3600      # rotator-sync --check runs at most this often
 PY = ["py", "-3"]
 IDLE_PRIORITY_CLASS = 0x40
 CHILD_FLAGS = 0x08000000 | IDLE_PRIORITY_CLASS if os.name == "nt" else 0     # every child: no console window, Idle CPU priority
+BOUND_GRACE = 1.0           # run_bounded: how long output still held by a grandchild's copy of the pipe is waited for once the child itself is done
+
+
+def _kill_tree(p):
+    """Kill the process we started and everything it started: taskkill /T on Windows (by OUR pid only), the process group on POSIX (start_new_session)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10, creationflags=CHILD_FLAGS)
+        else:
+            import signal
+            os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        p.kill()
+    except OSError:
+        pass
+
+
+def run_bounded(argv, timeout, text=False, **kw):
+    """subprocess.run(argv, capture_output=True, timeout=timeout) that really returns by the deadline. On Windows run() waits for the pipes to close after
+    it kills the child, and a grandchild (npm's claude.cmd -> node) holding a copy of the pipe keeps them open. Here the output is read by threads and
+    never waited for beyond the deadline: on a timeout the tree of OUR pid is killed and subprocess.TimeoutExpired raised; a child that finished but whose
+    grandchild still holds the pipe returns what was read so far after BOUND_GRACE s. -> CompletedProcess (str output with text=True)."""
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name != "nt", **kw)
+    bufs = [[], []]
+
+    def pump(f, buf):
+        try:
+            while True:
+                b = f.read1(65536)
+                if not b:
+                    return
+                buf.append(b)
+        except (OSError, ValueError):
+            pass
+    ts = [threading.Thread(target=pump, args=(f, b), daemon=True) for f, b in zip((p.stdout, p.stderr), bufs)]
+    for t in ts:
+        t.start()
+    timed_out = False
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(p)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    end = time.monotonic() + BOUND_GRACE
+    for t in ts:
+        t.join(max(0.0, end - time.monotonic()))     # a still-blocked reader is abandoned (daemon thread), never joined unbounded or closed
+    out, err = b"".join(bufs[0]), b"".join(bufs[1])
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout, out, err)
+    if text:
+        out, err = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    return subprocess.CompletedProcess(argv, p.returncode, out, err)
 
 
 def _kernel32():
@@ -477,22 +536,27 @@ class PcacheError(Exception):
 
 
 def _keep_bad_pcache():
-    """One copy of an unparseable PCACHE for diagnosis, named by the file's own mtime (<name>.bad-<mtime>): the same bad file is copied once, not at every attempt."""
+    """One copy of an unparseable PCACHE for diagnosis, named by the file's own mtime (<name>.bad-<mtime>): the same bad file is copied once, not at every attempt.
+    -> the copy's path, or None when it could not be kept."""
     try:
         dst = "%s.bad-%d" % (PCACHE, int(os.stat(PCACHE).st_mtime))
         if not os.path.exists(dst):
             shutil.copy2(PCACHE, dst)
+        return dst
     except OSError:
-        pass
+        return None
 
 
 def load_pcache(strict=False):
     """The provider cache. A missing file is {}. One that exists but cannot be read or parsed is {} for a plain read (the page just shows less), but with `strict`
     (every read-modify-write: pcache_txn, pcache_merge) it raises PcacheError, after keeping a copy of an unparseable one, so the save that follows cannot
-    replace the whole cache with an empty one."""
+    replace the whole cache with an empty one. An empty (0-byte) file is {} either way: it cannot hold a pending reset claim."""
     try:
-        with open(PCACHE, encoding="utf-8") as fh:
-            c = json.load(fh)
+        with open(PCACHE, encoding="utf-8-sig") as fh:
+            text = fh.read()
+        if not text.strip():
+            return {}
+        c = json.loads(text)
         if not isinstance(c, dict):
             raise ValueError("not a JSON object")
     except FileNotFoundError:
@@ -500,9 +564,9 @@ def load_pcache(strict=False):
     except (OSError, ValueError) as e:
         if not strict:
             return {}
-        if isinstance(e, ValueError):
-            _keep_bad_pcache()
-        raise PcacheError("%s cannot be read (%s); left as it is" % (os.path.basename(PCACHE), type(e).__name__)) from e
+        kept = _keep_bad_pcache() if isinstance(e, ValueError) else None
+        raise PcacheError("%s cannot be read (%s) and was left as it is.%s Check the seats' limits first, then repair or delete the file; "
+                          "deleting it forgets pending resets." % (PCACHE, type(e).__name__, " A copy of it is %s." % kept if kept else "")) from e
     c.pop("cursor", None)                                   # Cursor folded into Grok
     (c.get("emails") or {}).pop("cursor", None)
     return c
@@ -587,7 +651,7 @@ def credits_enabled(cfg=None):
         return True
 
 
-def claude_version(now, run=subprocess.run, which=shutil.which, home=None):
+def claude_version(now, run=run_bounded, which=shutil.which, home=None):
     """The installed Claude CLI's version (the usage endpoint's user-agent must track it), from `claude --version`, kept for 6 h; CLI_FALLBACK when it will not run.
     The binary is ~/.local/bin/claude.exe (what the `claude` wrapper runs) when it exists, else whatever `claude` resolves to: the same order as Get-CliVersion in claude-cli-account.ps1."""
     if _ver[1] and now - _ver[0] < CREDITS_EVERY:
@@ -598,8 +662,7 @@ def claude_version(now, run=subprocess.run, which=shutil.which, home=None):
         if not os.path.isfile(exe):
             exe = which("claude")
         if exe:
-            r = run([exe, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
-                    creationflags=CHILD_FLAGS)
+            r = run([exe, "--version"], stdin=subprocess.DEVNULL, text=True, timeout=20, creationflags=CHILD_FLAGS)
             m = re.match(r"\s*(\d+\.\d+\.\d+)", r.stdout or "")
             v = m.group(1) if m else ""
     except (OSError, subprocess.SubprocessError):
@@ -670,16 +733,18 @@ SCOPE_HOLD = 7 * DAY        # a seat whose only token cannot read credits (a set
 NOTE_SCOPE = "Reset credits need a full Claude login (not a setup-token)"
 NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
 NOTE_PENDING = "waiting for this seat's first usage probe"
+NOTE_APP_ORG = "app login is for another organization; open the app on this seat to refresh"
 CREDITS_PENDING_RETRY = 15 * 60      # an app login whose organization is not recorded yet is asked again in 15 min, not after the 6 h read interval
-CREDITS_PENDING_TRIES = 4            # ... for this many consecutive pending reads; after that (a seat that never gets probed) it is the 6 h read interval again
+CREDITS_PENDING_TRIES = 4            # ... for this many consecutive pending reads; after that (a seat that never gets probed) it is the 6 h read interval again, unless credits_tick sees its organization recorded
 
 
-def app_login(label, run=subprocess.run):
+def app_login(label, run=run_bounded):
     """The seat's full desktop-app login, READ-ONLY, when the app saved one for the SAME account: its email matches the seat's email.txt, the
     helper took it from a snapshot pinned to the app seat's owner-uuid.txt (and only that account's entries), and its organization is the one
     the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), ("pending", None) when the login is this
     account's but the seat's organization is not recorded yet (it cannot be tied to the seat, so it is not used, and the setup-token must not be tried
-    instead: it can only be refused for its scope), or (None, None) when there is none or anything does not match. The setup-token in token.txt cannot read reset
+    instead: it can only be refused for its scope), ("org", None) when it is this account's but has no entry for the seat's organization (the same:
+    never used, never the setup-token, but not retried soon, since the probe cannot change it), or (None, None) when there is none or anything does not match. The setup-token in token.txt cannot read reset
     credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
     prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored.
     The two cheap identity files are checked BEFORE the helper runs, so nothing is decrypted that could not be used: no owner-uuid.txt means no login can be tied
@@ -698,8 +763,8 @@ def app_login(label, run=subprocess.run):
     if not org:
         return "pending", None          # this account's own login, its organization not recorded yet: wait for the probe to record it, decrypting nothing meanwhile
     try:
-        r = run(["pwsh", "-NoProfile", "-NonInteractive", "-File", os.path.join(HERE, "app-login-token.ps1"), "-Seat", label], stdin=subprocess.DEVNULL,
-                capture_output=True, timeout=60, creationflags=CHILD_FLAGS)
+        r = run(["pwsh", "-NoProfile", "-NonInteractive", "-File", os.path.join(HERE, "app-login-token.ps1"), "-Seat", label, "-Org", org], stdin=subprocess.DEVNULL,
+                timeout=60, creationflags=CHILD_FLAGS)
         j = json.loads(r.stdout.decode("utf-8", "replace"))
     except (OSError, subprocess.SubprocessError, ValueError):
         return None, None
@@ -707,18 +772,20 @@ def app_login(label, run=subprocess.run):
         if j.get("accountUuid") != owner:
             return None, None           # another account's login: never used
         if str(j.get("orgUuid") or "").lower() != org.lower():
-            return None, None
+            return "org", None
         return "ok", j["token"]
+    if isinstance(j, dict) and j.get("state") == "org":       # the helper looked only at the seat's organization and found no entry for it
+        return "org", None
     return ("expired", None) if isinstance(j, dict) and j.get("state") == "expired" else (None, None)
 
 
 def seat_token(label, login=app_login):
     """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so, and so does one whose
-    seat organization is not known yet ("pending": no fallback to token.txt, which cannot read credits and would only earn a week-long scope hold)."""
+    seat organization is not known yet ("pending") or has no entry for it ("org"): no fallback to token.txt for those, which cannot read credits and would only earn a week-long scope hold."""
     st, tok = login(label)
     if st == "ok":
         return tok, None
-    if st in ("expired", "pending"):
+    if st in ("expired", "pending", "org"):
         return None, st
     return _read(os.path.join(ROOT, label, "token.txt")) or None, None
 
@@ -731,10 +798,10 @@ def token_seats():
 def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
     """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "scope" (403: the token cannot read credits, a
     setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "pending" (it has an app login but the seat's organization is
-    not recorded yet: nothing is sent), "none" (no token), "fail". The seat's full app login is used when it has one (seat_token). The token stays in
+    not recorded yet: nothing is sent), "org" (its app login has no entry for the seat's organization: nothing is sent), "none" (no token), "fail". The seat's full app login is used when it has one (seat_token). The token stays in
     this function: never logged, stored or returned."""
     tok, why = seat_token(label, login)
-    if why in ("expired", "pending"):
+    if why in ("expired", "pending", "org"):
         return why, None
     if not tok:
         return "none", None
@@ -759,6 +826,7 @@ def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
 RESET_KINDS = ("fable", "full", "weekly", "session")      # the kinds the page may ask for, in button order; "other" grants get no button
 RESET_URL = "https://api.anthropic.com/api/organizations/%s/reset_rate_limits"
 CONSUME_TIMEOUT = 25
+SEND_SETTLE = CONSUME_TIMEOUT + 5      # s after a send's stamp by which it has either landed or failed (the POST's own timeout, plus a margin)
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
@@ -777,17 +845,16 @@ def spend_grant(cache, seat, gid, now, prev_send=None):
     """Take one reset off grant `gid` in the provider cache's reading of `seat`, dropping the grant at 0: a confirmed claim spent it, and the next read (which
     replaces the grants) may be refused by a hold. Without this the spent grant stays offered with its old count, and the next Apply would mint a new request id for it.
     `prev_send` is given for an `alreadyRedeemed` answer: the claim landed on an EARLIER send than the one just answered, so it is the time of the latest send before
-    that one (the claim's `sentAt` as it stood before this send; `at` for a claim saved without one). A reading whose ts is strictly greater than it was taken after
-    a send that could have landed, so it already shows the spend and is left as it is. A reading at or before it may predate the landing (the claim's `at` is stamped
-    once, at creation: an earlier send that was lost, then a reading, then the send that landed), so it is decremented. A tie is decremented too: taking one grant too
-    many off a reading is repaired by the next read, leaving a spent grant on offer is not. A fresh `redeemed` passes none: the spend just happened.
+    that one (the claim's `sentAt` as it stood before this send; `at` for a claim saved without one). Only a reading taken more than SEND_SETTLE s after it can be trusted
+    to show the spend already, and is left as it is; any other (one taken while that send was in flight, or landing slowly, or before it) is decremented. Taking one
+    grant too many off a reading is repaired by the next read, leaving a spent grant on offer is not. A fresh `redeemed` passes none: the spend just happened.
     The reading's `nextId` (the grant its gate in usable_grants requires) goes with a grant that is dropped: left naming it, every other grant of the reading
     would read as unusable until the next read. It moves to the grant the gate would pick next, the usable one that expires soonest (none last), and is
     dropped when no usable grant is left."""
     e = (cache.get("credits") or {}).get(seat)
     if not isinstance(e, dict):
         return
-    if isinstance(prev_send, (int, float)) and (e.get("ts") or 0) > prev_send:
+    if isinstance(prev_send, (int, float)) and (e.get("ts") or 0) > prev_send + SEND_SETTLE:
         return
     e["grants"] = [dict(g, left=g["left"] - 1) if g.get("id") == gid else g for g in e.get("grants") or []]
     e["grants"] = [g for g in e["grants"] if g.get("id") != gid or g["left"] > 0]
@@ -819,8 +886,8 @@ def consume_reset(label, kind, gid, rid, fetch, ver=None, login=app_login):
     call was turned away before it reached the claim: it settles a new claim, but says nothing about an earlier unconfirmed one with the same `rid`. The
     token stays in this function: never logged, stored or returned."""
     (tok, why), org, name = seat_token(label, login), claude_org(label), CREDIT_KINDS[kind]
-    if why == "expired":
-        return {"outcome": "error", "text": "Seat %s: %s." % (label, NOTE_APP_EXPIRED)}, None
+    if why in ("expired", "org"):
+        return {"outcome": "error", "text": "Seat %s: %s." % (label, NOTE_APP_EXPIRED if why == "expired" else NOTE_APP_ORG)}, None
     if not tok or not org:
         return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh, then try again." % label}, None
     req = urllib.request.Request(RESET_URL % org, method="POST", data=json.dumps({"program": "cedar_ember", "grant_id": gid, "request_id": rid}).encode("utf-8"),
@@ -1217,6 +1284,8 @@ def build(hist, now, emails=None, app=False, extra=None):
     d = extra.get("drift")
     if d and d.get("differing"):
         out["drift"] = {"n": len(d["differing"]), "names": [str(x) for x in d["differing"]], "checked": int(_f(d.get("checked")) or 0) or None}
+    if isinstance(extra.get("pcacheError"), str) and extra["pcacheError"]:
+        out["pcacheError"] = extra["pcacheError"]
     return out
 
 
@@ -1313,7 +1382,11 @@ def pending_claims(c):
 
 def load_extra():
     """What build() takes besides history and emails: account/provider notes from the provider cache, the rotator drift file."""
-    c, drift = load_pcache(), None
+    drift, perr = None, None
+    try:
+        c = load_pcache(strict=True)
+    except PcacheError as e:                # the page shows why, and holds back every button that would write it
+        c, perr = load_pcache(), str(e)
     plans, pairs = codex_measure()
     try:
         with open(os.path.join(ROOT, ".rotator-drift.json"), encoding="utf-8-sig") as fh:
@@ -1322,7 +1395,7 @@ def load_extra():
         pass
     return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claims": pending_claims(c), "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs},
-            "codexPending": sorted(c.get("codex_pending") or {}), "codexRefresh": codex_usage_argv() is not None}
+            "codexPending": sorted(c.get("codex_pending") or {}), "codexRefresh": codex_usage_argv() is not None, "pcacheError": perr}
 
 
 LOCK_WAIT = 30                      # s: how long a writer waits for the history or provider-cache lock
@@ -2169,9 +2242,7 @@ class Store:
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if e.get("gen") != gen:
-                if e.get("note") == NOTE_PENDING:
-                    e.pop("note", None)                 # this read is dropped, and the one that owns the entry sets its own note: a pending one must not outlive it
-                return "stale"                          # a read started after this one owns the seat's entry: this answer is older, dropped
+                return "stale"                          # a read started after this one owns the seat's entry: this answer is older, dropped; the entry (its notes too) is left to that read
             if state != "pending":
                 e.pop("pend", None)                     # the run of pending reads is over
             if state == "ok":
@@ -2184,29 +2255,39 @@ class Store:
                 e["note"] = {"rl": "rate limited", "auth": "sign-in needed", "scope": NOTE_SCOPE}[state]
             elif state == "expired":
                 e["note"] = NOTE_APP_EXPIRED
+            elif state == "org":
+                e["note"] = NOTE_APP_ORG                # no hold and no short retry: the ordinary interval re-reads it (the login may be refreshed meanwhile)
             elif state == "pending":
                 # No hold, but not the 6 h wait either: the organization is recorded by the seat's next usage probe (the rotator's own, or the dashboard's Refresh,
-                # which runs claude-cli-account.ps1 --status). Refresh does not read credits itself: the sampler's credits_tick does, once `next` is due.
-                # After CREDITS_PENDING_TRIES in a row the seat is asked at the ordinary interval again (`next` was claimed at that above): it is not being probed.
+                # which runs claude-cli-account.ps1 --status). Refresh does not read credits itself: the sampler's credits_tick does, once `next` is due or the organization is recorded.
+                # After CREDITS_PENDING_TRIES in a row the seat is asked at the ordinary interval again (`next` was claimed at that above): it is not being probed (credits_tick still reads it early once its organization is recorded).
                 e["pend"] = (e["pend"] if isinstance(e.get("pend"), int) else 0) + 1
                 if e["pend"] < CREDITS_PENDING_TRIES:
                     e["next"] = int(now + CREDITS_PENDING_RETRY)
                 e["note"] = NOTE_PENDING
-            elif e.get("note") == NOTE_PENDING:
+            elif e.get("note") in (NOTE_PENDING, NOTE_APP_ORG):
                 e.pop("note", None)                     # "none" / "fail": the organization is no longer what is being waited for
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
-        """The sampler's share: at most ONE seat per tick, the one whose next read is oldest and due; seats without a token file are not read. Off with claudeResetCredits:false."""
+        """The sampler's share: at most ONE seat per tick, the one whose next read is oldest and due; seats without a token file are not read. A seat whose entry
+        says it is waiting for its organization (NOTE_PENDING) is due as soon as that is recorded (a cheap file check), whatever is left of its back-off; only a hold
+        still holds it. Off with claudeResetCredits:false."""
         if not credits_enabled(cfg):
             return None
         with self.lock:
             cr = load_pcache().get("credits") or {}
-        due = sorted((max((cr.get(l) or {}).get("next") or 0, (cr.get(l) or {}).get("hold") or 0), l)
-                     for l in (token_seats() if labels is None else labels))
+
+        def due_at(l):
+            e = cr.get(l) or {}
+            if e.get("note") == NOTE_PENDING and claude_org(l):
+                return e.get("hold") or 0, l, True
+            return max(e.get("next") or 0, e.get("hold") or 0), l, False
+        due = sorted(due_at(l) for l in (token_seats() if labels is None else labels))
         if not due or due[0][0] > now:
             return None
-        return due[0][1], self.credits_read(due[0][1], now, fetch)
+        at, label, early = due[0]
+        return label, self.credits_read(label, now, fetch, force=early)
 
     def rebuild(self, now):
         self.blob = build(self.hist, now, load_emails(), True, load_extra())
@@ -2339,14 +2420,14 @@ class Store:
         the last reading, never taken from the page. The claim (grant id + request id) is saved per seat and kind before the call and kept while the outcome
         is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
         claim that landed), so a retry can never spend a second grant. A confirmed reset also takes its grant off the cached reading at once (spend_grant; for an
-        `alreadyRedeemed` answer only when that reading is not newer than the claim's previous send: see spend_grant). `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
+        `alreadyRedeemed` answer only when that reading is not clearly newer than the claim's previous send: see spend_grant). `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
         settled meanwhile (by another window), it is refused, never a new claim. Returns {"outcome", "text"}."""
         now = time.time()
         with self.lock, pcache_txn() as cache:
             key = seat + ":" + kind
             claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict)}     # kept, whatever their age, until a resend settles them
             resend = bool((claims.get(key) or {}).get("gid"))     # an earlier, unconfirmed claim is sent again
-            prev_send = int(now)                                # the latest send before this one, for spend_grant; a first send has none, so this send's own time
+            prev_send = None                                    # the latest send before this one, for spend_grant; a first send has none (set to this send's own stamp below)
             if resend_rid is not None and not (resend and claims[key].get("id") == resend_rid):
                 return {"outcome": "error", "text": "That pending reset was already settled; reload to see the result."}
             if resend:
@@ -2360,7 +2441,9 @@ class Store:
                 if resend:
                     prev_send = old.get("sentAt", old.get("at"))
                 claims[key] = {"id": old["id"] if old and old.get("id") else (new_id or (lambda: secrets.token_urlsafe(16)))(), "gid": gs[0]["id"], "at": int(now)}
-            claims[key]["sentAt"] = int(now)                    # every send, the first and each resend, is stamped here, under this lock, before the POST
+            claims[key]["sentAt"] = sent = int(time.time())     # every send, the first and each resend, is stamped here, under this lock, just before the POST
+            if prev_send is None:
+                prev_send = sent
             cache["credits_claims"] = claims
             gid, rid = claims[key]["gid"], claims[key]["id"]
         res, settled = consume_reset(seat, kind, gid, rid, fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
@@ -2398,8 +2481,7 @@ class Store:
 def probe_claude():
     """The one live Claude read: the rotator's own --status, with no console window."""
     script = os.path.join(HERE, "claude-cli-account.ps1")
-    r = subprocess.run(["pwsh", "-NoProfile", "-File", script, "--status"], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=180, creationflags=CHILD_FLAGS)
+    r = run_bounded(["pwsh", "-NoProfile", "-File", script, "--status"], stdin=subprocess.DEVNULL, timeout=180, creationflags=CHILD_FLAGS)
     return r.returncode
 
 
@@ -2519,6 +2601,9 @@ def make_handler(store, port):
                 res = store.codex_reset(seat, script)
                 handed = res["outcome"] == "running"            # the script outlived the wait: its thread now holds the lock
                 self.js(202 if handed else 200, res)
+            except PcacheError as e:                 # the provider cache cannot be read: the message says what to do
+                applog("codex reset error: %s" % e)
+                self.js(500, {"outcome": "error", "text": str(e)})
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("codex reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
@@ -2538,6 +2623,9 @@ def make_handler(store, port):
                 return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
             try:
                 self.js(200, store.codex_reset_clear(seat))
+            except PcacheError as e:                 # the provider cache cannot be read: the message says what to do
+                applog("codex reset clear error: %s" % e)
+                self.js(500, {"outcome": "error", "text": str(e)})
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("codex reset clear error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "Could not clear it: %s." % type(e).__name__})
@@ -2559,6 +2647,9 @@ def make_handler(store, port):
                 return self.js(409, {"outcome": "error", "text": "A refresh or another reset is running; try again in a minute."})
             try:
                 self.js(200, store.claude_reset(seat, kind, resend_rid=rid) if rid is not None else store.claude_reset(seat, kind))
+            except PcacheError as e:                 # the provider cache cannot be read: the message says what to do
+                applog("claude reset error: %s" % e)
+                self.js(500, {"outcome": "error", "text": str(e)})
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
@@ -2578,6 +2669,9 @@ def make_handler(store, port):
                 return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
             try:
                 self.js(200, store.claude_reset_clear(seat, kind, rid))
+            except PcacheError as e:                 # the provider cache cannot be read: the message says what to do
+                applog("claude reset clear error: %s" % e)
+                self.js(500, {"outcome": "error", "text": str(e)})
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset clear error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "Could not clear it: %s." % type(e).__name__})
@@ -3667,6 +3761,34 @@ def selftest():
         assert claude_version(JN + 12 * CREDITS_EVERY, ok_run, lambda n: "C:/path/claude.exe", os.path.join(hd_, "none")) == "2.1.400" and vs == [["C:/path/claude.exe", "--version"]], vs
     finally:
         shutil.rmtree(hd_, ignore_errors=True)
+    # run_bounded returns by its deadline: output and exit code of a plain child, TimeoutExpired for a hung one, and on Windows even when a grandchild
+    # (an npm .cmd shim's node) keeps the pipe open after the child exited or after it was killed
+    rb_ = run_bounded([sys.executable, "-c", "print('hi')"], 20, text=True, stdin=subprocess.DEVNULL)
+    assert rb_.returncode == 0 and rb_.stdout == "hi" + os.linesep and rb_.stderr == "", rb_
+    t0_ = time.monotonic()
+    try:
+        run_bounded([sys.executable, "-c", "import time; time.sleep(30)"], 2, stdin=subprocess.DEVNULL)
+        assert False, "no timeout"
+    except subprocess.TimeoutExpired:
+        assert time.monotonic() - t0_ < 10, time.monotonic() - t0_
+    if os.name == "nt":
+        bd_ = tempfile.mkdtemp()
+        try:
+            crlf_ = chr(13) + chr(10)
+            for nm_, body_ in (("held", "echo 1.2.3" + crlf_ + "start /b ping -n 30 127.0.0.1 >nul" + crlf_), ("hung", "ping -n 30 127.0.0.1 >nul" + crlf_)):
+                with open(os.path.join(bd_, nm_ + ".cmd"), "wb") as fh_:
+                    fh_.write(("@echo off" + crlf_ + body_).encode())
+            t0_ = time.monotonic()
+            rb_ = run_bounded([os.path.join(bd_, "held.cmd")], 3, text=True, stdin=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
+            assert rb_.returncode == 0 and rb_.stdout.strip() == "1.2.3" and time.monotonic() - t0_ < 6, (rb_, time.monotonic() - t0_)     # child done, pipe still held
+            t0_ = time.monotonic()
+            try:
+                run_bounded([os.path.join(bd_, "hung.cmd")], 3, stdin=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
+                assert False, "no timeout"
+            except subprocess.TimeoutExpired:
+                assert time.monotonic() - t0_ < 6, time.monotonic() - t0_
+        finally:
+            shutil.rmtree(bd_, ignore_errors=True)
     _ver[:] = [JN + 99 * CREDITS_EVERY, "2.1.400"]                                        # pinned: the schedule below must not run the real `claude --version`
     # the schedule, against a temp seat root and provider cache
     keep_root, keep_pc, jd = ROOT, PCACHE, tempfile.mkdtemp()
@@ -3775,12 +3897,13 @@ def selftest():
                 assert app_login("E", ok_("acct-E")) == (None, None) and not runs                    # no owner file: cannot be tied to the seat, never decrypted either
                 open(os.path.join(APP_SEATS, "E", "owner-uuid.txt"), "w").write("acct-E")
                 assert app_login("A", okr) == ("ok", "tok-app") and app_login("B", ok_("acct-B")) == ("ok", "tok-app")     # email from meta.txt, or email.txt
-                assert runs[0][0][-2:] == ["-Seat", "A"] and runs[0][0][-3].endswith("app-login-token.ps1") and runs[0][1]["creationflags"] == CHILD_FLAGS
+                assert runs[0][0][-4:] == ["-Seat", "A", "-Org", ORG_] and runs[0][0][-5].endswith("app-login-token.ps1") and runs[0][1]["creationflags"] == CHILD_FLAGS
                 assert app_login("C", okr) == (None, None) and app_login("D", okr) == (None, None) and len(runs) == 2      # another account's login, or none: never asked
                 assert app_login("A", hp_(b'{"state":"expired","expiresAt":1}')) == ("expired", None)
                 assert app_login("A", hp_(b"junk")) == (None, None) and app_login("A", hp_(b'{"state":"ok","token":""}')) == (None, None)
                 assert app_login("A", ok_("acct-B")) == (None, None)                                  # the helper's account is not this seat's owner
-                assert app_login("A", ok_("acct-A", "11111111-2222-4333-8444-555555555555")) == (None, None)     # another organization than the seat's
+                assert app_login("A", ok_("acct-A", "11111111-2222-4333-8444-555555555555")) == ("org", None)     # another organization than the seat's: never used, no setup-token either
+                assert app_login("A", hp_(b'{"state":"org","why":"x"}')) == ("org", None)           # the helper found no entry for the seat's organization
                 assert app_login("A", hp_(b'{"state":"ok","token":"tok-app","expiresAt":1}')) == (None, None)    # no identity at all
                 os.remove(os.path.join(APP_SEATS, "A", "owner-uuid.txt"))
                 assert app_login("A", okr) == (None, None)                                            # an unpinned seat
@@ -3810,18 +3933,49 @@ def selftest():
         assert st.credits_read("E", t_ + 2 * CREDITS_PENDING_RETRY, fx, login=pend_) == "pending"
         ee_ = load_pcache()["credits"]["E"]
         assert ee_["pend"] == 4 and ee_["next"] == t_ + 2 * CREDITS_PENDING_RETRY + CREDITS_EVERY and ee_["note"] == NOTE_PENDING, ee_      # the 4th in a row: back to 6 h
-        # ... any other result ends the run: the counter is cleared, and a "fail" or a dropped (stale) read takes a pending note with it
+        # ... any other result ends the run: the counter is cleared, and a "fail" takes a pending note with it (a dropped, stale read touches nothing: see below)
         assert st.credits_read("E", t_ + 2 * CREDITS_PENDING_RETRY + 1, bad_, force=True, login=lambda l: ("ok", "t")) == "fail"
         ee_ = load_pcache()["credits"]["E"]
         assert "pend" not in ee_ and "note" not in ee_, ee_
         save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": NOTE_PENDING, "pend": 2}}))
         assert st.credits_read("E", t_ + 10 * CREDITS_EVERY, bad_, force=True, login=lambda l: ("ok", "t")) == "fail" and "note" not in load_pcache()["credits"]["E"]
+        # an app login with no entry for the seat's organization ("org"): nothing is sent, no setup-token fallback, no hold, no short retry, its own note, cleared by the next other result
+        org_ = lambda l: ("org", None)
+        t2_ = t_ + 20 * CREDITS_EVERY
+        n_ = len(calls)
+        assert seat_token("E", org_) == (None, "org") and read_credits("E", JN, lambda req: 1 / 0, None, org_) == ("org", None)
+        assert consume_reset("E", "full", "g1", "r1", lambda req: 1 / 0, None, org_)[0]["outcome"] == "error"
+        save_pcache(dict(load_pcache(), credits={"E": {"ts": 1}}))
+        assert st.credits_read("E", t2_, fx, force=True, login=org_) == "org" and len(calls) == n_
+        ee_ = load_pcache()["credits"]["E"]
+        assert ee_["note"] == NOTE_APP_ORG and "hold" not in ee_ and "pend" not in ee_ and ee_["next"] == t2_ + CREDITS_EVERY, ee_
+        assert st.credits_read("E", t2_ + 1, bad_, force=True, login=lambda l: ("ok", "t")) == "fail" and "note" not in load_pcache()["credits"]["E"]
+        # a seat waiting for its organization (NOTE_PENDING) is read as soon as the organization is recorded, not when its back-off ends; a hold still holds it; without
+        # the note a recorded organization changes nothing
+        t3_, ucf_ = t2_ + 30 * CREDITS_EVERY, os.path.join(jd, "E", "usage-cache.json")
+        tick_ = lambda n: st.credits_tick(n, fx, "no-such-config.json", labels=["E"])
+        far_ = t3_ + 5 * 3600
+        save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": NOTE_PENDING, "pend": 4, "next": far_}}))
+        n_ = len(calls)
+        assert tick_(t3_) is None and len(calls) == n_                                          # organization still unknown: the back-off stands
+        open(ucf_, "w").write(json.dumps({"ts": 1, "data": {"ok": True, "org": ORG_}}))
+        try:
+            save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": NOTE_PENDING, "pend": 4, "next": far_, "hold": far_}}))
+            assert tick_(t3_) is None and len(calls) == n_                                      # a hold is still respected
+            save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": NOTE_PENDING, "pend": 4, "next": far_}}))
+            assert tick_(t3_) == ("E", "ok") and len(calls) == n_ + 1 and calls[-1][1] == "Bearer secret-E"      # organization recorded: read now
+            ee_ = load_pcache()["credits"]["E"]
+            assert "note" not in ee_ and "pend" not in ee_ and ee_["next"] == t3_ + CREDITS_EVERY, ee_
+            save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "next": far_}}))
+            assert tick_(t3_ + 1) is None and len(calls) == n_ + 1                              # no pending note: the ordinary schedule
+        finally:
+            os.remove(ucf_)
         save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": NOTE_PENDING}}))
         def newer_(l):                                                                  # a later read of the seat starts while this one is in flight: this one is dropped
             with pcache_txn() as c_:
                 c_["credits"]["E"]["gen"] = c_["credits"]["E"].get("gen", 0) + 1
             return ("ok", "t")
-        assert st.credits_read("E", t_ + 11 * CREDITS_EVERY, bad_, force=True, login=newer_) == "stale" and "note" not in load_pcache()["credits"]["E"]
+        assert st.credits_read("E", t_ + 11 * CREDITS_EVERY, bad_, force=True, login=newer_) == "stale" and load_pcache()["credits"]["E"]["note"] == NOTE_PENDING      # the entry belongs to the newer read: a pending note it set is not popped
         save_pcache(dict(load_pcache(), credits={"E": {"ts": 1, "note": "rate limited"}}))
         assert st.credits_read("E", t_ + 12 * CREDITS_EVERY, bad_, force=True, login=newer_) == "stale" and load_pcache()["credits"]["E"]["note"] == "rate limited"   # another note is left alone
         assert st.credits_read("E", JN + 60 * CREDITS_EVERY + 1, fx, force=True, login=lambda l: ("ok", "secret-appE")) == "ok" and calls[-1][1] == "Bearer secret-appE"
@@ -3936,12 +4090,12 @@ def selftest():
         post.append(TimeoutError("t"))
         ks.claude_reset("A", "fable", kf, hid_)
         assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2]
-        # spend_grant, an `alreadyRedeemed` answer (prev_send given): a reading taken strictly after the claim's previous send already shows the spend and is left alone;
-        # one at (a tie) or before it may predate the landing and is decremented
+        # spend_grant, an `alreadyRedeemed` answer (prev_send given): only a reading taken more than SEND_SETTLE s after the claim's previous send already shows the spend
+        # and is left alone; one at (a tie) or before that, in particular one taken while that send was in flight, is decremented
         sgc_ = lambda **kw: {"credits": {"A": dict(ke, **kw)}}
-        for ts_, spent_ in ((KN - 10, True), (KN - 5, True), (KN - 4, False), (KN, False)):
+        for ts_, spent_ in ((KN - 10, True), (KN - 1, True), (KN, True), (KN + 1, False), (KN + 100, False)):
             c_ = sgc_(ts=ts_)
-            spend_grant(c_, "A", "g2", KN, KN - 5)
+            spend_grant(c_, "A", "g2", KN, KN - SEND_SETTLE)
             assert (not any(g["id"] == "g2" for g in c_["credits"]["A"]["grants"])) is spent_, (ts_, c_)
         c_ = sgc_(ts=KN - 10)
         spend_grant(c_, "A", "g2", KN)                                                               # a fresh `redeemed` (no prev_send) always decrements, whatever the reading's age
@@ -3960,14 +4114,15 @@ def selftest():
         spend_grant(c_, "A", "g2", KN)
         assert c_["credits"]["A"]["nextId"] == "g1"                                                  # another grant's spend leaves the next grant alone
         # ... and through claude_reset (a hold keeps the follow-up read from replacing the grants): an alreadyRedeemed resend spends only an older reading
-        for ts_, left_ in ((KN - 200, []), (KN - 100, []), (KN - 99, [1]), (KN, [1])):                 # a claim saved without sentAt falls back to `at`
+        for ts_, left_ in ((KN - 200, []), (KN - 100, []), (KN - 90, []), (KN - 70, []), (KN - 69, [1]), (KN, [1])):      # a claim saved without sentAt falls back to `at`; KN-90 was taken in flight
             save_pcache({"credits": {"A": dict(ke, ts=ts_, hold=hold_)}, "credits_claims": {"A:full": {"id": "ridN", "gid": "g2", "at": KN - 100}}})
             post.append((200, {"result": "already_used"}))
             assert ks.claude_reset("A", "full", kf, hid_)["outcome"] == "alreadyRedeemed"
             assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g2"] == left_, (ts_, load_pcache()["credits"]["A"]["grants"])
         # the lost first send: sent at KN-300 (never landed), a reading at KN-200 still lists the grant, the resend at KN-100 landed (its answer lost), the third send answers
-        # already_used. `at` is still KN-300, so the old rule (reading ts >= at) skipped the decrement for the KN-200 reading, which predates the landing.
-        for ts_, left_ in ((KN - 200, []), (KN - 100, []), (KN - 99, [1])):
+        # already_used. `at` is still KN-300, so a rule on `at` would skip the decrement for the KN-200 reading, which predates the landing; one taken within SEND_SETTLE of the
+        # KN-100 send (KN-99, KN-71) may predate a slow landing, and is decremented too.
+        for ts_, left_ in ((KN - 200, []), (KN - 100, []), (KN - 99, []), (KN - 70, []), (KN - 69, [1])):
             save_pcache({"credits": {"A": dict(ke, ts=ts_, hold=hold_)}, "credits_claims": {"A:full": {"id": "ridLost", "gid": "g2", "at": KN - 300, "sentAt": KN - 100}}})
             post.append((200, {"result": "already_used"}))
             assert ks.claude_reset("A", "full", kf, hid_)["outcome"] == "alreadyRedeemed"
@@ -3978,7 +4133,7 @@ def selftest():
         t0_ = int(time.time())
         ks.claude_reset("A", "full", kf, hid_)
         cl_ = load_pcache()["credits_claims"]["A:full"]
-        assert t0_ <= cl_["sentAt"] <= int(time.time()) and cl_["at"] == cl_["sentAt"], cl_
+        assert t0_ <= cl_["sentAt"] <= int(time.time()) and cl_["at"] <= cl_["sentAt"], cl_
         save_pcache(dict(load_pcache(), credits_claims={"A:full": dict(cl_, at=KN - 300, sentAt=KN - 200)}))
         post.append(TimeoutError("t"))
         ks.claude_reset("A", "full", kf, hid_)
@@ -4134,6 +4289,38 @@ def selftest():
             copies_ = glob.glob(PCACHE + ".bad-*")
             assert len(copies_) == 1 and open(copies_[0], "rb").read() == bad_, copies_            # the same bad file is copied once
             os.remove(copies_[0])
+        # the error says which file, where the copy is and what to do; an empty file (or one that is only a BOM / whitespace) is {} even strictly, and a BOM is skipped
+        with open(PCACHE, "wb") as fh_:
+            fh_.write(b"{broken")
+        try:
+            load_pcache(strict=True)
+            raise AssertionError("no PcacheError")
+        except PcacheError as e_:
+            m_ = str(e_)
+            assert PCACHE in m_ and PCACHE + ".bad-" in m_ and "check the seats' limits first" in m_.lower() and "deleting it forgets pending resets" in m_, m_
+        for glob_ in glob.glob(PCACHE + ".bad-*"):
+            os.remove(glob_)
+        bom_ = bytes.fromhex("efbbbf")
+        for empty_ in (b"", b"  " + bytes([10]), bom_):
+            with open(PCACHE, "wb") as fh_:
+                fh_.write(empty_)
+            assert load_pcache(strict=True) == {} and load_pcache() == {}
+            with pcache_txn() as c_:
+                c_["drift_run"] = 3
+            assert load_pcache() == {"drift_run": 3} and not glob.glob(PCACHE + ".bad-*")
+        with open(PCACHE, "wb") as fh_:
+            fh_.write(bom_ + b'{"drift_run": 4}')
+        assert load_pcache(strict=True) == {"drift_run": 4}
+        # load_extra / build: an unreadable cache is reported to the page (pcacheError), a readable one is not
+        with open(PCACHE, "wb") as fh_:
+            fh_.write(b"[1]")
+        ex_ = load_extra()
+        assert "cannot be read" in ex_["pcacheError"] and build([], 5, {}, False, ex_)["pcacheError"] == ex_["pcacheError"]
+        for glob_ in glob.glob(PCACHE + ".bad-*"):
+            os.remove(glob_)
+        with open(PCACHE, "w") as fh_:
+            fh_.write("{}")
+        assert load_extra()["pcacheError"] is None and "pcacheError" not in build([], 5, {}, False, load_extra())
         shutil.rmtree(rd_, ignore_errors=True)
         os.remove(PCACHE)
         assert load_pcache(strict=True) == {}
@@ -4219,6 +4406,21 @@ def selftest():
             while hs.refreshing.locked() and time.time() < end_:
                 time.sleep(0.02)
             assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("cclear", "A", "fable", "rid1") and not hs.refreshing.locked()
+            # an unreadable provider cache: the reset and clear handlers answer 500 with the PcacheError's message (what to do), not just the exception type
+            def boom_(*args, **kw):
+                raise PcacheError("MSG-FROM-PCACHE")
+            hs.claude_reset, hs.claude_reset_clear, hs.codex_reset_clear = boom_, boom_, boom_
+            globals()["credits_enabled"] = lambda cfg=None: True
+            globals()["codex_homes"] = lambda cdir=None: ["A", "B"]
+            try:
+                for path_, body__ in (("/api/claude-reset", ok_), (cc_, okc_), ("/api/codex-reset-clear", {"seat": "A"})):
+                    st_, body_ = hp(body__, path=path_)
+                    end_ = time.time() + 5
+                    while hs.refreshing.locked() and time.time() < end_:
+                        time.sleep(0.02)
+                    assert st_ == 500 and json.loads(body_) == {"outcome": "error", "text": "MSG-FROM-PCACHE"} and not hs.refreshing.locked(), (path_, st_, body_)
+            finally:
+                globals()["codex_homes"] = keep_ch
         finally:
             srv.shutdown()
             srv.server_close()

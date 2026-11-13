@@ -295,6 +295,41 @@ assert.strictEqual(quotaShare(600, 600), 100);
     assert.strictEqual(sent.length, 3);
   })().catch(e => { console.error(e); process.exit(1); });
 }
+// an unreadable provider cache (D.pcacheError): a banner with the server's message, and no Apply / Resend / Clear anywhere while it is set; a 500 answer's text reaches the toast
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const bannerSrc = tpl.slice(tpl.indexOf('const pcacheBanner = '), tpl.indexOf('\nfunction driftRow('));
+  const banner = new Function('esc', bannerSrc + '\nreturn pcacheBanner;')(esc);
+  const html = banner('usage-cache.json <b> cannot be read. Check the seats limits first.');
+  assert.ok(html.includes('role="alert"') && html.includes('usage-cache.json &lt;b> cannot be read. Check the seats limits first.') && !html.includes('<b>'), html);
+  assert.ok(tpl.includes("(D.pcacheError ? pcacheBanner(D.pcacheError) : '')"));
+  const btnSrc = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction accounts('));
+  const mk = D => new Function('D', 'esc', 'QUOTA_RESET_KINDS', btnSrc + '\nreturn resetBtn;')(D, s => String(s), QUOTA_RESET_KINDS);
+  const cl = { id: 'claude', canReset: true }, cx = { id: 'codex', canReset: true };
+  const acc = { label: 'A', banked: 2, resetPending: true, resets: [{ kind: 'full', pending: true, rid: 'r' }, { kind: 'fable', left: 1, endsAt: null }] };
+  assert.ok(mk({ app: true })(cl, acc).includes('Resend pending') && mk({ app: true })(cx, acc).includes('rsclear'));      // without the error: the buttons are there
+  assert.strictEqual(mk({ app: true, pcacheError: 'x' })(cl, acc), '');
+  assert.strictEqual(mk({ app: true, pcacheError: 'x' })(cx, acc), '');
+  // the dialogs do not open either (a stale button, or a click already in flight)
+  const dlgSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
+  const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
+  const D = { now: 1000, pcacheError: 'x', providers: [{ id: 'claude', accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true, rid: 'r' }] }] }] };
+  const f = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', dlgSrc + '\nreturn { openReset, openClear };')(D, () => dlg, s => String(s), {}, String, String, QUOTA_RESET_KINDS);
+  f.openReset('claude', 'A', 'full'); f.openClear('A', 'claude', 'full');
+  assert.strictEqual(dlg.opened, 0);
+  delete D.pcacheError;
+  f.openClear('A', 'claude', 'full');
+  assert.strictEqual(dlg.opened, 1);
+  // the server's 500 body (the PcacheError message) is what the toast shows
+  const doSrc = tpl.slice(tpl.indexOf('async function doReset() {'), tpl.indexOf('\n// The rotator actions'));
+  const toasts = [], dlg2 = Object.assign(dlg, { close() {}, querySelector: () => ({}), querySelectorAll: () => [] });
+  const g = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', 'fetch', 'toast', 'loadData', dlgSrc + '\n' + doSrc + '\nreturn { openClear, doReset };')(
+    D, () => dlg2, s => String(s), {}, String, String, QUOTA_RESET_KINDS,
+    async () => ({ status: 500, json: async () => ({ outcome: 'error', text: 'usage-cache.json cannot be read. Check the seats limits first.' }) }), (t, o) => toasts.push([t, o]), () => {});
+  g.openClear('A', 'claude', 'full');
+  g.doReset().then(() => assert.deepStrictEqual(toasts, [['usage-cache.json cannot be read. Check the seats limits first.', 'error']])).catch(e => { console.error(e); process.exit(1); });
+}
 // the update notice speaks to an end user: what is out of date and the one command that fixes it; no --push
 {
   const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');

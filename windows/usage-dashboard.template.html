@@ -43,6 +43,7 @@ select{background:var(--panel);color:var(--ink);padding:9px 12px}
 .range button{background:var(--panel);padding:8px 14px}
 .range button.i{padding:8px 10px;background:none}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--acc);display:inline-block;flex:none}
+.pcerr{margin-top:12px;background:var(--panel);border-radius:12px;border-left:4px solid var(--warn);padding:10px 14px;font-size:14px;color:var(--ink2)}
 .drift{margin-top:12px;background:var(--panel);border-radius:12px;padding:6px 14px;font-size:14px}
 .drift summary{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;list-style:none;color:var(--ink2);padding:4px 0}
 .drift summary::-webkit-details-marker{display:none}
@@ -179,6 +180,8 @@ const ICON = {
 };
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
 
+// The provider cache cannot be read: say why (the server's message names the file and what to do); the reset buttons are held back meanwhile (resetBtn, openReset, openClear).
+const pcacheBanner = m => `<div class="pcerr" role="alert">${esc(m)}</div>`;
 function driftRow(d) {
   return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Update available from GitHub (${d.n} file${d.n === 1 ? '' : 's'} differ${d.n === 1 ? 's' : ''})</span>` +
     `<span class="dl">${d.checked ? `<span>Checked ${esc(ago(d.checked))}</span>` : ''}<b>Details</b></span></summary><div class="dd">` +
@@ -274,7 +277,7 @@ const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 108
 const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
 const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a.bankedNote || ''].filter(Boolean).join(' · '); return t ? ` title="${esc(t)}"` : ''; };
 // Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
-const resetBtn = (p, a) => !D.app || !p.canReset ? '' : p.id === 'claude'
+const resetBtn = (p, a) => !D.app || !p.canReset || D.pcacheError ? '' : p.id === 'claude'
   ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">${r.pending ? 'Resend pending' : 'Apply'} ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>` +
       (r.pending ? `<button class="rs" data-a="rsclear" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">Clear</button>` : '')).join('')
   : a.resetPending ? `<small class="muted">Last reset unconfirmed</small><button class="rs" data-a="rsclear" data-v="${esc(a.label)}">Clear</button>`
@@ -333,7 +336,7 @@ function render() {
     `<div class="row t"><h1>Agent Dashboard</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails">${ico('eye')}${ui.emails ? 'Hide emails' : 'Show emails'}</button>` +
     (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh'}</button>` : '') +
-    `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
+    `</div></div>` + (D.pcacheError ? pcacheBanner(D.pcacheError) : '') + (D.drift ? driftRow(D.drift) : '') +
     `<div class="msg" role="status">${esc(msg)}</div>` +
     `<div class="row tabs" role="group" aria-label="Provider"><button data-a="tab" data-v="all" aria-pressed="${ui.tab === 'all'}">${ico('grid')}All <span class="n">${tot}</span></button>` +
     ps.map(p => `<button data-a="tab" data-v="${esc(p.id)}" aria-pressed="${ui.tab === p.id}" style="--acc:var(--c-${esc(p.id)})"><span class="dot"></span>${esc(p.name)} <span class="n">${p.total}</span></button>`).join('') + `</div>` +
@@ -391,7 +394,7 @@ async function refreshAll() {
 let rs = null;   // the reset dialog's seat: {pid, label, kind (Claude only), busy}
 function openReset(pid, label, kind) {
   const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label);
-  if (!a || rs) return;
+  if (!a || rs || D.pcacheError) return;
   const win = id => a.windows.find(x => x.id === id), w = win('w'), s = win('s');
   const used = x => x ? Math.round(x.used * 100) + '%' : '–';
   const k = pid === 'claude' ? QUOTA_RESET_KINDS[kind] : null, r = k && (a.resets || []).find(x => x.kind === kind);
@@ -418,7 +421,7 @@ function openReset(pid, label, kind) {
 // Clear an unconfirmed reset by hand: Codex only once codex-usage shows it was not used; Claude (a pending claim that never settles) only once the seat's
 // limit shows it was not used. Cancel is the default. A Claude clear names the claim it showed, so a claim replaced meanwhile is refused, not dropped.
 function openClear(label, pid, kind) {
-  if (rs) return;
+  if (rs || D.pcacheError) return;
   const cl = pid === 'claude', k = cl && QUOTA_RESET_KINDS[kind];
   if (cl && !k) return;
   const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label), r = cl && a && (a.resets || []).find(x => x.kind === kind);
