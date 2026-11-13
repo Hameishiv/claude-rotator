@@ -955,15 +955,8 @@ function Invoke-CheckRotateCore {
   # first eligible seat in label order. Do not mark those seats disabled. Do not touch a seat the
   # desktop-app identity rule already excludes. One pick, no second wave of probes.
   if (-not $win -and $capped -eq 'access') {
-    $appSeat = Get-AppSeatLabel
-    $ranked = @(Rank-Accounts $false $false)
-    $pick = @($ranked | Where-Object {
-      $_.access -eq 'unknown' -and $_.label -ne $act -and -not ($appSeat -and ($_.label -ieq $appSeat)) -and -not (Read-AccessDisabled $_.label)
-    } | Sort-Object label) | Select-Object -First 1
-    if ($pick) {
-      $win = [pscustomobject]@{ label = $pick.label; s5 = 0; w7 = 0; fable = $null; usageUnknown = $true }
-      Write-RotateLog "fallback '$($pick.label)' with usage unknown (network); not marked disabled" DarkYellow
-    }
+    $win = Select-RotationTarget $sessBar -UnknownExcept $act
+    if ($win) { Write-RotateLog "fallback '$($win.label)' with usage unknown (network); not marked disabled" DarkYellow }
   }
   if (-not $win) {
     # Never rotate onto a fable-capped seat to escape this, and never onto one that would
@@ -1029,7 +1022,22 @@ function Invoke-EnsureCliSeat {
 # enough to look broken, and long enough to burn several more points at ~2%/min. Fable is only
 # needed to REJECT a capped target, so buy it one candidate at a time — normally exactly one.
 function Select-RotationTarget {
-  param([int]$Bar)
+  param([int]$Bar, [string]$UnknownExcept)
+  if ($PSBoundParameters.ContainsKey('UnknownExcept')) {
+    # The access-refusal fallback: usage unknown (network), so no session bar, but every other exclusion
+    # still holds - the active seat, the desktop-app seat, a seat marked disabled, and a seat whose cached
+    # Fable reading says rejected (cache only: the network is what failed, so no probe).
+    $appSeat = Get-AppSeatLabel
+    $unknown = @(Rank-Accounts $false $false | Where-Object {
+      $_.access -eq 'unknown' -and $_.label -ne $UnknownExcept -and -not ($appSeat -and ($_.label -ieq $appSeat)) -and -not (Read-AccessDisabled $_.label)
+    } | Sort-Object label)
+    foreach ($c in $unknown) {
+      $fu = Get-UsageCached $c.label $false 'fable' '-fable' $true
+      if ($fu.ok -and $fu.oi7_stat -eq 'rejected') { continue }       # Gate C needs Fable
+      return [pscustomobject]@{ label = $c.label; s5 = 0; w7 = 0; fable = $null; usageUnknown = $true }
+    }
+    return $null
+  }
   $viable = @(Rank-Accounts $true $false | Where-Object {
                 $_.usable -and ([int][math]::Round($_.s5 * 100)) -lt $Bar })
   if (-not $viable) { return $null }

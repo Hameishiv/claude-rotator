@@ -703,6 +703,32 @@ $resSrc = Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'claude-res
 Check 'resume script emits the line Ping-ActiveSessions counts' ($resSrc -match 'Skipped parked review \$\(\$mp\.Repo\)#') 'wording drifted between the two scripts'
 Check 'Ping-ActiveSessions counts skipped separately' (($src -match 'Skipped parked review') -and ($src -match 'skipped \$\(\$skipLines\.Count\) parked')) 'summary does not report skipped'
 
+# 12. the access-refusal fallback (usage unknown) goes through Select-RotationTarget and keeps its exclusions,
+#     the cached Fable rejection included. The real function, loaded from the script, over stub readers.
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Select-RotationTarget' }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+$script:fbRows = @(); $script:fbFable = @{}; $script:fbDisabled = @(); $script:fbApp = $null; $script:fbFableCalls = @()
+function Rank-Accounts { param($r, $f) $script:fbRows }
+function Get-AppSeatLabel { $script:fbApp }
+function Read-AccessDisabled { param($l) if ($script:fbDisabled -contains $l) { 'marked' } }
+function Get-UsageCached { param($Label, $Refresh, $Model, $CacheSuffix, $CacheOnly)
+  $script:fbFableCalls += , @($Label, $Refresh, $CacheOnly)
+  if ($script:fbFable.ContainsKey($Label)) { [pscustomobject]@{ ok = $true; oi7_stat = $script:fbFable[$Label] } } else { [pscustomobject]@{ ok = $false } } }
+function Row([string]$l, [string]$acc = 'unknown') { [pscustomobject]@{ label = $l; usable = $false; access = $acc } }
+$script:fbRows = @((Row 'A'), (Row 'B'), (Row 'C'), (Row 'D'), (Row 'E' 'ok'))
+$script:fbApp = 'B'; $script:fbDisabled = @('C'); $script:fbFable = @{ D = 'rejected' }
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback skips the active, app, disabled and Fable-rejected seats' ($null -eq $w) "picked '$($w.label)'"
+$script:fbFable = @{ D = 'allowed' }; $script:fbFableCalls = @()
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback picks an unknown-usage seat whose Fable cache is not rejected' (($w.label -eq 'D') -and $w.usageUnknown -and $w.s5 -eq 0) "picked '$($w.label)'"
+Check 'fallback reads Fable from the cache only (no probe on a failed network)' (($script:fbFableCalls.Count -eq 1) -and -not $script:fbFableCalls[0][1] -and $script:fbFableCalls[0][2]) "calls: $($script:fbFableCalls | ForEach-Object { $_ -join '/' })"
+$script:fbRows = @((Row 'F'), (Row 'D')); $script:fbFable = @{ D = 'rejected' }
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback passes over a Fable-rejected seat to the next one' ($w.label -eq 'F') "picked '$($w.label)'"
+Check 'Invoke-CheckRotate routes the fallback through Select-RotationTarget' ($src -match 'Select-RotationTarget \$sessBar -UnknownExcept \$act') 'the fallback picks a seat itself again'
+
 Write-Host ""
 if ($fail) { Write-Host "$fail check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "all checks passed" -ForegroundColor Green
