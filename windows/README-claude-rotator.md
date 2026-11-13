@@ -690,6 +690,8 @@ when the pool runs out, with each seat refilled at its weekly reset. It reloads 
 `--render` re-renders without sampling; `--selftest` runs the checks. `--backfill [--days N]` rebuilds past history (Claude from
 `.rotate-log.txt`, Codex from the session logs) and is safe while the app runs: every write to the history file holds
 `.usage-history.jsonl.lock` (`hist_lock`), and a writer re-reads the file when another process changed it (selftest block A).
+The provider cache has its own `.usage-providers.json.lock` (`pcache_lock`). Both are OS locks on the open lock file
+(`file_lock`: `msvcrt.locking` / `fcntl.flock`), released when the holder exits, so a crash never leaves one held.
 
 The projection uses, by default, a **typical-day profile** (button `Typical` under `Rate over`): the expected %/h for
 each local hour of the day, built from the limit's whole history (up to 35 days), so nights and weekends are not

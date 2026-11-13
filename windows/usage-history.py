@@ -1163,7 +1163,7 @@ def load_extra():
             "codexPending": sorted(c.get("codex_pending") or {})}
 
 
-LOCK_WAIT, LOCK_STALE = 30, 120    # s: how long a writer waits for the history lock; a lock older than this was left by a crash
+LOCK_WAIT = 30                      # s: how long a writer waits for the history or provider-cache lock
 _SIG = None                         # HIST's (mtime, size) as this process last read or wrote it
 
 
@@ -1175,41 +1175,48 @@ def hist_sig():
         return None
 
 
-def hist_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
+def hist_lock(wait=LOCK_WAIT):
     """Cross-process lock on HIST (the app, the scheduled sample and --backfill all write it): every write holds it."""
-    return file_lock(HIST + ".lock", wait, stale)
+    return file_lock(HIST + ".lock", wait)
 
 
-def pcache_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
+def pcache_lock(wait=LOCK_WAIT):
     """Cross-process lock on PCACHE: every read-modify-write of the provider cache holds it (pcache_txn, sample)."""
-    return file_lock(PCACHE + ".lock", wait, stale)
+    return file_lock(PCACHE + ".lock", wait)
 
 
 @contextlib.contextmanager
-def file_lock(path, wait=LOCK_WAIT, stale=LOCK_STALE):
-    """A lock file created exclusively; one older than `stale` was left by a crash and is removed."""
-    end = time.time() + wait
-    while True:
-        try:
-            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-            break
-        except (FileExistsError, PermissionError):     # Windows gives PermissionError while the lock is being deleted
-            try:
-                if time.time() - os.path.getmtime(path) > stale:
-                    os.remove(path)     # shortcut: two waiters can both judge it stale; only after a crash, so not guarded
-                    continue
-            except OSError:
-                pass                    # released meanwhile, or not removable: wait as usual
-            if time.time() >= end:
-                raise TimeoutError("lock held over %d s: %s" % (wait, path))
-            time.sleep(0.1)
+def file_lock(path, wait=LOCK_WAIT):
+    """A cross-process lock the OS holds for the open lock file (msvcrt.locking on Windows, fcntl.flock elsewhere): it is released when
+    its owner exits, so a crash never leaves it held and there is no stale-lock guess. Two handles exclude each other, threads included.
+    Waits up to `wait` s, then TimeoutError. The lock file itself stays."""
+    fh = open(path, "a+b")
     try:
-        yield
-    finally:
+        end = time.time() + wait
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= end:
+                    raise TimeoutError("lock held over %d s: %s" % (wait, path))
+                time.sleep(0.1)
         try:
-            os.remove(path)
-        except OSError:
-            pass
+            yield
+        finally:
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 def _read_hist():
@@ -2474,7 +2481,7 @@ def selftest():
         finally:
             HIST, PCACHE = keep
 
-    # A: the history lock - a held lock makes the second writer wait, a stale one is removed; nothing another process wrote is lost
+    # A: the history lock - a held lock makes the second writer wait, a dead owner's is released by the OS; nothing another process wrote is lost
     with tempfile.TemporaryDirectory() as td:
         keep, HIST = HIST, os.path.join(td, "h.jsonl")
         try:
@@ -2500,22 +2507,27 @@ def selftest():
             t0 = time.time()
             got = save([], {"t": 2, "x": 2}, 1000)
             th.join()
-            assert time.time() - t0 >= 0.25 and [h["t"] for h in got] == [1, 2] and not os.path.exists(HIST + ".lock")
+            assert time.time() - t0 >= 0.25 and [h["t"] for h in got] == [1, 2]
             assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [1, 2]
-            open(HIST + ".lock", "w").close()
-            os.utime(HIST + ".lock", (time.time() - LOCK_STALE - 5,) * 2)
-            t0 = time.time()
-            with hist_lock(wait=1):
-                assert os.path.exists(HIST + ".lock")
-            assert time.time() - t0 < 0.5 and not os.path.exists(HIST + ".lock")
-            os.mkdir(HIST + ".lock")        # a stale lock that cannot be removed: the wait still ends
-            os.utime(HIST + ".lock", (time.time() - LOCK_STALE - 5,) * 2)
+            # the OS releases the lock when its owner dies: a killed holder (our own child, by its pid) frees it at once, no stale-lock wait
+            kid = subprocess.Popen([sys.executable, "-c", "import importlib.util, sys, time; s = importlib.util.spec_from_file_location('uh', sys.argv[1]); "
+                                    "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\nwith m.file_lock(sys.argv[2]):\n print('held', flush=True); time.sleep(60)",
+                                    os.path.abspath(__file__), HIST + ".lock"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
             try:
-                with hist_lock(wait=0.3):
-                    raise AssertionError("got an unremovable lock")
-            except TimeoutError:
+                assert kid.stdout.readline().strip() == b"held"
+                try:
+                    with hist_lock(wait=0.3):
+                        raise AssertionError("got a lock another process holds")
+                except TimeoutError:
+                    pass
+            finally:
+                kid.kill()
+                kid.wait(10)
+                kid.stdout.close()
+            t0 = time.time()
+            with hist_lock(wait=5):
                 pass
-            os.rmdir(HIST + ".lock")
+            assert time.time() - t0 < 2
             # a backfill rewrites the file under a Store holding an older list: its next save keeps both
             mem = load()
             raw([{"t": 0, "b": 1, "s": {}}] + mem)
@@ -2544,7 +2556,7 @@ def selftest():
                 assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [10, 11, 13, 20]
                 stub["claude"] = [{"t": 14, "b": 1, "s": {}}]
                 backfill(7)
-                assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [10, 13, 14, 20, 21] and not os.path.exists(HIST + ".lock")
+                assert [json.loads(x)["t"] for x in open(HIST, encoding="utf-8")] == [10, 13, 14, 20, 21]
             finally:
                 g["backfill_claude"], g["import_rollouts"], g["say"] = saved
         finally:
@@ -3396,7 +3408,6 @@ def selftest():
         th.join()
         pc = load_pcache()
         assert pc["credits_claims"]["B:full"]["id"] == "ridY" and pc["credits_claims"]["A:full"]["id"] == "ridX" and pc["drift_run"] == 5, pc
-        assert not os.path.exists(PCACHE + ".lock")
         # the HTTP guards, on a spare loopback port with a fake store
         hs = Store.__new__(Store)
         hs.lock, hs.refreshing, hs.blob, hc = threading.RLock(), threading.Lock(), {}, []
