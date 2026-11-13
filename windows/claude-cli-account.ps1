@@ -146,6 +146,16 @@ function Write-SeatHealth {
   } catch {}
 }
 
+# A secret's temp file is created owner-only (0600 on Linux) BEFORE the secret is written, never chmod-ed afterwards: a
+# 0644 window would let another user read it. CreateNew: a planted or stale file is never reused. Throws on any failure.
+function Write-OwnerOnly([string]$Path, [string]$Text) {
+  Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  $o = [IO.FileStreamOptions]::new(); $o.Mode = 'CreateNew'; $o.Access = 'Write'
+  if ($IsLinux) { $o.UnixCreateMode = [IO.UnixFileMode]'UserRead, UserWrite' }
+  $fs = [IO.FileStream]::new($Path, $o)
+  try { $b = [Text.UTF8Encoding]::new($false).GetBytes($Text); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+}
+
 # Write the active account's setup-token into ~/.claude/.credentials.json too, so that
 # app-spawned / desktop-app-bridged Claude Code sessions follow the switch. Those sessions
 # read this file and IGNORE CLAUDE_CODE_OAUTH_TOKEN, so the env var alone never switched them.
@@ -168,8 +178,7 @@ function Set-DiskCredential {
     $j.claudeAiOauth.expiresAt   = [int64][DateTimeOffset]::UtcNow.AddYears(10).ToUnixTimeMilliseconds()
     if ($j.claudeAiOauth.PSObject.Properties.Name -contains 'refreshToken') { $j.claudeAiOauth.refreshToken = '' }
     # Temp file + one replace: a crash mid-write must not truncate the credentials file (Grok review 2026-10-30).
-    $tmp = "$cred.tmp-$PID"; [IO.File]::WriteAllText($tmp, ($j | ConvertTo-Json -Depth 20))
-    if ($IsLinux) { & chmod 600 -- $tmp }   # LINUX-PORT: a fresh temp file lands 0644 (umask 022); keep the credentials file owner-only
+    $tmp = "$cred.tmp-$PID"; Write-OwnerOnly $tmp ($j | ConvertTo-Json -Depth 20)   # LINUX-PORT: owner-only from creation
     [IO.File]::Move($tmp, $cred, $true)
     Write-Host "  + updated ~/.claude/.credentials.json — app-spawned & desktop-bridged sessions follow too (new sessions)." -ForegroundColor DarkGreen
   } catch {
@@ -1117,8 +1126,7 @@ function Save-ProfileToken {
     Copy-Item $tf (Join-Path $dst ("token.txt.bak-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Force
   }
   New-Item -ItemType Directory -Path $dst -Force | Out-Null
-  $tmp = "$tf.tmp-$PID"; Set-Content -LiteralPath $tmp -Value $Tok -Encoding UTF8 -NoNewline
-  if ($IsLinux) { & chmod 600 -- $tmp }   # LINUX-PORT: token files stay owner-only (temp file would be 0644)
+  $tmp = "$tf.tmp-$PID"; Write-OwnerOnly $tmp $Tok   # LINUX-PORT: token files are owner-only from creation
   [IO.File]::Move($tmp, $tf, $true)
 }
 

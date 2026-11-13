@@ -340,6 +340,20 @@ $py = (Get-Content (Join-Path $PSScriptRoot 'claude-rotate-proxy.py') -Raw) + (G
 Check 'rotator has no hardcoded app-only seat' ($src -notmatch 'AppOnly|reserved app-only')
 Check 'proxy and hook do not exclude label A' ($py -notmatch '== ["'']A["'']|label == "A"')
 
+# --- a secret's temp file is created owner-only before the secret is written (UnixCreateMode on Linux), never chmod-ed after ---
+$woFn = Get-Command Write-OwnerOnly -CommandType Function -ErrorAction SilentlyContinue
+Check 'Write-OwnerOnly exists' ([bool]$woFn)
+if ($woFn) {
+  $wo = Join-Path $root 'wo.tmp'; Set-Content -LiteralPath $wo -Value 'stale'
+  Write-OwnerOnly $wo 'sk-ant-oat01-SEATX-TOKENVALUE'
+  Check 'Write-OwnerOnly writes the exact text, no BOM, over a stale file' ([IO.File]::ReadAllText($wo) -ceq 'sk-ant-oat01-SEATX-TOKENVALUE' -and [IO.File]::ReadAllBytes($wo)[0] -eq [byte][char]'s')
+  Check 'Write-OwnerOnly sets the owner-only mode at creation' ($woFn.Definition -match "UnixCreateMode = \[IO.UnixFileMode\]'UserRead, UserWrite'" -and $woFn.Definition -match "Mode = 'CreateNew'")
+}
+foreach ($fn in 'Set-DiskCredential', 'Save-ProfileToken') {
+  $d = (Get-Command $fn -CommandType Function).Definition
+  Check "$fn writes its temp secret through Write-OwnerOnly, no write-then-chmod" ($d -match 'Write-OwnerOnly \$tmp' -and $d -notmatch 'chmod')
+}
+
 # --- the claude wrapper's seat gate never blocks a credential command (every seat refused, the user adds a token) ---
 $gd = Join-Path $root 'gate'; $gh = Join-Path $gd 'home'; $ga = Join-Path $gh '.claude-cli-accounts'
 New-Item -ItemType Directory -Force -Path (Join-Path $ga 'B') | Out-Null
