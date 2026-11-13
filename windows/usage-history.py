@@ -1917,14 +1917,24 @@ def make_handler(store, port):
                     pass
             self.send(404, "not found")
 
+        def refuse(self, code, msg):
+            """Read a small request body before refusing: replying unread lets Windows abort the connection before the client sees the code."""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if 0 < n <= 1024:
+                    self.rfile.read(n)
+            except (ValueError, OSError):
+                pass
+            return self.send(code, msg)
+
         def do_POST(self):
             if not host_ok(self.headers.get("Host"), port):
-                return self.send(403, "forbidden")
+                return self.refuse(403, "forbidden")
             path = self.path.split("?")[0]
             if path not in ("/api/refresh", "/api/codex-reset", "/api/claude-reset", "/api/switch"):
-                return self.send(404, "not found")
+                return self.refuse(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
-                return self.send(403, "forbidden")
+                return self.refuse(403, "forbidden")
             if path == "/api/codex-reset":
                 return self.codex_reset()
             if path == "/api/claude-reset":
