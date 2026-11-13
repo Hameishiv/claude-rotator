@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-from rotator_access import classify_hook
+from rotator_access import HOOK_ERRORS, classify_hook
 CMD = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
        os.path.join(HERE, "claude-cli-account.ps1"), "--check-rotate", "--now", "--source", "StopFailure"]
 CREATE_NO_WINDOW, BREAKAWAY = 0x08000000, 0x01000000
@@ -112,15 +112,17 @@ def transcript_api_error(path):
             continue
         if entry.get("type") == "assistant" and entry.get("isApiErrorMessage"):
             err = entry.get("error")
-            if isinstance(err, str) and err.strip():
-                return err.strip()[:500]
-            # Some builds leave the code only in the displayed text of the API-error turn.
+            err = err.strip() if isinstance(err, str) else ""
             try:
                 text = entry["message"]["content"][0]["text"]
             except (KeyError, IndexError, TypeError):
                 text = ""
-            if isinstance(text, str):
-                return text.strip()[:500]
+            text = text.strip() if isinstance(text, str) else ""
+            # A known token says it all. Otherwise (none, or a generic one such as "unknown") the displayed text of the
+            # API-error turn is where a refusal shows, so it is read too.
+            if err in HOOK_ERRORS or not text:
+                return err[:500]
+            return ((err + " " + text) if err else text)[:500]
         return ""
     return ""
 

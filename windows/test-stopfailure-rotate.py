@@ -73,6 +73,22 @@ def test_transcript_reader():
     check("newest API error token is read", hook.transcript_api_error(path) == "oauth_org_not_allowed")
     check("should_rotate uses that token", hook.should_rotate({"transcript_path": path}) == "oauth_org_not_allowed")
     check("token text is not required to contain the secret", SECRET not in hook.transcript_api_error(path))
+    generic = {"type": "assistant", "isApiErrorMessage": True, "error": "unknown",
+               "message": {"role": "assistant", "content": [{"type": "text", "text": 'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"Your organization has disabled Claude subscription access for Claude Code"},"error_code":"oauth_org_not_allowed"}'}]}}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(generic) + "\n")
+    check("a generic error token still reads the displayed refusal", hook.should_rotate({"transcript_path": path}) == "oauth_org_not_allowed")
+    check("... also when the hook event carries the generic token", hook.should_rotate({"error": "unknown", "transcript_path": path}) == "oauth_org_not_allowed")
+    quota = dict(generic, error="rate_limit", message={"content": [{"type": "text", "text": "limit reached"}]})
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(quota) + "\n")
+    check("a known token is used as it is", hook.transcript_api_error(path) == "rate_limit")
+    with open(os.path.join(HERE, "fixtures", "access-responses.json"), encoding="utf-8") as handle:
+        refusals = [c for c in json.load(handle) if c["disabled"]]
+    for case in refusals:                       # every shared refusal fixture, shown under a generic token, rotates
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(generic, message={"content": [{"type": "text", "text": "API Error: 403 " + case["body"]}]})) + "\n")
+        check("refusal fixture under a generic token: %s" % case["body"][60:100], hook.should_rotate({"transcript_path": path}) == "oauth_org_not_allowed")
 
 
 def test_spawn_gate():
