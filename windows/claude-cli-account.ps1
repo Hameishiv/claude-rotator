@@ -388,8 +388,10 @@ function Get-UsageCached {
   if ($d.access -eq 'disabled') {
     Write-AccessDisabled $Label 403 $(if ($d.code) { [string]$d.code } else { 'oauth_org_not_allowed' })
   } elseif ($d.ok) {
-    # Only Fable clears the seat's shared refusal marker: a Haiku probe running beside a refused Fable one must not erase it.
-    if ($Model -like '*fable*') { Clear-AccessDisabled $Label }
+    # Only a Fable probe that PROVES access clears the seat's shared refusal marker: a 2xx carrying the usage headers. A Haiku probe
+    # running beside a refused Fable one, or an ok=$true 500 / unrelated 403 with no usage headers, proves nothing.
+    $proved = ([int]$d.http -ge 200 -and [int]$d.http -lt 300 -and ($d.status -or $d.s5_util -or $d.oi7_util))
+    if ($Model -like '*fable*' -and $proved) { Clear-AccessDisabled $Label }
     if ($script:UnknownProbeMemo.ContainsKey($memoKey)) { [void]$script:UnknownProbeMemo.Remove($memoKey) }
     try { @{ ts=$now; data=$d } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cf -Encoding UTF8 } catch {}
   } elseif ($HonorAccessCooldown -and $d.access -eq 'unknown') {

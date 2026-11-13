@@ -36,6 +36,9 @@ $global:ClaudeRotatorProbeOverride = {
   $plan = $script:plan[$Label]
   if (-not $plan) { $plan = 'ok' }
   if ($Model -eq 'fable') {
+    if ($plan -eq 'fable-500') {     # Probe-Usage's ok=$true for a non-2xx with no usage headers
+      return [pscustomobject]@{ label=$Label; ok=$true; access='ok'; http=500; note='http 500: api_error: Overloaded' }
+    }
     if ($plan -eq 'fable-disabled') {
       return [pscustomobject]@{ label=$Label; ok=$false; access='disabled'; http=403; code='oauth_org_not_allowed'; note='subscription disabled (403 oauth_org_not_allowed)' }
     }
@@ -234,8 +237,12 @@ $markerA = Join-Path (Join-Path $Root 'A') 'access-disabled.json'
 Write-AccessDisabled 'A' 403 'oauth_org_not_allowed'
 $null = Get-UsageCached 'A' $true 'haiku' '' $false $false
 Check 'a Haiku success leaves the refusal marker' (Test-Path $markerA)
+$script:plan['A'] = 'fable-500'
 $null = Get-UsageCached 'A' $true 'fable' '-fable' $false $false
-Check 'a Fable success clears it' (-not (Test-Path $markerA))
+Check 'a Fable ok=true that proves nothing (500, no usage headers) leaves it' (Test-Path $markerA)
+$script:plan['A'] = 'ok'
+$null = Get-UsageCached 'A' $true 'fable' '-fable' $false $false
+Check 'a Fable 2xx with usage headers clears it' (-not (Test-Path $markerA))
 
 # --- ranking rejects a Fable refusal by itself, even with no marker on disk (so --switch best skips the seat) ---
 Reset-Case
