@@ -544,6 +544,7 @@ function Sync-AppSeatFromLaptop {
   if ($env:CLAUDE_ROTATOR_SKIP_APP_SYNC -eq '1') { return }
   if ($script:AppSeatSynced) { return }; $script:AppSeatSynced = $true
   $appRoot = Join-Path $env:USERPROFILE '.claude-app-seats'
+  New-Item -ItemType Directory -Path $appRoot -Force | Out-Null     # a fresh install has none yet; .active and the sync state live here
   $act  = Join-Path $appRoot '.active'
   $conf = Join-Path $appRoot '.laptop-sync.json'
   $local = try { Get-Content (Join-Path $PSScriptRoot 'rotator.local.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }

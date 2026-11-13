@@ -156,6 +156,18 @@ New-Item -ItemType Directory -Path (Split-Path $actFile) -Force | Out-Null
 Set-Content -LiteralPath $actFile -Value 'F' -Encoding UTF8 -NoNewline
 Check 'fallback .active is F, not a hardcoded letter' ((Get-AppSeatLabel) -eq 'F') (Get-AppSeatLabel)
 
+# --- a fresh install (no ~/.claude-app-seats yet) still records the laptop's app seat from the heartbeat ---
+# `timeout` wraps every gh call in Sync-AppSeatFromLaptop; this function shadows it, so nothing reaches GitHub.
+Clear-AppIdentity
+$appRoot = Join-Path $env:USERPROFILE '.claude-app-seats'
+function timeout { <# MOCK-NO-NETWORK #> $global:LASTEXITCODE = 0; if ("$($args[3])" -like '*state=open*') { '7' } else { ConvertTo-Json -Compress @([DateTimeOffset]::UtcNow.ToString('o'), 'app-seat: C') } }
+if ((Get-Command timeout).CommandType -ne 'Function' -or (Get-Command timeout).Definition -notmatch 'MOCK-NO-NETWORK') { Write-Host 'ABORT: timeout is not the mock' -ForegroundColor Red; exit 2 }
+$env:CLAUDE_ROTATOR_SKIP_APP_SYNC = '0'; $script:AppSeatSynced = $false
+try { Sync-AppSeatFromLaptop } finally { $env:CLAUDE_ROTATOR_SKIP_APP_SYNC = '1'; Remove-Item function:timeout }
+Check 'fresh install: the heartbeat seat is written to .active' ((Test-Path (Join-Path $appRoot '.active')) -and ((Get-Content (Join-Path $appRoot '.active') -Raw).Trim() -eq 'C'))
+Check 'fresh install: the app seat resolves to C' ((Get-AppSeatLabel) -eq 'C') (Get-AppSeatLabel)
+Clear-AppIdentity
+
 # --- active B is subscription-disabled; A is the best eligible seat and must be selected ---
 Reset-Case
 Clear-AppIdentity
