@@ -748,7 +748,9 @@ keeps its `request_id` in the provider cache, so applying again retries the same
 **Switching seats from the dashboard.** In the app, each seat row has a Switch column and each provider header a button; they run the rotators next to
 `usage-history.py`, never a copy of their logic, so every rotator check (integrity gate, seat lock, VM-shared block, re-capture of the seat being left)
 still applies. `POST /api/switch` `{provider, role, seat}` (same Host and `X-Quota-App` guards, one action at a time across Refresh, the resets and the
-switches) runs, with no window and a 120 s limit:
+switches) runs, with no window. It waits up to 120 s for the rotator; one still running then is never killed (a kill mid-switch can leave a login moved
+aside but not replaced): the page is told "Still switching; the dashboard will update when it finishes.", and Refresh, the resets and the switches stay
+refused (409) until it exits, when its outcome is logged and the data rebuilt:
 
 | Button | Runs | Asks first |
 |---|---|---|

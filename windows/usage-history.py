@@ -1680,16 +1680,26 @@ def switch_outcome(rc, out):
     return {"outcome": "ok" if rc == 0 else "error", "text": head + (": " + t if t else ".")}
 
 
-def run_switch(argv, run=subprocess.run):
-    """Run one rotator call with no window and SWITCH_TIMEOUT s -> switch_outcome(); stderr only when stdout said nothing."""
+SWITCH_RUNNING = "Still switching; the dashboard will update when it finishes."
+
+
+def switch_result(p, outs):
+    """switch_outcome() for a finished rotator process and its (stdout, stderr); stderr only when stdout said nothing."""
+    out = (outs[0] or b"").decode("utf-8", "replace")
+    return switch_outcome(p.returncode, out if out.strip() else (outs[1] or b"").decode("utf-8", "replace"))
+
+
+def run_switch(argv, popen=subprocess.Popen):
+    """Start one rotator call with no window and wait up to SWITCH_TIMEOUT s -> (switch_result(), None). A rotator still running then is NEVER killed (a kill
+    mid-switch can leave a login moved aside but not replaced): -> ({"outcome": "running", ...}, the process), and the caller waits for it."""
     try:
-        r = run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=SWITCH_TIMEOUT, creationflags=0x08000000 if os.name == "nt" else 0)
-    except subprocess.TimeoutExpired:
-        return {"outcome": "error", "text": "The rotator did not finish within %d s. Check the app and the seat before trying again." % SWITCH_TIMEOUT}
+        p = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=0x08000000 if os.name == "nt" else 0)
     except (OSError, subprocess.SubprocessError) as e:
-        return {"outcome": "error", "text": "The rotator could not run: %s." % type(e).__name__}
-    out = (r.stdout or b"").decode("utf-8", "replace")
-    return switch_outcome(r.returncode, out if out.strip() else (r.stderr or b"").decode("utf-8", "replace"))
+        return {"outcome": "error", "text": "The rotator could not run: %s." % type(e).__name__}, None
+    try:
+        return switch_result(p, p.communicate(timeout=SWITCH_TIMEOUT)), None
+    except subprocess.TimeoutExpired:                    # communicate() can be called again without losing output
+        return {"outcome": "running", "text": SWITCH_RUNNING}, p
 
 
 class Store:
@@ -1798,13 +1808,36 @@ class Store:
                 self.rebuild(now)
         return res
 
-    def switch(self, provider, role, seat, run=subprocess.run, here=None):
-        """Run one rotator action (the caller holds `refreshing`), log it, and rebuild, which reads the in-use seats again so the badges move."""
-        res = run_switch(switch_argv(provider, role, seat, here), run)
-        applog("switch: %s %s%s -> %s" % (provider, role, " " + seat if seat else "", res["text"]))
+    def switch(self, provider, role, seat, popen=subprocess.Popen, here=None):
+        """Run one rotator action (the caller holds `refreshing`), log it, and rebuild, which reads the in-use seats again so the badges move. A rotator still
+        running after SWITCH_TIMEOUT s is never killed: a background thread takes over `refreshing` (other actions get 409 meanwhile), waits for it with no
+        upper bound, logs and rebuilds, then releases the lock. The result's outcome is then "running" and the caller must NOT release the lock."""
+        what = "%s %s%s" % (provider, role, " " + seat if seat else "")
+        res, p = run_switch(switch_argv(provider, role, seat, here), popen)
+        if p is None:
+            self.switch_done(what, res)
+            return res
+        applog("switch: %s -> still running after %d s (pid %s); waiting for it" % (what, SWITCH_TIMEOUT, p.pid))
+        threading.Thread(target=self.switch_wait, args=(what, p), daemon=True).start()
+        return res
+
+    def switch_wait(self, what, p):
+        """The waiter for a rotator that outlived SWITCH_TIMEOUT: its outcome, logged and rebuilt, then `refreshing` back, whatever happens."""
+        try:
+            try:
+                res = switch_result(p, p.communicate())
+            except Exception as e:   # shortcut: a broken pipe must not keep the lock
+                res = {"outcome": "error", "text": "Lost track of the rotator: %s." % type(e).__name__}
+            self.switch_done(what, res)
+        except Exception as e:   # shortcut: same broad catch as the handlers
+            applog("switch error: %s: %s" % (type(e).__name__, e))
+        finally:
+            self.refreshing.release()
+
+    def switch_done(self, what, res):
+        applog("switch: %s -> %s" % (what, res["text"]))
         with self.lock:
             self.rebuild(time.time())
-        return res
 
     def claude_reset(self, seat, kind, fetch=None, new_id=None):
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
@@ -1967,13 +2000,17 @@ def make_handler(store, port):
                 return self.js(400, {"outcome": "error", "text": "Unknown provider, role or seat."})
             if not store.refreshing.acquire(blocking=False):
                 return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
+            handed = False
             try:
-                self.js(200, store.switch(*ok))
+                res = store.switch(*ok)
+                handed = res["outcome"] == "running"            # the rotator outlived the wait: its waiter thread now holds the lock
+                self.js(202 if handed else 200, res)
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("switch error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The switch did not run: %s." % type(e).__name__})
             finally:
-                store.refreshing.release()
+                if not handed:
+                    store.refreshing.release()
 
     return H
 
@@ -2927,36 +2964,52 @@ def selftest():
         assert switch_outcome(3, "") == {"outcome": "error", "text": "Failed (exit 3)."} and switch_outcome(0, None)["text"] == "Done."
         assert len(switch_outcome(0, "y " * 300)["text"]) <= 206
         assert switch_outcome(0, "  only indented\n")["text"] == "Done: only indented"
-        # the runner: argv as given, no window, the timeout; stderr when stdout is empty; a timeout or a missing pwsh is an error, never a raise
+        # the runner: argv as given, no window, waits SWITCH_TIMEOUT; stderr when stdout is empty; a missing pwsh is an error, never a raise; a rotator
+        # that outlives the wait is handed back still running, never killed
         seen = []
 
-        class R_:
-            def __init__(self, rc, out, err=b""):
-                self.returncode, self.stdout, self.stderr = rc, out, err
+        class P_:
+            """A fake rotator process: finishes at once, or (slow) outlives every timed wait and finishes only when `go` is set. Records kill/terminate."""
+            def __init__(self, rc, out, err=b"", slow=False):
+                self.rc, self.outs, self.slow, self.go, self.calls, self.returncode, self.pid = rc, (out, err), slow, threading.Event(), [], None, 4242
 
-        def fake(argv, **kw):
-            seen.append((argv, kw))
-            return R_(0, b"Relaunched the Claude app on seat B.\r\n")
+            def communicate(self, timeout=None):
+                self.calls.append(("communicate", timeout))
+                if self.slow and timeout is not None:
+                    raise subprocess.TimeoutExpired("pwsh", timeout)
+                if self.slow:
+                    assert self.go.wait(10), "fake rotator never released"
+                self.returncode = self.rc
+                return self.outs
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def terminate(self):
+                self.calls.append("terminate")
+
+        def pop(proc):
+            return lambda argv, **kw: (seen.append((argv, kw)), proc)[1]
         a_ = switch_argv("claude", "app", "B", here)
-        assert run_switch(a_, fake) == {"outcome": "ok", "text": "Done: Relaunched the Claude app on seat B."}
-        assert seen[0][0] == a_ and seen[0][1]["timeout"] == SWITCH_TIMEOUT == 120 and seen[0][1]["capture_output"] and seen[0][1]["stdin"] == subprocess.DEVNULL
-        assert seen[0][1]["creationflags"] == (0x08000000 if os.name == "nt" else 0) and "shell" not in seen[0][1]
-        assert run_switch(a_, lambda argv, **kw: R_(1, b"  \r\n", b"pwsh: boom\r\n")) == {"outcome": "error", "text": "Failed (exit 1): pwsh: boom"}
-
-        def slow(argv, **kw):
-            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        p_ = P_(0, b"Relaunched the Claude app on seat B.\r\n")
+        assert run_switch(a_, pop(p_)) == ({"outcome": "ok", "text": "Done: Relaunched the Claude app on seat B."}, None) and p_.calls == [("communicate", SWITCH_TIMEOUT)]
+        assert seen[0][0] == a_ and SWITCH_TIMEOUT == 120 and seen[0][1]["stdin"] == subprocess.DEVNULL and seen[0][1]["stdout"] == seen[0][1]["stderr"] == subprocess.PIPE
+        assert seen[0][1]["creationflags"] == (0x08000000 if os.name == "nt" else 0) and "shell" not in seen[0][1] and "timeout" not in seen[0][1]
+        assert run_switch(a_, pop(P_(1, b"  \r\n", b"pwsh: boom\r\n"))) == ({"outcome": "error", "text": "Failed (exit 1): pwsh: boom"}, None)
 
         def gone(argv, **kw):
             raise FileNotFoundError("pwsh")
-        assert run_switch(a_, slow)["text"].startswith("The rotator did not finish within 120 s") and run_switch(a_, gone) == {"outcome": "error", "text": "The rotator could not run: FileNotFoundError."}
+        assert run_switch(a_, gone) == ({"outcome": "error", "text": "The rotator could not run: FileNotFoundError."}, None)
+        p_ = P_(0, b"", slow=True)
+        assert run_switch(a_, pop(p_)) == ({"outcome": "running", "text": SWITCH_RUNNING}, p_) and p_.calls == [("communicate", 120)]       # no kill, no terminate
         # Store.switch: runs the argv for the action, logs without tokens, rebuilds (which re-reads in_use)
         globals()["APPLOG"] = os.path.join(ld, "log.txt")
         fs = Store.__new__(Store)
         fs.lock, rb = threading.RLock(), []
         fs.rebuild = lambda now: rb.append(now)
         seen.clear()
-        assert fs.switch("codex", "best", None, lambda argv, **kw: (seen.append(argv), R_(0, b"The app will come up on the new account. " + tok.encode()))[1], here)["outcome"] == "ok"
-        assert seen == [ps("codex-app-rotator.ps1") + ["--rotate"]] and len(rb) == 1
+        assert fs.switch("codex", "best", None, pop(P_(0, b"The app will come up on the new account. " + tok.encode())), here)["outcome"] == "ok"
+        assert [x[0] for x in seen] == [ps("codex-app-rotator.ps1") + ["--rotate"]] and len(rb) == 1
         lg = open(APPLOG, encoding="utf-8").read()
         assert "switch: codex best -> Done: The app will come up on the new account." in lg and "sk-ant" not in lg, lg
         # the blob: per-seat roles minus the role the seat holds; the header button only with its rotator
@@ -3003,7 +3056,28 @@ def selftest():
             assert hq(ok_)[0] == 409 and len(hc) == 2                                                       # single flight with refresh and the resets
             hs.refreshing.release()
             hs.switch = lambda p, r, s: 1 / 0
-            assert hq(ok_)[0] == 500 and hs.refreshing.acquire(blocking=False)                              # a crash still releases the lock
+            assert hq(ok_)[0] == 500 and hs.refreshing.acquire(timeout=5)                                   # a crash still releases the lock (just after the reply)
+            hs.refreshing.release()
+            # a rotator that outlives the 120 s wait: 202 + "still switching", never killed, the lock held (409) until it exits, then logged, rebuilt, released
+            hs.rebuild, rb = (lambda now: rb.append(now)), []
+            p_ = P_(0, b"Relaunched the Claude app on seat B.\r\n", slow=True)
+            hs.switch = lambda p, r, s: Store.switch(hs, p, r, s, pop(p_), here)
+            st_, body_ = hq(ok_)
+            assert st_ == 202 and json.loads(body_) == {"outcome": "running", "text": SWITCH_RUNNING}, (st_, body_)
+            assert hq(ok_)[0] == 409 and hq(ok_)[0] == 409 and not hs.refreshing.acquire(blocking=False) and not rb
+            assert "switch: claude app B -> still running after 120 s (pid 4242); waiting for it" in open(APPLOG, encoding="utf-8").read()
+            p_.go.set()
+            for _ in range(500):
+                if hs.refreshing.acquire(blocking=False):
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("the waiter never released the lock")
+            hs.refreshing.release()
+            assert p_.calls == [("communicate", 120), ("communicate", None)] and len(rb) == 1, p_.calls        # waited with no bound; no kill, no terminate
+            assert "switch: claude app B -> Done: Relaunched the Claude app on seat B." in open(APPLOG, encoding="utf-8").read()
+            hs.switch = lambda p, r, s: Store.switch(hs, p, r, s, pop(P_(0, b"ok")), here)
+            assert hq(ok_)[0] == 200 and hs.refreshing.acquire(timeout=5)
             hs.refreshing.release()
         finally:
             srv.shutdown()
