@@ -787,8 +787,8 @@ exists.
 | Command | What it does |
 |---|---|
 | `rotator-sync --check [--quiet]` | Fetches the clone (at most every 6 h), then compares every file under `windows/` at `origin/main` with the live folder, ignoring CRLF/LF and a UTF-8 BOM. Lists `differing` and `missing-live` files; files only in the live folder and `rotator.local.json` / `*.local.*` are ignored. Exit 1 if anything differs. Writes `~/.claude-cli-accounts/.rotator-drift.json`. |
-| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. |
-| `rotator-sync --push <branch>` | Makes a new worktree of the clone at the ref (`--worktree <path>` to choose where), copies every differing live file into its `windows/`, commits on `<branch>` and prints the worktree path. It never pushes and never opens a PR. |
+| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. Each file is written to a temporary sibling and then replaced, so a failure never leaves a truncated live script. Records the commit it installed (`installed` in the state file) for `--push`. |
+| `rotator-sync --push <branch>` | Exports only the live files changed since the commit the last `--pull` installed: fetches, makes a new worktree of the clone at the ref (`--worktree <path>` to choose where), copies those files into its `windows/`, commits on `<branch>` and prints the worktree path. A newer upstream change to any other file is therefore never rolled back. Refuses, naming the files, when the ref also changed one of them since the installed commit, and refuses when no `--pull` has been recorded yet. It never pushes and never opens a PR. Built in `cmd_push`, tested by `--selftest`. |
 | `rotator-sync --selftest` | Runs the built-in checks in a temporary repo. |
 
 Options: `--repo <clone>`, `--live <folder>`, `--ref <ref>` (default `origin/main`). The usage dashboard shows a

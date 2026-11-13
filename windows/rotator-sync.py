@@ -3,7 +3,8 @@
 
   --check [--quiet]   compare every file under windows/ at the ref with the live folder
   --pull              copy differing / missing files from the ref into the live folder (backs up first)
-  --push <branch>     copy differing live files into a new worktree of the clone and commit them there
+  --push <branch>     commit the live files changed since the commit --pull installed, onto a new worktree of the
+                      freshly fetched ref; refuses (and names the files) when the ref also changed one of them
   --selftest          run the built-in checks
 
 Config (rotator.local.json next to this script, all keys optional):
@@ -147,6 +148,9 @@ def cmd_pull(repo, live, ref, state):
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
     record(repo, live, ref, state)
+    st = load_json(state)
+    st["installed"] = git(repo, "rev-parse", ref).stdout.decode().strip()     # --push exports changes relative to this
+    write_state(state, st)
     return 0
 
 
@@ -160,22 +164,45 @@ def match_style(live_bytes, repo_bytes_):
 
 
 def cmd_push(repo, live, ref, state, branch, worktree):
-    differing, _ = compare(repo, live, ref)
-    if not differing:
-        print("rotator-sync: no differing live files, nothing to push")
+    """Export only what was changed live since the installed commit, onto the freshly fetched ref, so a hotfix to one
+    file never carries a rollback of the ref's newer change to another."""
+    base = load_json(state).get("installed")
+    if not base or git(repo, "cat-file", "-e", base + "^{commit}", check=False).returncode:
+        sys.stderr.write("rotator-sync: no installed commit recorded (or it is not in the clone): run --pull first\n")
+        return 2
+    maybe_fetch(repo, ref, state, force=True)
+    changed, clash = [], []
+    for rel in sorted(repo_files(repo, base)):
+        path = os.path.join(live, *rel.split("/"))
+        if not os.path.isfile(path):
+            continue        # shortcut: a file deleted live is not exported; delete it in the repo by hand
+        with open(path, "rb") as fh:
+            if norm(fh.read()) == norm(repo_bytes(repo, base, rel)):
+                continue
+        changed.append(rel)
+        up = git(repo, "show", "%s:%s%s" % (ref, PREFIX, rel), check=False)
+        if up.returncode or norm(up.stdout) != norm(repo_bytes(repo, base, rel)):
+            clash.append(rel)
+    if not changed:
+        print("rotator-sync: no live file changed since the installed commit %s, nothing to push" % base[:9])
         return 0
+    if clash:
+        sys.stderr.write("rotator-sync: refusing to push: %s also changed since the installed commit %s:\n" % (ref, base[:9]))
+        for rel in clash:
+            sys.stderr.write("  both changed: %s\n" % rel)
+        return 1
     if not worktree:
-        base = r"C:\Dev\Temp" if os.path.isdir(r"C:\Dev\Temp") else tempfile.gettempdir()
-        worktree = os.path.join(base, "wt-rotator-push-" + branch.replace("/", "-"))
+        root = r"C:\Dev\Temp" if os.path.isdir(r"C:\Dev\Temp") else tempfile.gettempdir()
+        worktree = os.path.join(root, "wt-rotator-push-" + branch.replace("/", "-"))
     git(repo, "worktree", "add", "-b", branch, worktree, ref)
-    for rel in differing:
+    for rel in changed:
         with open(os.path.join(live, *rel.split("/")), "rb") as fh:
             data = match_style(fh.read(), repo_bytes(repo, ref, rel))
         with open(os.path.join(worktree, "windows", *rel.split("/")), "wb") as fh:
             fh.write(data)
-    git(worktree, "add", "--", *["windows/" + r for r in differing])
-    git(worktree, "commit", "-q", "-m", "Sync live changes: " + ", ".join(differing))
-    print("committed %d file(s) on branch %s: %s" % (len(differing), branch, ", ".join(differing)))
+    git(worktree, "add", "--", *["windows/" + r for r in changed])
+    git(worktree, "commit", "-q", "-m", "Sync live changes: " + ", ".join(changed))
+    print("committed %d file(s) on branch %s: %s" % (len(changed), branch, ", ".join(changed)))
     print("worktree: " + worktree)
     return 0
 
@@ -202,7 +229,7 @@ def selftest():
         git(repo, "config", "user.email", "selftest@example.com")
         git(repo, "config", "commit.gpgsign", "false")
         git(repo, "config", "core.autocrlf", "false")  # the real repo is `* -text`; keep the self-test bytes as written
-        files = {"a.ps1": b"one\r\ntwo\r\n", "b.py": b"print(1)\n", "fixtures/f.json": b"{}\n", "missing.txt": b"m\n"}
+        files = {"a.ps1": b"one\r\ntwo\r\n", "b.py": b"print(1)\n", "c.ps1": b"x\r\n", "fixtures/f.json": b"{}\n", "missing.txt": b"m\n"}
         for rel, data in files.items():
             write(os.path.join(repo, "windows", rel), data)
         git(repo, "add", "-A")
@@ -233,17 +260,10 @@ def selftest():
         os.remove(os.path.join(live, "fixtures", "f.json"))
         check("missing-live inside a subfolder", compare(repo, live, "HEAD") == (["b.py"], ["fixtures/f.json"]))
 
-        # --push: live b.py (LF) becomes a commit; a CRLF repo file keeps its CRLF
+        # --push needs the commit --pull installed: without one it refuses and creates nothing
         write(os.path.join(live, "a.ps1"), b"one\nTWO\n")
         wt = os.path.join(root, "wt-push")
-        before = git(repo, "rev-parse", "HEAD").stdout
-        cmd_push(repo, live, "HEAD", state, "hotfix", wt)
-        check("push leaves the clone's HEAD alone", git(repo, "rev-parse", "HEAD").stdout == before)
-        check("push committed on the new branch", git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == b"hotfix"
-              and git(wt, "show", "--name-only", "--format=", "HEAD").stdout.split() == [b"windows/a.ps1", b"windows/b.py"])
-        with open(os.path.join(wt, "windows", "a.ps1"), "rb") as fh:
-            check("pushed CRLF file kept its CRLF", fh.read() == b"one\r\nTWO\r\n")
-        git(repo, "worktree", "remove", "--force", wt)
+        check("push before any pull is refused", cmd_push(repo, live, "HEAD", state, "hotfix", wt) == 2 and not os.path.exists(wt))
 
         # --pull gets the repo bytes before it touches a live file: a git failure leaves the live script whole
         real_rb, seen = repo_bytes, []
@@ -273,6 +293,28 @@ def selftest():
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
         check("state reset after pull", load_json(state)["differing"] == [])
+        check("pull recorded the installed commit", load_json(state).get("installed") == git(repo, "rev-parse", "HEAD").stdout.decode().strip())
+
+        # --push exports only what changed live since the installed commit, onto the ref as it is now
+        write(os.path.join(repo, "windows", "a.ps1"), b"one\r\nthree\r\n")      # upstream changes a.ps1 after the install
+        git(repo, "add", "--", "windows/a.ps1")
+        git(repo, "commit", "-q", "-m", "upstream")
+        write(os.path.join(live, "b.py"), b"print(3)\n")                         # live hotfixes, LF
+        write(os.path.join(live, "c.ps1"), b"y\n")
+        write(os.path.join(live, "a.ps1"), b"one\nlocal\n")
+        check("a file changed both live and upstream is refused", cmd_push(repo, live, "HEAD", state, "clash", wt) == 1 and not os.path.exists(wt)
+              and git(repo, "show-ref", "--verify", "--quiet", "refs/heads/clash", check=False).returncode != 0)
+        write(os.path.join(live, "a.ps1"), b"one\r\ntwo\r\n")                    # back to what was installed
+        before = git(repo, "rev-parse", "HEAD").stdout
+        check("push exit 0", cmd_push(repo, live, "HEAD", state, "hotfix", wt) == 0)
+        check("push leaves the clone's HEAD alone", git(repo, "rev-parse", "HEAD").stdout == before)
+        check("push committed only the live changes, on the new branch", git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == b"hotfix"
+              and git(wt, "show", "--name-only", "--format=", "HEAD").stdout.split() == [b"windows/b.py", b"windows/c.ps1"])
+        with open(os.path.join(wt, "windows", "a.ps1"), "rb") as fh:
+            check("upstream's newer a.ps1 is not rolled back", fh.read() == b"one\r\nthree\r\n")
+        with open(os.path.join(wt, "windows", "c.ps1"), "rb") as fh:
+            check("pushed CRLF file kept its CRLF", fh.read() == b"y\r\n")
+        git(repo, "worktree", "remove", "--" + "force", wt)
     finally:
         rmtree(root)
     print("rotator-sync selftest: all passed")
