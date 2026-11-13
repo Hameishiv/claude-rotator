@@ -442,10 +442,47 @@ def load_pcache():
 
 
 def save_pcache(c):
+    """Replace PCACHE atomically. Callers outside the selftest go through pcache_txn() or pcache_merge(), which hold pcache_lock()."""
     tmp = PCACHE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(c, fh, separators=(",", ":"))
     os.replace(tmp, PCACHE)
+
+
+@contextlib.contextmanager
+def pcache_txn():
+    """A read-modify-write of the provider cache (the app, a one-shot sample and --backfill all write it): under pcache_lock(), the
+    file as it is now, then saved. Keep the body short and off the network; a long read uses pcache_merge() instead."""
+    with pcache_lock():
+        c = load_pcache()
+        yield c
+        save_pcache(c)
+
+
+_GONE = object()
+
+
+def _merge(fresh, before, after):
+    """Apply to `fresh` only what changed from `before` to `after`: dicts recurse, anything else is replaced or removed."""
+    for k in set(before) | set(after):
+        b, a = before.get(k, _GONE), after.get(k, _GONE)
+        if a is b or a == b:
+            continue
+        if a is _GONE:
+            fresh.pop(k, None)
+        elif isinstance(a, dict) and isinstance(b, dict) and isinstance(fresh.get(k), dict):
+            _merge(fresh[k], b, a)
+        else:
+            fresh[k] = a
+
+
+def pcache_merge(before, after):
+    """Save what this caller changed (`before` -> `after`, both from one earlier load_pcache()) into the cache as it is now, under
+    the lock, so a key another process wrote meanwhile (a pending reset claim) is never dropped by a writer that did not touch it."""
+    with pcache_lock():
+        c = load_pcache()
+        _merge(c, before, after)
+        save_pcache(c)
 
 
 def read_live(pid, label, fetch, every, now, force, cache):
@@ -646,6 +683,7 @@ def consume_reset(label, kind, gid, rid, fetch, ver=None):
 def sample(now, force=False):
     rec = {"t": int(now), "s": read_claude()}
     cache = load_pcache()
+    before = json.loads(json.dumps(cache))      # the provider reads below are slow: only what they change is merged back, under the lock
     codex, cemails = read_codex()
     for label, fresh in (cache.get("codex_fresh") or {}).items():     # a reading taken after an applied reset, until the cache catches up
         if label in codex and (fresh.get("ts") or 0) > (codex[label].get("ts") or 0):
@@ -669,7 +707,7 @@ def sample(now, force=False):
     email = gemini_email()
     if email:
         cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
-    save_pcache(cache)
+    pcache_merge(before, cache)
     return rec
 
 
@@ -1103,10 +1141,20 @@ def hist_sig():
         return None
 
 
-@contextlib.contextmanager
 def hist_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
     """Cross-process lock on HIST (the app, the scheduled sample and --backfill all write it): every write holds it."""
-    path, end = HIST + ".lock", time.time() + wait
+    return file_lock(HIST + ".lock", wait, stale)
+
+
+def pcache_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
+    """Cross-process lock on PCACHE: every read-modify-write of the provider cache holds it (pcache_txn, sample)."""
+    return file_lock(PCACHE + ".lock", wait, stale)
+
+
+@contextlib.contextmanager
+def file_lock(path, wait=LOCK_WAIT, stale=LOCK_STALE):
+    """A lock file created exclusively; one older than `stale` was left by a crash and is removed."""
+    end = time.time() + wait
     while True:
         try:
             os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
@@ -1119,7 +1167,7 @@ def hist_lock(wait=LOCK_WAIT, stale=LOCK_STALE):
             except OSError:
                 pass                    # released meanwhile, or not removable: wait as usual
             if time.time() >= end:
-                raise TimeoutError("history lock held over %d s: %s" % (wait, path))
+                raise TimeoutError("lock held over %d s: %s" % (wait, path))
             time.sleep(0.1)
     try:
         yield
@@ -1788,15 +1836,14 @@ class Store:
 
     def import_codex(self, now, cdir=None):
         """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
-        cache = load_pcache()
-        since = cache.get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
+        since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
             new, _ = import_rollouts(self.hist, now, False, since, cdir)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
             applog("codex import error: %s: %s" % (type(e).__name__, e))
             return
-        cache["codex_import"] = int(now)
-        save_pcache(cache)
+        with pcache_txn() as cache:
+            cache["codex_import"] = int(now)
         if new:
             with hist_lock():
                 stale = hist_sig() != _SIG      # someone else wrote since: take the file as it now is
@@ -1806,12 +1853,10 @@ class Store:
     def drift_check(self, now, here=None, py=None):
         """rotator-sync.py --check --quiet at most every DRIFT_EVERY, when the script sits next to this one. It writes .rotator-drift.json; its exit code and output are ignored."""
         script = os.path.join(here or HERE, "rotator-sync.py")
-        with self.lock:
-            cache = load_pcache()
+        with self.lock, pcache_txn() as cache:
             if not os.path.isfile(script) or now - (cache.get("drift_run") or 0) < DRIFT_EVERY:
                 return False
             cache["drift_run"] = int(now)           # first, so a hang or crash is not retried every sample
-            save_pcache(cache)
         try:
             subprocess.run((py or PY) + [script, "--check", "--quiet"], stdin=subprocess.DEVNULL, capture_output=True, timeout=120,
                            creationflags=0x08000000 if os.name == "nt" else 0)
@@ -1822,16 +1867,13 @@ class Store:
     def credits_read(self, label, now, fetch=http_json, force=False, ver=None):
         """Read one Claude seat's reset credits into the provider cache (`credits`: {seat: {ts, eligible, grants, next, hold, note}}). `next` is claimed before the
         call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read. Returns the read's state, or None when it was skipped."""
-        with self.lock:
-            cache = load_pcache()
+        with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
                 return None
             e["next"] = int(now + CREDITS_EVERY)
-            save_pcache(cache)
         state, rd = read_credits(label, now, fetch, ver or claude_version(now))
-        with self.lock:
-            cache = load_pcache()
+        with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if state == "ok":
                 e.update(ts=rd["ts"], eligible=rd["eligible"], grants=rd["grants"])
@@ -1841,7 +1883,6 @@ class Store:
             elif state in ("rl", "auth"):
                 e["hold"] = int(now + CREDITS_EVERY)
                 e["note"] = "rate limited" if state == "rl" else "sign-in needed"
-            save_pcache(cache)
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
@@ -1875,9 +1916,8 @@ class Store:
         if new:
             with self.lock:
                 now = time.time()
-                cache = load_pcache()
-                cache.setdefault("codex_fresh", {})[seat] = new       # sample() prefers it until the seat's own cache is newer
-                save_pcache(cache)
+                with pcache_txn() as cache:
+                    cache.setdefault("codex_fresh", {})[seat] = new       # sample() prefers it until the seat's own cache is newer
                 last = next((dict(h["codex"]) for h in reversed(self.hist) if h.get("codex")), {})
                 last[seat] = new
                 self.hist = save(self.hist, {"t": int(now), "codex": last}, now)
@@ -1921,8 +1961,7 @@ class Store:
         is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
         claim that landed), so a retry can never spend a second grant. Returns {"outcome", "text"}."""
         now = time.time()
-        with self.lock:
-            cache = load_pcache()
+        with self.lock, pcache_txn() as cache:
             key = seat + ":" + kind
             claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict) and now - (v.get("at") or 0) < DAY}
             if not (claims.get(key) or {}).get("gid"):          # nothing pending for this seat and kind: a grant from the last reading
@@ -1932,15 +1971,12 @@ class Store:
                 old = claims.pop(seat + ":" + gs[0]["id"], None)    # a claim saved under the older per-grant key keeps its request id
                 claims[key] = {"id": old["id"] if old and old.get("id") else (new_id or (lambda: secrets.token_urlsafe(16)))(), "gid": gs[0]["id"], "at": int(now)}
             cache["credits_claims"] = claims
-            save_pcache(cache)
             gid, rid = claims[key]["gid"], claims[key]["id"]
         res, settled = consume_reset(seat, kind, gid, rid, fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
         applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], "" if settled else " (unconfirmed)"))
         if settled:
-            with self.lock:
-                cache = load_pcache()
+            with self.lock, pcache_txn() as cache:
                 (cache.get("credits_claims") or {}).pop(key, None)
-                save_pcache(cache)
         self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
         with self.lock:
             self.rebuild(time.time())
@@ -3060,6 +3096,43 @@ def selftest():
         r_ = ks.claude_reset("B", "fable", kf, nid)
         assert r_["outcome"] == "error" and "organization is not known" in r_["text"] and [c[0] for c in kc[n_:]] == ["GET"]   # only the re-read
         assert load_pcache()["credits_claims"] == {}
+        # B: provider-cache writers never drop what another process saved meanwhile (a pending reset claim): a sample merges only its own
+        # changes after its slow provider reads, and a transaction waits for the lock and starts from the file as it then is
+        stub = {k: globals()[k] for k in ("read_claude", "read_codex", "fetch_grok", "read_gemini", "gemini_email")}
+
+        def mid_sample(now_):           # the server saves a claim while this sample is still reading providers
+            o_ = load_pcache()
+            o_.setdefault("credits_claims", {})["A:full"] = {"id": "ridX", "gid": "g2", "at": 1}
+            save_pcache(o_)
+            return None, "not readable"
+        try:
+            globals().update(read_claude=lambda: {}, read_codex=lambda *a_, **k_: ({}, {}), fetch_grok=lambda now_: (None, None), read_gemini=mid_sample,
+                             gemini_email=lambda: None)
+            save_pcache({"credits": {"A": dict(ke)}})
+            sample(KN, True)
+            pc = load_pcache()
+            assert pc["credits_claims"]["A:full"]["id"] == "ridX" and pc["notes"]["gemini"] == {"antigravity": "not readable"} and "grok" in pc, pc
+        finally:
+            globals().update(stub)
+        held = threading.Event()
+
+        def holder():                   # another process: holds the lock, then saves a claim 0.3 s later
+            with pcache_lock():
+                held.set()
+                time.sleep(0.3)
+                o_ = load_pcache()
+                o_["credits_claims"]["B:full"] = {"id": "ridY", "gid": "g2", "at": 1}
+                save_pcache(o_)
+        th = threading.Thread(target=holder)
+        th.start()
+        held.wait(5)
+        with pcache_txn() as c_:        # without the lock this would read before the claim and save after it
+            time.sleep(0.6)
+            c_["drift_run"] = 5
+        th.join()
+        pc = load_pcache()
+        assert pc["credits_claims"]["B:full"]["id"] == "ridY" and pc["credits_claims"]["A:full"]["id"] == "ridX" and pc["drift_run"] == 5, pc
+        assert not os.path.exists(PCACHE + ".lock")
         # the HTTP guards, on a spare loopback port with a fake store
         hs = Store.__new__(Store)
         hs.lock, hs.refreshing, hs.blob, hc = threading.RLock(), threading.Lock(), {}, []
