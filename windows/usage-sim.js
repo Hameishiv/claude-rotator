@@ -74,7 +74,7 @@ function quotaIn(sec) {
 // Banked resets (Codex's, and Claude's from the read-only usage call): the count, then a muted line per credit ("x2" when a grant holds more than one, no
 // expiry part when it has none); a count above the list says so. A seat that was read and has none shows an empty cell, one never read '–'.
 function quotaBankedCell(a, now, fmt, esc) {
-  if (a.banked == null) return a.bankedAt ? '' : '–';
+  if (a.banked == null) return a.bankedNote ? '<small>' + esc(a.bankedNote) + '</small>' : a.bankedAt ? '' : '–';     // why there is no count, e.g. a setup-token seat
   const l = a.bankedList || [], miss = a.banked - l.reduce((n, c) => n + (c.n || 1), 0);
   return a.banked + l.map(c => '<small>' + esc(c.title) + (c.n > 1 ? ' ×' + c.n : '') +
     (c.expiresAt == null ? '' : ' · expires ' + esc(fmt(c.expiresAt)) + ' (in ' + quotaIn(c.expiresAt - now) + ')') + '</small>').join('') +

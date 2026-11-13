@@ -753,11 +753,17 @@ is the weight the seat already has. The suggestion's line and the copied fragmen
 
 **Banked resets (Claude).** The Claude table's `Banked resets` column shows the reset credits each seat holds: a count, then one muted line per credit
 (`Fable reset · expires <date> (in N d)`), and the header chip adds them up. They come from Claude Code's own usage call
-(`GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1` with the seat's `token.txt`), which is **undocumented** and **rate-limited**, so the
+(`GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1`), which is **undocumented** and **rate-limited**, so the
 dashboard's sampler (`Store.credits_tick` and `Store.credits_read` in `usage-history.py`, parsed by `parse_cedar`, selftest block J) reads one seat per
 5-minute tick and each seat at most once every **6 hours**; a 429 or a sign-in error holds that seat for 6 hours, any other failure keeps the last good reading.
-This read changes nothing. The token is sent only in that request's header and is never logged or stored. A seat that was read and holds no credits shows an
-empty cell, one never read `–`; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
+A setup-token (`token.txt`) cannot read credits: the call answers 403 "scope requirement user:profile", the cell says "Reset credits need a full Claude
+login (not a setup-token)" and that seat is asked again only after **7 days**. So when the Claude desktop app has saved a full login for the **same
+account** (`~/.claude-app-seats/<seat>/config.json`, kept by `claude-account`; its `email.txt` or `meta.txt` must name the seat's `email.txt` address),
+the credit read and the Apply use that login's `user:profile` token instead. `app-login-token.ps1` decrypts it **read-only** (it never refreshes a token
+and never writes a file; the live seat is read from the app's own `%APPDATA%\Claude\config.json`); an expired one shows "app login expired; open the
+app on this seat to refresh" (`app_login`, `seat_token`, selftest; `app-login-token.ps1 -SelfTest`). This read changes nothing. The token is sent only in
+that request's header and is never logged or stored. A seat that was read and holds no credits shows an empty cell, one never read `–`, and a seat with a
+note (sign-in needed, rate limited, the two above) shows it; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
 buttons below included.
 
 **Apply reset (Claude).** In the app, a seat whose last reading has a credit usable now gets one button per kind: `Apply Fable reset`, `Apply full reset`, and

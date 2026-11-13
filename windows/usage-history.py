@@ -285,7 +285,10 @@ def http_json(req, timeout=10):
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        return e.code, None
+        try:
+            return e.code, json.loads(e.read().decode("utf-8"))     # an error body says why (a 403 scope refusal, say)
+        except (OSError, ValueError):
+            return e.code, None
     except (urllib.error.URLError, OSError, ValueError) as e:
         return 0, str(type(e).__name__)
 
@@ -614,15 +617,58 @@ def parse_usage(j, now):
     return parse_cedar(j.get("cedar_ember"), now) if isinstance(j, dict) else None
 
 
+APP_SEATS = os.path.join(HOME, ".claude-app-seats")     # the desktop app's saved per-seat logins (claude-app-rotator.ps1)
+SCOPE_HOLD = 7 * DAY        # a seat whose only token cannot read credits (a setup-token) is asked again after a week, not every 6 h
+NOTE_SCOPE = "Reset credits need a full Claude login (not a setup-token)"
+NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
+
+
+def app_login(label, run=subprocess.run):
+    """The seat's full desktop-app login, READ-ONLY, when the app saved one for the SAME account (its email matches the seat's email.txt):
+    ("ok", token) while unexpired, ("expired", None), or (None, None) when there is none. The setup-token in token.txt cannot read reset
+    credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
+    prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored."""
+    app = os.path.join(APP_SEATS, label)
+    if os.name != "nt" or not os.path.isfile(os.path.join(app, "config.json")):
+        return None, None
+    want = _read(os.path.join(ROOT, label, "email.txt")).lower()
+    m = re.search(r"(?:^|\s)account=(\S+@\S+)", _read(os.path.join(app, "meta.txt")))
+    have = (_read(os.path.join(app, "email.txt")) or (m.group(1) if m else "")).lower()
+    if not want or want != have:
+        return None, None
+    try:
+        r = run(["pwsh", "-NoProfile", "-NonInteractive", "-File", os.path.join(HERE, "app-login-token.ps1"), "-Seat", label], stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=60, creationflags=CHILD_FLAGS)
+        j = json.loads(r.stdout.decode("utf-8", "replace"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+    if isinstance(j, dict) and j.get("state") == "ok" and isinstance(j.get("token"), str) and j["token"]:
+        return "ok", j["token"]
+    return ("expired", None) if isinstance(j, dict) and j.get("state") == "expired" else (None, None)
+
+
+def seat_token(label, login=app_login):
+    """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so."""
+    st, tok = login(label)
+    if st == "ok":
+        return tok, None
+    if st == "expired":
+        return None, "expired"
+    return _read(os.path.join(ROOT, label, "token.txt")) or None, None
+
+
 def token_seats():
     """The Claude seat labels that have a token file (the same one the rotator uses)."""
     return sorted(os.path.basename(os.path.dirname(f)) for f in glob.glob(os.path.join(ROOT, "*", "token.txt")) if os.path.basename(os.path.dirname(f))[:1] not in "._")
 
 
-def read_credits(label, now, fetch=http_json, ver=None):
-    """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "auth" (401/403), "none" (no token), "fail". The token stays in this
-    function: never logged, stored or returned."""
-    tok = _read(os.path.join(ROOT, label, "token.txt"))
+def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
+    """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "scope" (403: the token cannot read credits, a
+    setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "none" (no token), "fail". The seat's full app login is
+    used when it has one (seat_token). The token stays in this function: never logged, stored or returned."""
+    tok, why = seat_token(label, login)
+    if why == "expired":
+        return "expired", None
     if not tok:
         return "none", None
     req = urllib.request.Request(CREDITS_URL, headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20",
@@ -633,6 +679,8 @@ def read_credits(label, now, fetch=http_json, ver=None):
         return "fail", type(e).__name__
     if code == 429:
         return "rl", None
+    if code == 403 and "scope requirement" in json.dumps(j):
+        return "scope", None
     if code in (401, 403):
         return "auth", None
     r = parse_usage(j, now) if code == 200 else None
@@ -671,12 +719,14 @@ def claude_org(label):
     return ""
 
 
-def consume_reset(label, kind, gid, rid, fetch, ver=None):
+def consume_reset(label, kind, gid, rid, fetch, ver=None, login=app_login):
     """One claim of grant `gid` with idempotency key `rid` -> ({"outcome", "text"}, settled). Not settled (False: no answer, a 5xx, `unavailable`) means the
     claim may or may not have landed: the caller keeps `rid` so a retry addresses the same claim. None (429, 401/403, no token or organization) means this
     call was turned away before it reached the claim: it settles a new claim, but says nothing about an earlier unconfirmed one with the same `rid`. The
     token stays in this function: never logged, stored or returned."""
-    tok, org, name = _read(os.path.join(ROOT, label, "token.txt")), claude_org(label), CREDIT_KINDS[kind]
+    (tok, why), org, name = seat_token(label, login), claude_org(label), CREDIT_KINDS[kind]
+    if why == "expired":
+        return {"outcome": "error", "text": "Seat %s: %s." % (label, NOTE_APP_EXPIRED)}, None
     if not tok or not org:
         return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh, then try again." % label}, None
     req = urllib.request.Request(RESET_URL % org, method="POST", data=json.dumps({"program": "cedar_ember", "grant_id": gid, "request_id": rid}).encode("utf-8"),
@@ -1935,7 +1985,7 @@ class Store:
             pass
         return True
 
-    def credits_read(self, label, now, fetch=http_json, force=False, ver=None):
+    def credits_read(self, label, now, fetch=http_json, force=False, ver=None, login=app_login):
         """Read one Claude seat's reset credits into the provider cache (`credits`: {seat: {ts, eligible, grants, next, hold, note}}). `next` is claimed before the
         call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read. Returns the read's state, or None when it was skipped."""
         with self.lock, pcache_txn() as cache:
@@ -1943,7 +1993,7 @@ class Store:
             if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
                 return None
             e["next"] = int(now + CREDITS_EVERY)
-        state, rd = read_credits(label, now, fetch, ver or claude_version(now))
+        state, rd = read_credits(label, now, fetch, ver or claude_version(now), login)
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if state == "ok":
@@ -1951,9 +2001,11 @@ class Store:
                 e.pop("note", None), e.pop("hold", None), e.pop("nextId", None)
                 if rd.get("nextId"):
                     e["nextId"] = rd["nextId"]
-            elif state in ("rl", "auth"):
-                e["hold"] = int(now + CREDITS_EVERY)
-                e["note"] = "rate limited" if state == "rl" else "sign-in needed"
+            elif state in ("rl", "auth", "scope"):
+                e["hold"] = int(now + (SCOPE_HOLD if state == "scope" else CREDITS_EVERY))
+                e["note"] = {"rl": "rate limited", "auth": "sign-in needed", "scope": NOTE_SCOPE}[state]
+            elif state == "expired":
+                e["note"] = NOTE_APP_EXPIRED
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
@@ -2382,6 +2434,7 @@ def make_icons():
 # ---------------------------------------------------------------- selftest
 
 def selftest():
+    globals()["APP_SEATS"] = os.path.join(__import__("tempfile").gettempdir(), "no-such-app-seats-%d" % os.getpid())     # never a real saved app login
     T, R = 1_800_000_000, 1_800_000_000 + 3 * 86400
 
     def rec(t, **seats):
@@ -3221,6 +3274,53 @@ def selftest():
         assert st.credits_read("B", JN + 2 * CREDITS_EVERY + 1000, bad) == "fail" and st.credits_read("C", JN + 2 * CREDITS_EVERY + 1000, bad) == "fail"
         assert st.credits_read("A", JN + 2 * CREDITS_EVERY + 5, bad) is None                             # failures count as the 6-hourly attempt too
         assert st.credits_read("A", JN + 3 * CREDITS_EVERY, lambda req: 1 / 0) == "fail"                  # a raising fetch is a failed read, not a crash
+        # a setup-token's 403 "scope requirement user:profile" is its own note, held a week; the seat's full app login is used when it has one
+        sc = fake({"A": (403, {"type": "error", "error": {"type": "permission_error", "message": "OAuth token does not meet scope requirement user:profile"}}),
+                   "B": (403, {"type": "error", "error": {"type": "permission_error", "message": "Request not allowed"}})})
+        assert st.credits_read("A", JN + 4 * CREDITS_EVERY, sc, force=True, login=lambda l: (None, None)) == "scope"
+        ea = load_pcache()["credits"]["A"]
+        assert ea["note"] == "Reset credits need a full Claude login (not a setup-token)" and ea["hold"] == JN + 4 * CREDITS_EVERY + 7 * DAY and ea["grants"]
+        assert st.credits_read("A", JN + 4 * CREDITS_EVERY + CREDITS_EVERY + 1, sc, force=True, login=lambda l: (None, None)) is None      # not asked again for a week
+        assert st.credits_read("B", JN + 4 * CREDITS_EVERY, sc, force=True, login=lambda l: (None, None)) == "auth"                         # another 403 is still sign-in needed
+        n_ = len(calls)
+        assert st.credits_read("C", JN + 4 * CREDITS_EVERY, fx, force=True, login=lambda l: ("ok", "secret-appC")) == "ok" and calls[-1][1] == "Bearer secret-appC"
+        assert st.credits_read("C", JN + 5 * CREDITS_EVERY, fx, force=True, login=lambda l: ("expired", None)) == "expired" and len(calls) == n_ + 1
+        assert load_pcache()["credits"]["C"]["note"] == "app login expired; open the app on this seat to refresh" and "secret-app" not in open(PCACHE).read()
+        # app_login: only the same account's saved app login, through the read-only helper; anything odd is no login
+        keep_as = APP_SEATS
+        globals()["APP_SEATS"] = os.path.join(jd, "app-seats")
+        try:
+            for lab_, meta in (("A", "captured=1 account=a@x.example uuid=u label=A"), ("B", "captured=1 account=(no email) uuid=u label=B"), ("C", "captured=1 account=other@x.example")):
+                os.makedirs(os.path.join(APP_SEATS, lab_))
+                open(os.path.join(APP_SEATS, lab_, "config.json"), "w").write("{}")
+                open(os.path.join(APP_SEATS, lab_, "meta.txt"), "w").write(meta + chr(10))
+            open(os.path.join(APP_SEATS, "B", "email.txt"), "w").write("B@X.example")
+            for lab_ in "ABC":
+                open(os.path.join(jd, lab_, "email.txt"), "w").write(lab_.lower() + "@x.example")
+            runs = []
+
+            class R_:
+                def __init__(self, out):
+                    self.stdout = out
+
+            def hp_(out):
+                def r(argv, **kw):
+                    runs.append((argv, kw))
+                    return R_(out)
+                return r
+            okr = hp_(b'{"state":"ok","token":"tok-app","expiresAt":1}')
+            if os.name == "nt":
+                assert app_login("A", okr) == ("ok", "tok-app") and app_login("B", okr) == ("ok", "tok-app")         # email from meta.txt, or email.txt
+                assert runs[0][0][-2:] == ["-Seat", "A"] and runs[0][0][-3].endswith("app-login-token.ps1") and runs[0][1]["creationflags"] == CHILD_FLAGS
+                assert app_login("C", okr) == (None, None) and app_login("D", okr) == (None, None) and len(runs) == 2      # another account's login, or none: never asked
+                assert app_login("A", hp_(b'{"state":"expired","expiresAt":1}')) == ("expired", None)
+                assert app_login("A", hp_(b"junk")) == (None, None) and app_login("A", hp_(b'{"state":"ok","token":""}')) == (None, None)
+                assert seat_token("A", lambda l: (None, None)) == ("secret-A", None) and seat_token("A", lambda l: ("expired", None)) == (None, "expired")
+                r_ = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", os.path.join(HERE, "app-login-token.ps1"), "-SelfTest"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=120, creationflags=CHILD_FLAGS)
+                assert r_.returncode == 0 and b"app-login-token selftest: ok" in r_.stdout, r_.stdout[-400:]
+        finally:
+            globals()["APP_SEATS"] = keep_as
         n_ = len(calls)
         off = os.path.join(jd, "off.json")
         open(off, "w").write('{"claudeResetCredits": false}')
