@@ -302,7 +302,7 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const bannerSrc = tpl.slice(tpl.indexOf('const pcacheBanner = '), tpl.indexOf('\nfunction driftRow('));
   const { banner, pcacheHold, pcacheSwap } = new Function('esc', bannerSrc + '\nreturn { banner: pcacheBanner, pcacheHold, pcacheSwap };')(esc);
   const html = banner('usage-cache.json <b> cannot be read. Check the seats limits first.');
-  assert.ok(html.includes('role="status"') && !html.includes('role="alert"') && html.includes('usage-cache.json &lt;b> cannot be read. Check the seats limits first.') && !html.includes('<b>'), html);
+  assert.ok(html.includes('role="alert"') && !html.includes('role="status"') && html.includes('usage-cache.json &lt;b> cannot be read. Check the seats limits first.') && !html.includes('<b>'), html);
   assert.ok(tpl.includes("(D.pcacheError ? pcacheBanner(D.pcacheError) : '')"));
   // the banner node survives a re-render while its message is unchanged (so it is not announced again), and is replaced when the message changes or goes
   const mkApp = () => { const b = { replaced: null, replaceWith(n) { this.replaced = n; } }; return { b, querySelector: () => b }; };

@@ -181,8 +181,9 @@ const ICON = {
 const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
 
 // The provider cache cannot be read: say why (the server's message names the file and what to do); the reset buttons are held back meanwhile (resetBtn, openReset, openClear).
-const pcacheBanner = m => `<div class="pcerr" role="status">${esc(m)}</div>`;
-// render() rebuilds the page, and a rebuilt live region can be announced again: the banner's node is kept across renders for as long as its message is the same.
+const pcacheBanner = m => `<div class="pcerr" role="alert">${esc(m)}</div>`;
+// An alert is announced when it first appears and when its text changes (a new message is a new node). render() rebuilds the page, and a rebuilt alert would be announced
+// again: the banner's node is kept across renders for as long as its message is the same.
 let pcKept = null;
 const pcacheHold = m => pcKept && m && pcKept.m === m ? pcKept.node : null;          // before the page is rebuilt: the node to put back, if the message is unchanged
 function pcacheSwap(app, m, kept) {                                                    // after: put the kept node in place of the new one, or remember the new one

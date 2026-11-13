@@ -170,19 +170,23 @@ def record(repo, live, ref, state, at=None):
 def roll_back(plan):
     """Put back every file of a pull's plan [(dest, backup or None)] that was swapped (its .tmp-sync is gone): a replaced one from its backup,
     which only exists once complete (written as .part, then renamed), an added one removed. A file not swapped is left as it is, so a backup
-    that died half-written never lands on an intact live file. Temps go too. -> (how many were put back, the paths that could not be)."""
+    that died half-written never lands on an intact live file. Two passes, because the .tmp-sync files are the only record of which swaps happened and a
+    rollback killed part-way must leave that record whole: pass 1 reads it for EVERY file before it changes any, then restores (copying a backup again, or
+    removing an already-removed added file, is harmless, so a second run finishes what a killed one began); pass 2, once all of them are restored, removes the
+    .tmp-sync and .part leftovers. -> (how many were put back, the paths that could not be)."""
     done, bad = 0, []
-    for dest, bak in reversed(plan):
-        swapped = not os.path.exists(dest + ".tmp-sync")
+    swapped = [not os.path.exists(dest + ".tmp-sync") for dest, _ in plan]   # all decided before the first restore
+    for (dest, bak), was_swapped in reversed(list(zip(plan, swapped))):
         try:
-            if swapped and bak and os.path.exists(bak):
+            if was_swapped and bak and os.path.exists(bak):
                 shutil.copy2(bak, dest)
                 done += 1
-            elif swapped and not bak and os.path.exists(dest):
+            elif was_swapped and not bak and os.path.exists(dest):
                 os.remove(dest)
                 done += 1
         except OSError:
             bad.append(dest)
+    for dest, bak in plan:
         for junk in (dest + ".tmp-sync", bak and bak + ".part"):   # an added file has no backup (bak None): no "None.part" to remove
             if junk:
                 with contextlib.suppress(OSError):
@@ -191,8 +195,9 @@ def roll_back(plan):
 
 
 def update_finished(j):
-    """True when every swap of the journal's pull happened: none of the planned files still has its .tmp-sync (that is also what roll_back counts as swapped).
-    A journal outlives its pull when the delete failed after the pull, or when the pull was killed (before its first swap, or part-way through them)."""
+    """True when no planned file of the journal's pull still has its .tmp-sync. A .tmp-sync goes away when its file is swapped in, and a rollback removes the
+    leftovers only after it has restored every file, so none left means either every swap happened (the journal outlived the pull: its delete failed) or a
+    rollback already put everything back. A pull killed before its first swap, or part-way through them, still has .tmp-sync files: not finished, rolled back."""
     plan = j.get("files")
     if not isinstance(plan, list):
         return True
@@ -209,8 +214,7 @@ def roll_back_journal(jpath):
         drop_journal(jpath)
         return None
     res = roll_back([tuple(e) for e in j.get("files") or []])
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(jpath)
+    drop_journal(jpath)                                 # one that cannot be deleted stays, with a warning; --pull checks for it
     return res
 
 
@@ -294,6 +298,9 @@ PROXY_TASK = "Claude rotate proxy"
 
 def pull_locked(repo, live, ref, state, jpath):
     say_recovered(roll_back_journal(jpath))
+    if os.path.exists(jpath):                           # recovery could not delete it: staging would write a new journal over it
+        sys.stderr.write("rotator-sync: the earlier update's journal %s could not be deleted; delete it by hand once nothing holds it, then run --pull again; nothing was changed\n" % jpath)
+        return 1
     maybe_fetch(repo, ref, state, force=True)
     at = resolve(repo, ref)
     differing, missing = compare(repo, live, at)
@@ -605,6 +612,20 @@ def selftest():
             recover(state)
         check("the next --check deletes that journal, restores nothing and keeps the user's edit", not os.path.exists(jp_) and buf.getvalue() == ""
               and {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))} == live_before_)
+        # a journal that recovery cannot delete stops the next --pull before it stages anything (a new journal would be written over it)
+        write_state(jp_, {"files": [[os.path.join(live, "b.py"), None]]})
+        live_before_ = {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))}
+        os.remove, os.replace = stuck_remove, real_replace2
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+                rc_j = cmd_pull(repo, live, "HEAD", state)
+        finally:
+            os.remove = real_remove
+        check("a --pull whose old journal cannot be deleted stops before staging, names the journal, and exits 1",
+              rc_j == 1 and jp_ in buf.getvalue() and "delete it by hand" in buf.getvalue() and os.path.exists(jp_)
+              and {n: open(os.path.join(live, n), "rb").read() for n in os.listdir(live) if os.path.isfile(os.path.join(live, n))} == live_before_)
+        os.remove(jp_)
         # a planned file still staged means that swap did not happen: rolled back (a journal an older version wrote, which also recorded hashes, is judged the same way)
         write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None], [os.path.join(live, "pending.txt"), None]]})
         write(os.path.join(live, "stale-added.txt"), b"x\n")
@@ -640,6 +661,42 @@ def selftest():
         for n in os.listdir(live):
             if ".bak-sync-" in n:
                 os.remove(os.path.join(live, n))
+        # a recovery killed part-way through its own rollback: the .tmp-sync files are the record of which swaps happened, so they must outlive the restores
+        kr = os.path.join(root, "killed-rollback")
+        st_k = os.path.join(kr, "state.json")
+        jp_k = st_k + ".pull-journal.json"
+        k_files = [os.path.join(kr, n) for n in ("f1.py", "f2.py", "f3.py")]
+        k_plan = []
+        for f_ in k_files:
+            write(f_, b"OLD")
+            write(f_ + ".tmp-sync", b"NEW")
+            k_plan.append((f_, f_ + ".bak-sync-X"))
+        write_state(jp_k, {"files": k_plan})
+        for f_, bak_ in k_plan[:2]:                         # f1 and f2 swapped; f3's swap never happened
+            shutil.copy2(f_, bak_)
+            os.replace(f_ + ".tmp-sync", f_)
+        real_copy, copies_ = shutil.copy2, []
+
+        def killing_copy(src, dst, *a, **kw):
+            copies_.append(dst)
+            if len(copies_) == 2:                           # recovery restores f2, then dies before f1
+                raise KeyboardInterrupt
+            return real_copy(src, dst, *a, **kw)
+        shutil.copy2 = killing_copy
+        try:
+            recover(st_k)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            shutil.copy2 = real_copy
+        check("a recovery killed part-way keeps the journal and the record of what was swapped", os.path.exists(jp_k) and len(copies_) == 2
+              and any(os.path.exists(f_ + ".tmp-sync") for f_ in k_files) and not update_finished(load_json(jp_k)))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            recover(st_k)
+        check("... and the next recovery finishes it: every file OLD, no temps, journal gone",
+              not os.path.exists(jp_k) and all(open(f_, "rb").read() == b"OLD" for f_ in k_files)
+              and not any(".tmp-sync" in n or n.endswith(".part") for n in os.listdir(kr)))
 
         # the ref is resolved once: a fetch moving it mid-pull does not change what --pull installs
         write(os.path.join(live, "b.py"), b"print(3)\n")

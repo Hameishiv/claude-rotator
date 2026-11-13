@@ -734,6 +734,7 @@ NOTE_SCOPE = "Reset credits need a full Claude login (not a setup-token)"
 NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
 NOTE_PENDING = "waiting for this seat's first usage probe"
 NOTE_APP_ORG = "app login is for another organization; open the app on this seat to refresh"
+NOTE_APP_UNREADABLE = "the app login on this seat could not be read; open the app on this seat to sign in again"
 CREDITS_PENDING_RETRY = 15 * 60      # an app login whose organization is not recorded yet is asked again in 15 min, not after the 6 h read interval
 CREDITS_PENDING_TRIES = 4            # ... for this many consecutive pending reads; after that (a seat that never gets probed) it is the 6 h read interval again, unless credits_tick sees its organization recorded
 
@@ -744,8 +745,9 @@ def app_login(label, run=run_bounded):
     the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), ("pending", None) when the login is this
     account's but the seat's organization is not recorded yet (it cannot be tied to the seat, so it is not used, and the setup-token must not be tried
     instead: it can only be refused for its scope), ("org", None) when it is this account's but has no entry for the seat's organization (the same:
-    never used, never the setup-token, but not retried soon, since the probe cannot change it), ("fail", None) when the login belongs to the seat (owner and organization
-    are known) but the helper could not tell (timed out, could not run, answered something unreadable, or could not read the login): not a reason to try the setup-token, nor
+    never used, never the setup-token, but not retried soon, since the probe cannot change it), ("unreadable", None) when the helper says a login is saved but it could not be read or
+    decrypted (it will not be, until the app signs in again: the seat gets a note saying so), ("fail", None) when the login belongs to the seat (owner and organization
+    are known) but the helper could not tell (timed out, could not run, answered something unreadable): not a reason to try the setup-token, nor
     to hold the seat, just an ordinary failed read, or (None, None) when there is none or anything does not match. The setup-token in token.txt cannot read reset
     credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
     prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored.
@@ -783,17 +785,19 @@ def app_login(label, run=run_bounded):
         return "org", None
     if state == "expired":
         return "expired", None
-    return (None, None) if state == "none" else ("fail", None)      # "none": no login for this seat; "unreadable" or anything else: the helper could not tell
+    if state == "unreadable":           # the helper found a saved login and could not read it: persistent, unlike a timeout
+        return "unreadable", None
+    return (None, None) if state == "none" else ("fail", None)      # "none": no login for this seat; anything else: the helper could not tell
 
 
 def seat_token(label, login=app_login):
     """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so, and so does one whose
-    seat organization is not known yet ("pending"), has no entry for it ("org") or could not be read just now ("fail"): no fallback to token.txt for those, which cannot read
+    seat organization is not known yet ("pending"), has no entry for it ("org"), could not be read ("unreadable") or could not be read just now ("fail"): no fallback to token.txt for those, which cannot read
     credits and would only earn a week-long scope hold."""
     st, tok = login(label)
     if st == "ok":
         return tok, None
-    if st in ("expired", "pending", "org", "fail"):
+    if st in ("expired", "pending", "org", "unreadable", "fail"):
         return None, st
     return _read(os.path.join(ROOT, label, "token.txt")) or None, None
 
@@ -806,11 +810,11 @@ def token_seats():
 def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
     """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "scope" (403: the token cannot read credits, a
     setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "pending" (it has an app login but the seat's organization is
-    not recorded yet: nothing is sent), "org" (its app login has no entry for the seat's organization: nothing is sent), "none" (no token), "fail" (the call failed, or the
+    not recorded yet: nothing is sent), "org" (its app login has no entry for the seat's organization: nothing is sent), "unreadable" (its app login is saved but cannot be read: nothing is sent), "none" (no token), "fail" (the call failed, or the
     app login could not be read: nothing is held). The seat's full app login is used when it has one (seat_token). The token stays in
     this function: never logged, stored or returned."""
     tok, why = seat_token(label, login)
-    if why in ("expired", "pending", "org", "fail"):
+    if why in ("expired", "pending", "org", "unreadable", "fail"):
         return why, None
     if not tok:
         return "none", None
@@ -891,8 +895,8 @@ def claude_org(label):
 
 def reset_refusal(label, tok, why, org):
     """The result a claim is turned away with before anything is sent (`tok`, `why` from seat_token, `org` from claude_org), or None when it can be sent."""
-    if why in ("expired", "org"):
-        return {"outcome": "error", "text": "Seat %s: %s." % (label, NOTE_APP_EXPIRED if why == "expired" else NOTE_APP_ORG)}
+    if why in ("expired", "org", "unreadable"):
+        return {"outcome": "error", "text": "Seat %s: %s." % (label, {"expired": NOTE_APP_EXPIRED, "org": NOTE_APP_ORG, "unreadable": NOTE_APP_UNREADABLE}[why])}
     if why == "fail":
         return {"outcome": "error", "text": "Seat %s: its app login could not be read just now. Try again in a minute." % label}
     if not tok or not org:
@@ -2257,8 +2261,8 @@ class Store:
         call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read; "pending" (an app login whose organization is
         not known yet) sets no hold but a short `next` (CREDITS_PENDING_RETRY, for the first CREDITS_PENDING_TRIES - 1 reads in a row, then the ordinary interval) and a note;
         the run is counted in the entry's `pend`, which any other result clears. credits_tick reads a seat with that note early (forced, whatever is left of `next`) once its
-        organization is recorded. "org" (an app login with no entry for the seat's organization) sets only its note, and "fail" (a failed call, or an app login that could not
-        be read) sets nothing and clears a pending or org note: neither holds the seat, and both are asked again at the ordinary interval. Returns the read's state, "stale"
+        organization is recorded. "org" (an app login with no entry for the seat's organization) sets only its note, "unreadable" (a saved app login the helper could not read) sets only its own note, which a later "fail" leaves and an ok read clears, and "fail" (a failed call, or a helper
+        that gave no answer) sets nothing and clears a pending or org note: none of them holds the seat, and all are asked again at the ordinary interval. Returns the read's state, "stale"
         when a later read owns the entry, or None when it was skipped."""
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
@@ -2283,6 +2287,8 @@ class Store:
                 e["note"] = {"rl": "rate limited", "auth": "sign-in needed", "scope": NOTE_SCOPE}[state]
             elif state == "expired":
                 e["note"] = NOTE_APP_EXPIRED
+            elif state == "unreadable":
+                e["note"] = NOTE_APP_UNREADABLE         # no hold either; only an ok read (or a read of the setup-token that ends in "none") takes it away, a transient "fail" does not
             elif state == "org":
                 e["note"] = NOTE_APP_ORG                # no hold and no short retry: the ordinary interval re-reads it (the login may be refreshed meanwhile)
             elif state == "pending":
@@ -2293,8 +2299,8 @@ class Store:
                 if e["pend"] < CREDITS_PENDING_TRIES:
                     e["next"] = int(now + CREDITS_PENDING_RETRY)
                 e["note"] = NOTE_PENDING
-            elif e.get("note") in (NOTE_PENDING, NOTE_APP_ORG):
-                e.pop("note", None)                     # "none" / "fail": the organization is no longer what is being waited for
+            elif e.get("note") in (NOTE_PENDING, NOTE_APP_ORG) or (state == "none" and e.get("note") == NOTE_APP_UNREADABLE):
+                e.pop("note", None)                     # "none" / "fail": the organization is no longer what is being waited for; "none": there is no longer a saved login to be unreadable
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
@@ -3955,9 +3961,10 @@ def selftest():
                         runs.append((argv, kw))
                         raise exc
                     return r
-                for bad_h_ in (hp_(b"junk"), hp_(b""), hp_(b'{"state":"ok","token":""}'), hp_(b'{"state":"unreadable","why":"app login unreadable"}'), hp_(b'{"state":"surprise"}'), hp_(b"[1]"),
+                for bad_h_ in (hp_(b"junk"), hp_(b""), hp_(b'{"state":"ok","token":""}'), hp_(b'{"state":"surprise"}'), hp_(b"[1]"),
                                raises_(subprocess.TimeoutExpired("pwsh", 60)), raises_(OSError("no pwsh")), raises_(subprocess.SubprocessError("x"))):
                     assert app_login("A", bad_h_) == ("fail", None), bad_h_
+                assert app_login("A", hp_(b'{"state":"unreadable","why":"app login unreadable"}')) == ("unreadable", None)     # persistent: its own state, so it can be told to the user
                 assert app_login("A", hp_(b'{"state":"none","why":"no user:profile login for this account"}')) == (None, None)     # a real "no login": the setup-token is tried as before
                 assert app_login("A", ok_("acct-B")) == (None, None)                                  # the helper's account is not this seat's owner
                 assert app_login("A", ok_("acct-A", "11111111-2222-4333-8444-555555555555")) == ("org", None)     # another organization than the seat's: never used, no setup-token either
@@ -4020,6 +4027,21 @@ def selftest():
         assert st.credits_read("E", t4_, fx, force=True, login=fail_) == "fail" and len(calls) == n_
         ee_ = load_pcache()["credits"]["E"]
         assert "hold" not in ee_ and "pend" not in ee_ and "note" not in ee_ and ee_["next"] == t4_ + CREDITS_EVERY, ee_
+        # an app login the helper reported as saved but unreadable: its own note (not silent), nothing sent, no hold, no setup-token fallback; a later transient "fail" keeps the
+        # note, an ok read clears it; a claim is refused naming it
+        unr_ = lambda l: ("unreadable", None)
+        assert seat_token("E", unr_) == (None, "unreadable") and read_credits("E", JN, lambda req: 1 / 0, None, unr_) == ("unreadable", None)
+        t5_ = t4_ + 25 * CREDITS_EVERY
+        save_pcache(dict(load_pcache(), credits={"E": {"ts": 1}}))
+        n_ = len(calls)
+        assert st.credits_read("E", t5_, fx, force=True, login=unr_) == "unreadable" and len(calls) == n_
+        ee_ = load_pcache()["credits"]["E"]
+        assert ee_["note"] == NOTE_APP_UNREADABLE and "hold" not in ee_ and ee_["next"] == t5_ + CREDITS_EVERY, ee_
+        assert st.credits_read("E", t5_ + 1, bad_, force=True, login=fail_) == "fail" and load_pcache()["credits"]["E"]["note"] == NOTE_APP_UNREADABLE      # a transient fail keeps it
+        assert st.credits_read("E", t5_ + 2, bad_, force=True, login=lambda l: ("ok", "t")) == "fail" and load_pcache()["credits"]["E"]["note"] == NOTE_APP_UNREADABLE
+        assert st.credits_read("E", JN + 61 * CREDITS_EVERY, fx, force=True, login=lambda l: ("ok", "secret-appE")) == "ok" and "note" not in load_pcache()["credits"]["E"]       # an ok read clears it
+        res_u_ = consume_reset("E", "full", "g1", "r1", lambda req: 1 / 0, None, unr_)
+        assert res_u_[0]["outcome"] == "error" and res_u_[1] is None and NOTE_APP_UNREADABLE in res_u_[0]["text"]
         # a seat waiting for its organization (NOTE_PENDING) is read as soon as the organization is recorded, not when its back-off ends; a hold still holds it; without
         # the note a recorded organization changes nothing
         t3_, ucf_ = t2_ + 30 * CREDITS_EVERY, os.path.join(jd, "E", "usage-cache.json")
