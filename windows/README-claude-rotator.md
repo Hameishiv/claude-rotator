@@ -453,6 +453,7 @@ a Claude session.
 |---|---|
 | `claude-account --status` | App state, live account + account UUID, captured profiles |
 | `claude-account --switch <label>` | Back up the current login, load profile `<label>` |
+| `claude-account --switch <label> --relaunch` | Close the running app first (asks its windows to close, waits up to 30 s, and aborts without force-closing if it is still running), switch, then reopen the installed app (the Squirrel `claude.exe` the Start-menu shortcut runs, else `Update.exe --processStart claude.exe`, else the MSIX package). A refused switch reopens the app on its old login. Tests: `test-app-relaunch.ps1` |
 | `claude-account --rotate [label]` | Cycle to the next profile (or switch straight to `<label>`) |
 | `claude-account --capture <label>` | Save the CURRENT app login as profile `<label>` |
 | `claude-account --list` / `--help` | List profiles / print help |
@@ -743,6 +744,26 @@ the credit itself from the last reading, soonest expiry first, and never takes a
 organization from the seat's `usage-cache.json`), and reads that seat's credits again. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
 keeps its `request_id` in the provider cache, so applying again retries the same claim instead of spending a second reset. Code: `Store.claude_reset`,
 `consume_reset` and `usable_grants` in `usage-history.py` (selftest block K); the kinds' wording is `QUOTA_RESET_KINDS` in `usage-sim.js`.
+
+**Switching seats from the dashboard.** In the app, each seat row has a Switch column and each provider header a button; they run the rotators next to
+`usage-history.py`, never a copy of their logic, so every rotator check (integrity gate, seat lock, VM-shared block, re-capture of the seat being left)
+still applies. `POST /api/switch` `{provider, role, seat}` (same Host and `X-Quota-App` guards, one action at a time across Refresh, the resets and the
+switches) runs, with no window and a 120 s limit:
+
+| Button | Runs | Asks first |
+|---|---|---|
+| Claude `Use for CLI` | `pwsh -NoProfile -File claude-cli-account.ps1 --switch <L> --no-usage` | no |
+| Claude `Use for App` | `claude-app-rotator.ps1 --switch <L> --relaunch` | yes: "Quitting the Claude app ends the sessions running in it." |
+| Claude header `Best seat` | `claude-cli-account.ps1 --switch best --no-usage` (`--best` only prints the ranking) | no |
+| Codex `Use for CLI + App` | `codex-app-rotator.ps1 --switch <L>` | yes |
+| Codex header `Next seat` | `codex-app-rotator.ps1 --rotate` (the next saved seat in order, not a headroom pick) | yes |
+
+A button is left off the seat that already holds that role (its CLI/App badge) and off seats the rotator cannot use (Claude CLI: no `token.txt`; Claude
+app: no captured `config.json`; Codex: no saved `auth.json`). The Codex buttons appear only when `codex-app-rotator.ps1` sits next to
+`usage-history.py` (it is not in this repo). The result shows as a toast: the exit code and the rotator's last unindented line, with tokens and email
+addresses removed; the action is also written to the app log, and the data is reloaded so the badges move. Code: `switch_targets`, `switch_check`,
+`switch_argv`, `run_switch`, `switch_outcome`, `Store.switch` in `usage-history.py` (selftest block L); the buttons are `quotaSwitchBtns` /
+`quotaBestBtn` in `usage-sim.js`.
 
 ## Keeping the install in sync (`rotator-sync`)
 
