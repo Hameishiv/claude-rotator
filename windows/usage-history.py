@@ -2079,7 +2079,7 @@ def codex_seat_from_read(rl, now):
     secondary slot is the weekly window and the primary the 5-hour one; a lone primary is the weekly."""
     def slot(k):
         w = rl.get(k) if isinstance(rl, dict) else None
-        return w if isinstance(w, dict) and "used_percent" in w else None       # present even when its value is bad, so the slots never shift
+        return w if isinstance(w, dict) and w.get("used_percent") is not None else None     # null = no such window (the script fills an absent one with nulls); a bad value (NaN) still holds its place
     p, s = slot("primary"), slot("secondary")
     weekly, session = (s, p) if s else (p, None)
     seat = {"ts": int(now)}
@@ -3373,6 +3373,8 @@ def selftest():
             assert parse_grok({"config": {"currentPeriod": {"start": "2026-11-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}, "creditUsagePercent": "NaN"}}) is None
             assert finite({"a": float("nan"), "b": [float("inf"), 1.5], "c": {"d": float("-inf"), "e": 2}}) == {"b": [None, 1.5], "c": {"e": 2}}
             assert codex_seat_from_read({"primary": {"used_percent": 30, "resets_at": 1800000000}, "secondary": {"used_percent": "NaN", "resets_at": 1}}, 5)["sp"] == 18000
+            lone_ = codex_seat_from_read({"primary": {"used_percent": 5, "resets_at": 9}, "secondary": {"used_percent": None, "resets_at": None}}, 5)   # the script's real shape for a lone window
+            assert lone_.get("w") == 0.05 and lone_.get("wp") == WEEK and "s" not in lone_, lone_
             # a point already on disk (a failed earlier append, a --backfill) is not appended twice
             n_ = len(st.hist)
             dup_ = {"t": K_ + 3 * BUCKET5 + 40, "codex": {"A": {"ts": K_ + 3 * BUCKET5 + 40, "w": 0.66}}}
