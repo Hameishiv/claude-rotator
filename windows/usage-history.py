@@ -671,10 +671,10 @@ BT_TARGETS = (("claude", "w", "Claude all models"), ("claude", "f", "Claude Fabl
 BT_METHODS = ("typical", "3h", "24h")
 
 
-def backtest(hist, targets=BT_TARGETS, every=6 * 3600, ahead=DAY):
+def backtest(hist, targets=BT_TARGETS, every=6 * 3600, ahead=DAY, fresh=6 * 3600, minpts=8):
     """How well each rate method projects 24 h ahead: {target label: {"n": origins, method: mean absolute error in pooled % points}}.
     An origin is every 6 h grid point with at least 24 h of history behind it and `ahead` of recorded history after it. Each method projects
-    from the state at the origin with quotaProject's rules (typical: the hour profile of the history before the origin only; 3h, 24h: that burn
+    from the state at the origin (the last record at most `fresh` s old; `minpts` recorded points needed after it) with quotaProject's rules (typical: the hour profile of the history before the origin only; 3h, 24h: that burn
     held flat); the error at an origin is the mean |projected - recorded| over the recorded points in the next `ahead`, the figure is the mean over origins."""
     out = {}
     for pid, wid, label in targets:
@@ -688,9 +688,9 @@ def backtest(hist, targets=BT_TARGETS, every=6 * 3600, ahead=DAY):
         while t0 + ahead <= ts[-1]:
             i = bisect.bisect_right(ts, t0) - 1
             actual = [(ts[j] - t0, lefts[j]) for j in range(i + 1, bisect.bisect_right(ts, t0 + ahead))]
-            prof = hour_profile(rows[:i + 1], wid, pid) if t0 - ts[i] <= 6 * 3600 else None
+            prof = hour_profile(rows[:i + 1], wid, pid) if t0 - ts[i] <= fresh else None
             rates = {"typical": prof and prof[0], "3h": burn_p(p, 3, t0), "24h": burn_p(p, 24, t0)}
-            if len(actual) >= 8 and all(r is not None for r in rates.values()):
+            if len(actual) >= minpts and all(r is not None for r in rates.values()):
                 seats = []
                 for s in seats_of(rows[i], pid).values():
                     u = util_at(s, wid, t0)
