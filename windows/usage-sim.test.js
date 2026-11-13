@@ -274,4 +274,12 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.strictEqual(btn({ emails: false }, () => ''), '<button data-a="emails">Show emails</button>');
   assert.strictEqual(btn({ emails: true }, () => ''), '<button data-a="emails">Hide emails</button>');
 }
+// the refresh button is plain "Refresh"
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const i = tpl.indexOf('(D.app ? `<button class="primary" data-a="refresh"'), j = tpl.indexOf("</button>` : '')", i) + "</button>` : '')".length;
+  const btn = new Function('D', 'busy', 'ico', 'return ' + tpl.slice(i, j));
+  assert.strictEqual(btn({ app: true }, false, () => ''), '<button class="primary" data-a="refresh">Refresh</button>');
+  assert.ok(!tpl.includes('Refresh all credentials'));
+}
 console.log('usage-sim tests passed');

@@ -677,7 +677,7 @@ def consume_reset(label, kind, gid, rid, fetch, ver=None):
     token stays in this function: never logged, stored or returned."""
     tok, org, name = _read(os.path.join(ROOT, label, "token.txt")), claude_org(label), CREDIT_KINDS[kind]
     if not tok or not org:
-        return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh all credentials, then try again." % label}, None
+        return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh, then try again." % label}, None
     req = urllib.request.Request(RESET_URL % org, method="POST", data=json.dumps({"program": "cedar_ember", "grant_id": gid, "request_id": rid}).encode("utf-8"),
                                  headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20", "content-type": "application/json",
                                           "user-agent": "claude-cli/%s (external, cli)" % (ver or CLI_FALLBACK)})

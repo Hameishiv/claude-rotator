@@ -331,7 +331,7 @@ function render() {
     `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
     `<div class="row t"><h1>Quota Management</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
     `<button data-a="emails">${ico('eye')}${ui.emails ? 'Hide emails' : 'Show emails'}</button>` +
-    (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh all credentials'}</button>` : '') +
+    (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh'}</button>` : '') +
     `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
     `<div class="msg" role="status">${esc(msg)}</div>` +
     `<div class="row tabs" role="group" aria-label="Provider"><button data-a="tab" data-v="all" aria-pressed="${ui.tab === 'all'}">${ico('grid')}All <span class="n">${tot}</span></button>` +
