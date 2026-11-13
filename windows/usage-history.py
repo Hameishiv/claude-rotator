@@ -2088,9 +2088,9 @@ class Store:
         with self.lock:
             now = time.time()
             rec = sample(now, force)
-            new = self.read_rollouts(now, None, rec)        # first, so the sample can be merged with what the logs saw
+            new = self.read_rollouts(now)                   # first, and every point of them, so the sample is merged with all the logs saw
             self.hist = save(self.hist, newest_codex(rec, self.hist, new), now)
-            self.append_rollouts(new)
+            self.append_rollouts([r for r in new if r["t"] // BUCKET5 != rec["t"] // BUCKET5])     # the sample now holds its own bucket
             return self.rebuild(now)
 
     def codex_reset(self, seat, script, popen=subprocess.Popen):
@@ -2868,6 +2868,18 @@ def selftest():
             zs = [h for h in st.hist if "codex" in h]
             assert zs[-1]["t"] == N + 1000 and zs[-1]["codex"]["A"]["w"] == 0.7, zs[-2:]
             assert len({h["t"] // BUCKET5 for h in zs}) == len(zs)
+            # a newer log reading inside the sample's own 5-minute bucket is not lost: the cache says 20 %, the log 60 % -> the sample says 60 %
+            T_ = (N + 3000) // BUCKET5 * BUCKET5 + 200
+            roll(os.path.join(td, "homes", "A", "sessions", "rollout-same.jsonl"), [tc(T_ - 100, wk=(60, WA))], T_ - 90)
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": {"ts": T_ - 150, "w": 0.2, "wr": WA, "wp": WEEK}}}
+                time.time = lambda: T_
+                st.take()
+            finally:
+                globals()["sample"], time.time = keep_s, real_time
+            zs = [h for h in st.hist if "codex" in h]
+            assert zs[-1]["t"] == T_ and zs[-1]["codex"]["A"]["w"] == 0.6 and zs[-1]["codex"]["A"]["ts"] == T_ - 100, zs[-2:]
+            assert len({h["t"] // BUCKET5 for h in zs}) == len(zs) and load_pcache()["codex_import"] == T_
         finally:
             HIST, PCACHE = keep
         # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
