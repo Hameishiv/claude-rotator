@@ -191,13 +191,30 @@ def roll_back(plan):
 
 
 def roll_back_journal(jpath):
-    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none."""
+    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal marked
+    "complete" belongs to an update whose every swap succeeded (only its deletion failed): it is deleted and nothing is restored."""
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away
-    res = roll_back([tuple(e) for e in load_json(jpath).get("files") or []])
+    j = load_json(jpath)
+    if j.get("complete") is True:
+        drop_journal(jpath)
+        return None
+    res = roll_back([tuple(e) for e in j.get("files") or []])
     with contextlib.suppress(FileNotFoundError):
         os.remove(jpath)
     return res
+
+
+def drop_journal(jpath):
+    """Delete a pull's journal; a journal that cannot be deleted is warned about, never an error (an update that is already in place must still report success)."""
+    try:
+        os.remove(jpath)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.stderr.write("rotator-sync: warning: could not delete the update journal %s (%s: %s); delete it by hand%s\n" % (
+            jpath, type(e).__name__, e, "" if os.path.exists(jpath) and load_json(jpath).get("complete") is True else
+            ", or the next --check will put the files back as they were before the update"))
 
 
 def say_recovered(res):
@@ -297,8 +314,12 @@ def pull_locked(repo, live, ref, state, jpath):
         err = None
     except OSError as e:
         err, (_, bad) = e, roll_back(plan)
-    with contextlib.suppress(OSError):
-        os.remove(jpath)
+    if not err and plan:
+        # Every swap succeeded: say so in the journal (an atomic rewrite) BEFORE deleting it, so that a delete that fails cannot make the next --check roll the
+        # successful update back; recovery deletes a complete journal and restores nothing.
+        with contextlib.suppress(OSError):
+            write_state(jpath, {"files": plan, "complete": True})
+    drop_journal(jpath)
     if err:
         e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
@@ -310,8 +331,8 @@ def pull_locked(repo, live, ref, state, jpath):
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
     if any(rel in RESTART_FILES for rel, _ in staged):
-        # the running dashboard server loaded the old script and template at start and keeps serving them
-        print("rotator-sync: the usage dashboard's files changed; restart it so the running server picks them up "
+        # the page (template + usage-sim.js) is re-read on every request, so it is already new; only usage-history.py's server code waits for a restart
+        print("rotator-sync: the usage dashboard's files changed; the page is already the new one, but the running server is still the old code: restart it now so the two match "
               "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s')" % (DASHBOARD_TASK, DASHBOARD_TASK))
     if any(rel in PROXY_FILES for rel, _ in staged):
         # the rotate proxy imported rotator_access.py at start; its task relaunches it within a minute once it is stopped
@@ -530,6 +551,39 @@ def selftest():
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
         check("state reset after pull", load_json(state)["differing"] == [])
+        # a pull whose every swap succeeded but whose journal cannot be deleted: it is marked complete first, warns, and the next --check leaves the update in place
+        write(os.path.join(live, "b.py"), b"a local edit\n")
+        real_remove = os.remove
+
+        def stuck_remove(path, *a, **kw):
+            if path == jp_:
+                raise PermissionError("in use")
+            return real_remove(path, *a, **kw)
+        os.remove = stuck_remove
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+                rc_j = cmd_pull(repo, live, "HEAD", state)
+        finally:
+            os.remove = real_remove
+        check("a journal that cannot be deleted after a successful pull is a warning, not a failure",
+              rc_j == 0 and "warning: could not delete the update journal" in buf.getvalue() and compare(repo, live, "HEAD") == ([], []))
+        check("... and it is left marked complete", os.path.exists(jp_) and load_json(jp_).get("complete") is True and load_json(jp_).get("files"))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            recover(state)
+        check("the next --check deletes the complete journal and restores nothing", not os.path.exists(jp_) and buf.getvalue() == ""
+              and compare(repo, live, "HEAD") == ([], []))
+        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None]]})
+        write(os.path.join(live, "stale-added.txt"), b"x\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            recover(state)
+        check("... while a journal that is not complete is still rolled back", not os.path.exists(jp_) and not os.path.exists(os.path.join(live, "stale-added.txt"))
+              and "recovered an interrupted update" in buf.getvalue())
+        for n in os.listdir(live):
+            if ".bak-sync-" in n:
+                os.remove(os.path.join(live, n))
 
         # the ref is resolved once: a fetch moving it mid-pull does not change what --pull installs
         write(os.path.join(live, "b.py"), b"print(3)\n")

@@ -212,6 +212,12 @@ try {
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $hung = Get-CliVersion -Preferred $prefStub -TimeoutMs 1500
   Check 'a hung claude --version times out to the fallback, quickly' ($hung -eq '2.1.322' -and $sw.Elapsed.TotalSeconds -lt 12) ('{0} after {1:n1}s' -f $hung, $sw.Elapsed.TotalSeconds)
+  # a child that exits at once but leaves a grandchild holding the stdout pipe open (ping runs ~12 s): the read of its output is bounded by the same timeout
+  Set-Content -LiteralPath $prefStub -Value "@echo off`r`nstart /b ping -n 13 127.0.0.1`r`nexit /b 0" -Encoding ASCII
+  $script:CliVersion = $null
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $held = Get-CliVersion -Preferred $prefStub -TimeoutMs 3000
+  Check 'an output pipe held open after the child exits times out to the fallback, quickly' ($held -eq '2.1.322' -and $sw.Elapsed.TotalSeconds -lt 8) ('{0} after {1:n1}s' -f $held, $sw.Elapsed.TotalSeconds)
 } finally { $env:PATH = $pathKeep; $script:CliVersion = '2.1.322' }      # the rest of the run never spawns the real CLI
 
 # --- active B is subscription-disabled; A is the best eligible seat and must be selected ---

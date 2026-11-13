@@ -289,10 +289,13 @@ function Get-CliVersion {
     try {
       $psi = [System.Diagnostics.ProcessStartInfo]::new($exePath, '--version')
       $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
       $p = [System.Diagnostics.Process]::Start($psi)
       $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()      # both drained, so a chatty stderr cannot fill its pipe and stall the wait
-      if ($p.WaitForExit($TimeoutMs)) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
-      else { try { $p.Kill($true) } catch { try { $p.Kill() } catch {} } }     # our own child and its tree, by handle: never by name (Kill($true) needs PowerShell 7; 5.1 kills the child only)
+      # One budget for the exit AND the read: a child that exits but leaves a grandchild holding the stdout pipe open would otherwise block `.Result` forever.
+      $done = $p.WaitForExit($TimeoutMs) -and $out.Wait([int][Math]::Max(0, $TimeoutMs - $sw.ElapsedMilliseconds))
+      if ($done) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
+      else { try { $p.Kill($true) } catch { try { $p.Kill() } catch {} } }     # our own child and its tree, by handle: never by name (Kill($true) needs PowerShell 7; 5.1 kills the child only). An already-exited child is a no-op
     } catch { $v = '' } finally { if ($p) { $p.Dispose() } }
   }
   if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = '2.1.322' }

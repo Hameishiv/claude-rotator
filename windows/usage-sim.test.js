@@ -285,9 +285,13 @@ assert.strictEqual(quotaShare(600, 600), 100);
     pair.openClear('A', 'claude', 'full');
     assert.ok(dlg2.innerHTML.includes('Clear the pending full reset on seat A?') && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg2.innerHTML), dlg2.innerHTML);
     await pair.doReset();
+    assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full', requestId: 'r-1' }]);
+    assert.strictEqual(sent.length, 3);
+    const opened = dlg2.opened;
     pair.openClear('A', 'claude', 'nonsense');                                    // an unknown kind opens nothing
     pair.openClear('A', 'claude', 'fable');                                       // a kind with no pending claim in view opens nothing: there is no claim to name
-    assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full', requestId: 'r-1' }]);
+    assert.strictEqual(dlg2.opened, opened);                                      // no dialog was shown ...
+    await pair.doReset();                                                         // ... so there is nothing to confirm: a confirm click sends nothing
     assert.strictEqual(sent.length, 3);
   })().catch(e => { console.error(e); process.exit(1); });
 }
