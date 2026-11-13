@@ -752,9 +752,12 @@ def build_provider(hist, pid, emails, now, extra):
         accounts.append(a)
     if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
         meas = measured_ratios((extra.get("codex") or {}).get("pairs") or {}, now)
+        sug = weight_suggestions((extra.get("codex") or {}).get("pairs") or {}, now)
         for a in accounts:
             x, n = meas.get(a["label"], (None, 0))
             a["ratio"] = dict({"n": n}, **({"x": round(x, 2)} if x is not None else {}))
+            if a["label"] in sug:
+                a["suggest"] = {"w": sug[a["label"]][0], "n": sug[a["label"]][1]}
     dflt = {w: p for w, _, p in wins}
     limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
     out = {"id": pid, "name": name, "total": len(accounts), "loaded": sum(a["ok"] for a in accounts),
@@ -1114,11 +1117,38 @@ def token_pairs(events):
 def measured_ratios(pairs, now, days=21, minn=5):
     """{seat: (ratio or None, samples)} from codex_measure's pairs: a seat's median tokens per 1 % over the last `days` days (at least `minn` pairs, else no ratio),
     divided by the median of that figure over the weight-1 seats that have one. A sanity check on the configured weights, not an input to them."""
-    recent = {s: [v for t, v in p if t >= now - days * DAY] for s, p in pairs.items()}
-    med = {s: statistics.median(v) for s, v in recent.items() if len(v) >= minn}
-    ref = [m for s, m in med.items() if wt("codex", s)[0] == 1]
-    base = statistics.median(ref) if ref else None
+    recent, med, base = _measured(pairs, now, days, minn)
     return {s: (med[s] / base if s in med and base else None, len(v)) for s, v in recent.items()}
+
+
+def _measured(pairs, now, days, minn):
+    """(recent {seat: [(t, tokens per 1 %)]}, median {seat: tokens per 1 %} of the seats with `minn`, reference: the median over the weight-1 seats among them or None)."""
+    recent = {s: [(t, v) for t, v in p if t >= now - days * DAY] for s, p in pairs.items()}
+    med = {s: statistics.median(v for _, v in r) for s, r in recent.items() if len(r) >= minn}
+    ref = [m for s, m in med.items() if wt("codex", s)[0] == 1]
+    return recent, med, statistics.median(ref) if ref else None
+
+
+def nice_weight(x):
+    """A measured ratio as a weight worth typing: the nearest 0.5 below 3 (never 0, which would drop the seat), a whole number from 3 up."""
+    return math.floor(x + .5) if x >= 3 else max(0.5, math.floor(x * 2 + .5) / 2)
+
+
+def weight_suggestions(pairs, now, days=21, minn=20, steady=1.25, off=1.3):
+    """{seat: (suggested weight, samples)} for the Codex seats whose measured ratio deserves a different weight: at least `minn` samples in the last `days` days, the
+    older and the newer half of them (by time) each within `steady` of the other against the same reference, and the ratio more than `off` away from the seat's current
+    weight once rounded by nice_weight to something else. A suggestion only: nothing applies it."""
+    recent, med, base = _measured(pairs, now, days, 5)
+    out = {}
+    for s, r in recent.items():
+        if not base or len(r) < minn:
+            continue
+        v = [x for _, x in sorted(r)]
+        old, new = (statistics.median(h) / base for h in (v[:len(v) // 2], v[len(v) // 2:]))
+        w, x = wt("codex", s)[0], med[s] / base
+        if max(old, new) / min(old, new) <= steady and w > 0 and max(x / w, w / x) > off and nice_weight(x) != w:
+            out[s] = (nice_weight(x), len(r))
+    return out
 
 
 def codex_measure(cdir=None, now=None):
@@ -2177,6 +2207,28 @@ def selftest():
         assert [a["ratio"] for a in blob] == [{"n": 8, "x": 1.0}, {"n": 8, "x": 5.0}, {"n": 3}, {"n": 0}], [a["ratio"] for a in blob]
         assert "ratio" not in build([{"t": N, "s": {"A": {"w": .2, "wr": N + 9999}}}], N, {}, False, {})["providers"][0]["accounts"][0]       # Codex only
         set_weights(None)
+    # I: a suggested weight for a Codex seat, from the same pairs: at least 20 samples, steady older and newer halves, more than 30 % off the weight, rounded
+    def at(*vals):
+        """(t, tokens per 1 %) samples an hour apart, the last one now."""
+        return [(N - (len(vals) - 1 - i) * 3600, float(v)) for i, v in enumerate(vals)]
+    refs = {"A": at(*[1000] * 8), "C": at(*[1000] * 8)}
+    sug = lambda b, w=None: (set_weights({"seat": {"codex": {"B": w}}} if w is not None else None), weight_suggestions(dict(refs, B=b), N))[1]
+    assert sug(at(*[3000] * 24)) == {"B": (3, 24)}                                           # qualifies: x3, steady
+    assert sug(at(*[3000] * 19)) == {} and sug(at(*[3000] * 20)) == {"B": (3, 20)}          # 20 samples are enough, 19 are not
+    assert sug(at(*[2000] * 12 + [4000] * 12)) == {} and sug(at(*[4000] * 12 + [2000] * 12)) == {}      # unsteady: the halves are 2x apart, whichever way
+    assert sug(at(*[2800] * 12 + [3500] * 12)) == {"B": (3, 24)}                             # halves 1.25 apart: still steady
+    assert sug(at(*[2800] * 12 + [3600] * 12)) == {}                                         # 1.29 apart: not
+    assert sug(at(*[1250] * 24)) == {} and sug(at(*[1350] * 24)) == {"B": (1.5, 24)}        # within 30 % of the weight 1: nothing; beyond it: 1.35 -> 1.5
+    assert sug(at(*[760] * 24)) == {}                                                        # 1 / 0.76 is off, but the nearest 0.5 is the weight itself
+    assert sug(at(*[5200] * 24), 5.0) == {} and sug(at(*[3000] * 24), 5.0) == {"B": (3, 24)}    # against a configured weight
+    assert sug(at(*[3000] * 24), 0.0) == {}                                                  # weight 0: left out, nothing to suggest
+    assert sug(at(*[3000] * 24)) != {} and weight_suggestions({"B": at(*[3000] * 24)}, N) == {}      # no weight-1 seat to measure against
+    assert sug([(t - 30 * 86400, v) for t, v in at(*[3000] * 24)]) == {}                     # older than 21 days: not counted
+    assert [nice_weight(x) for x in (0.2, 0.74, 0.76, 1.3, 2.74, 2.76, 2.9, 3.4, 3.5, 4.5, 11.6)] == [0.5, 0.5, 1.0, 1.5, 2.5, 3, 3, 3, 4, 5, 12]
+    bl = build([{"t": N, "codex": {s: {"w": .2, "wr": N + 9999, "wp": WEEK, "ts": N} for s in "ABC"}}], N, {}, False,
+               {"codex": {"pairs": dict(refs, B=at(*[3000] * 24))}})["providers"][0]["accounts"]
+    assert [a.get("suggest") for a in bl] == [None, {"w": 3, "n": 24}, None] and type(bl[1]["suggest"]["w"]) is int, bl
+    set_weights(None)
     # the page keeps both placeholders from being re-scanned and escapes </
     assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
     # icons: a valid PNG signature and an ICO header
