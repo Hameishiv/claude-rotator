@@ -88,9 +88,11 @@ td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--b
 .inuse{display:inline-flex;flex-wrap:wrap;gap:6px}
 td small{display:block;color:var(--muted);font-size:12px}
 li small{color:var(--muted);font-size:12px;margin-left:6px}
-td.w{color:var(--warn)}
+td.w3{color:color-mix(in srgb,var(--warn) 45%,var(--muted))}
+td.w{color:var(--warn);font-weight:600}
 td.nt{color:var(--warn);white-space:normal;min-width:220px}
-ul.nl{margin:12px 0 0;padding-left:20px;color:var(--muted)}
+.empty{margin-top:12px;padding:14px 16px;border-radius:12px;background:var(--bg);color:var(--ink2)}
+.empty p{margin:0}.empty p+p{margin-top:6px}
 .rs{display:block;margin-top:6px;padding:4px 10px;font-size:13px;color:var(--ink)}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--grid);border-radius:16px;padding:20px;width:min(460px,calc(100vw - 32px));font:inherit}
 dialog::backdrop{background:rgba(0,0,0,.6)}
@@ -102,7 +104,7 @@ dialog .dact{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);max-width:min(560px,calc(100vw - 32px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;z-index:5;box-shadow:0 2px 12px rgba(0,0,0,.35)}
 .toast[hidden]{display:none}
-@media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}}
+@media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}.stat{text-align:left}th,td{padding:8px 6px}.bar{min-width:60px}}
 </style>
 </head>
 <body>
@@ -253,6 +255,10 @@ function chart(p, lim, W) {
   return `<div class="chart" data-p="${esc(p.id)}"><svg class="c" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}"><defs><linearGradient id="g-${esc(p.id)}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--acc)" stop-opacity=".32"/><stop offset="1" stop-color="var(--acc)" stop-opacity=".02"/></linearGradient></defs>${s.join('')}</svg><div class="tip"></div></div><p class="note">${notes.join(' · ')}</p>${young}`;
 }
 
+// A reading over 3 h old is a muted warning (Codex readings go stale between codex-usage runs); over 24 h the stronger one.
+const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 86400 ? ' class="w" title="Reading is over a day old"' : s > 10800 ? ' class="w3" title="Reading is over 3 hours old"' : ''; };
+// A reset time more than 6 days away would read like the weekday just gone ("Thu" on a Friday): give it its date.
+const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
 const resetBtn = (p, a) => D.app && p.canReset && a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
 function accounts(p) {
@@ -265,9 +271,9 @@ function accounts(p) {
       const w = a.windows.find(x => x.id === id);
       if (!w) return '<td>–</td>';
       const lv = quotaLevel(p.id, w), pct = w.used == null ? null : Math.round(w.used * 100);
-      return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtWT(w.reset))}</small>` : ''}</td>`;
+      return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtRS(w.reset))}</small>` : ''}</td>`;
     }).join('');
-    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${a.readAt && D.now - a.readAt > 86400 ? ' class="w"' : ''}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');
   return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
 }
@@ -282,7 +288,8 @@ function panel(p, W) {
     h += `<div class="hd"><div><span class="big">${Math.round(sh(lim.now, lim))}%</span><span class="of">left across ${seatsTxt(lim)}</span></div><div class="stat"><span class="muted">Usage rate</span><b>${rf.avg == null ? 'not enough history yet' : fr(sh(rf.avg, lim)) + '%/h'}</b><span class="muted why">${esc(rf.why)}</span></div></div>`;
     h += chart(p, lim, W);
   } else {
-    h += `<p class="muted">No usage data yet.</p>` + (p.accounts.some(a => a.note) ? `<ul class="nl">${p.accounts.filter(a => a.note).map(a => `<li>${nm(a)}: ${esc(a.note)}</li>`).join('')}</ul>` : '');
+    const ns = p.accounts.filter(a => a.note);
+    return h + `<div class="empty">${ns.length ? ns.map(a => `<p>${p.accounts.length > 1 ? nm(a) + ': ' : ''}${esc(a.note)}</p>`).join('') : '<p>No usage data yet.</p>'}</div></section>`;
   }
   return h + accounts(p) + '</section>';
 }
