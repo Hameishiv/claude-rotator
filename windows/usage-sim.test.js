@@ -193,4 +193,20 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.deepStrictEqual([['claude', 'cli'], ['claude', 'best'], ['claude', 'app'], ['codex', 'both'], ['codex', 'best']].map(([p, r]) => quotaSwitchAsks(p, r)), [false, false, true, true, true]);
   assert.deepStrictEqual(Object.keys(QUOTA_SWITCH.claude), ['cli', 'app', 'best']);
 }
+// a provider with no pooled chart (every seat weighted 0) still gets its accounts table, and says why there is no chart
+{
+  const { quotaNoPool } = require('./usage-sim.js');
+  assert.strictEqual(quotaNoPool({ accounts: [{ w: 0 }, { w: 0 }] }), 'No seats counted in the pool (all weights are 0).');
+  assert.strictEqual(quotaNoPool({ accounts: [{ w: 0 }, {}] }), '');
+  assert.strictEqual(quotaNoPool({ accounts: [] }), '');
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const src = tpl.slice(tpl.indexOf('function panel(p, W) {'), tpl.indexOf('\nfunction render('));
+  const deps = { ui: { lim: {} }, D: { app: true }, esc: s => String(s), sh: x => x, quotaBankedTotal: () => null, quotaInUse: () => '', quotaBestBtn: () => '',
+    swBusy: () => false, rateFor: () => ({}), seatsTxt: () => '', fr: x => x, chart: () => '', nm: a => a.label, accounts: () => '<ACCOUNTS>', quotaNoPool };
+  const panel = new Function(...Object.keys(deps), src + '\nreturn panel;')(...Object.values(deps));
+  const zero = panel({ id: 'claude', name: 'Claude', total: 2, limits: [], accounts: [{ label: 'A', w: 0, note: '' }, { label: 'B', w: 0, note: '' }] }, 600);
+  assert.ok(zero.includes('<ACCOUNTS>') && zero.includes('No seats counted in the pool (all weights are 0).') && !zero.includes('No usage data yet.'), zero);
+  const none = panel({ id: 'grok', name: 'xAI', total: 1, limits: [], accounts: [{ label: 'grok', note: '' }] }, 600);
+  assert.ok(none.includes('<ACCOUNTS>') && none.includes('No usage data yet.'), none);
+}
 console.log('usage-sim tests passed');

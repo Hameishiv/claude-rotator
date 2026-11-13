@@ -303,9 +303,9 @@ function panel(p, W) {
     const rf = rateFor(lim);
     h += `<div class="hd"><div><span class="big">${Math.round(sh(lim.now, lim))}%</span><span class="of">left across ${seatsTxt(lim)}</span></div><div class="stat"><span class="muted">Usage rate</span><b>${rf.avg == null ? 'not enough history yet' : fr(sh(rf.avg, lim)) + '%/h'}</b><span class="muted why">${esc(rf.why)}</span></div></div>`;
     h += chart(p, lim, W);
-  } else {
-    const ns = p.accounts.filter(a => a.note);
-    return h + `<div class="empty">${ns.length ? ns.map(a => `<p>${p.accounts.length > 1 ? nm(a) + ': ' : ''}${esc(a.note)}</p>`).join('') : '<p>No usage data yet.</p>'}</div></section>`;
+  } else {        // no pooled chart; the accounts table below still carries the readings and the reset/switch buttons
+    const ps = (quotaNoPool(p) ? [`<p>${esc(quotaNoPool(p))}</p>`] : []).concat(p.accounts.filter(a => a.note).map(a => `<p>${p.accounts.length > 1 ? nm(a) + ': ' : ''}${esc(a.note)}</p>`));
+    h += `<div class="empty">${ps.length ? ps.join('') : '<p>No usage data yet.</p>'}</div>`;
   }
   return h + accounts(p) + '</section>';
 }
