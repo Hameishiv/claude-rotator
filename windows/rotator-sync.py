@@ -165,7 +165,41 @@ def record(repo, live, ref, state, at=None):
     return differing, missing, sha
 
 
+def roll_back(plan):
+    """Put back every file of a pull's plan [(dest, backup or None)]: a swapped one from its backup, an added one removed; its temp goes too.
+    A file not swapped yet has no backup and no new copy, so it is left as it is. -> the paths that could not be put back."""
+    bad = []
+    for dest, bak in reversed(plan):
+        try:
+            if bak and os.path.exists(bak):
+                shutil.copy2(bak, dest)
+            elif not bak and os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            bad.append(dest)
+        with contextlib.suppress(OSError):
+            os.remove(dest + ".tmp-sync")
+    return bad
+
+
+def recover(state):
+    """A --pull that died mid-swap left its journal (<state>.pull-journal.json): put every file back and say so. Skipped while a pull holds
+    the journal's lock, so a --check never undoes a pull that is still running."""
+    jpath = state + ".pull-journal.json"
+    if not os.path.exists(jpath):
+        return
+    try:
+        with state_lock(jpath, wait=0):
+            plan = [tuple(e) for e in load_json(jpath).get("files") or []]
+            bad = roll_back(plan)
+            os.remove(jpath)
+    except TimeoutError:
+        return
+    sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (len(plan) - len(bad), "; restore by hand: " + ", ".join(bad) if bad else ""))
+
+
 def cmd_check(repo, live, ref, state, quiet):
+    recover(state)
     maybe_fetch(repo, ref, state)
     differing, missing, sha = record(repo, live, ref, state)
     if not quiet:
@@ -181,16 +215,19 @@ def cmd_check(repo, live, ref, state, quiet):
 
 
 def cmd_pull(repo, live, ref, state):
+    recover(state)
     maybe_fetch(repo, ref, state, force=True)
     at = resolve(repo, ref)
     differing, missing = compare(repo, live, at)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     # All or nothing: a half-applied update (a script replaced before the new file it imports arrives) cannot start. So every new
     # version is read and written to a .tmp-sync sibling first, touching nothing live; only then is each one swapped in, after a
-    # backup, and any failure puts back every file already swapped (and removes the ones added) before it is reported.
+    # backup, and any failure puts back every file already swapped (and removes the ones added) before it is reported. Added files go in first,
+    # so a new file a changed one imports is there before it; the plan is journaled before the first swap, so a killed pull is rolled back
+    # by the next --pull or --check.
     staged = []
     try:
-        for rel in differing + missing:
+        for rel in missing + differing:
             dest = os.path.join(live, *rel.split("/"))
             data = repo_bytes(repo, at, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -202,28 +239,23 @@ def cmd_pull(repo, live, ref, state):
             with contextlib.suppress(OSError):
                 os.remove(dest + ".tmp-sync")
         raise
-    done = []                                   # (dest, its backup, or None for a file this pull added)
-    try:
-        for rel, dest in staged:
-            bak = None
-            if rel in differing:
-                bak = "%s.bak-sync-%s" % (dest, stamp)
-                shutil.copy2(dest, bak)
-            os.replace(dest + ".tmp-sync", dest)
-            done.append((dest, bak))
-    except OSError as e:
-        bad = []
-        for dest, bak in reversed(done):
-            try:
+    plan = [(dest, "%s.bak-sync-%s" % (dest, stamp) if rel in differing else None) for rel, dest in staged]
+    jpath = state + ".pull-journal.json"
+    with state_lock(jpath):
+        if plan:
+            write_state(jpath, {"files": plan})
+        try:
+            for dest, bak in plan:
                 if bak:
-                    shutil.copy2(bak, dest)
-                else:
-                    os.remove(dest)
-            except OSError:
-                bad.append(dest)
-        for _, dest in staged:
-            with contextlib.suppress(OSError):
-                os.remove(dest + ".tmp-sync")
+                    shutil.copy2(dest, bak)
+                os.replace(dest + ".tmp-sync", dest)
+            err = None
+        except OSError as e:
+            err, bad = e, roll_back(plan)
+        with contextlib.suppress(OSError):
+            os.remove(jpath)
+    if err:
+        e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
                          "these could not be put back, restore them from their .bak-sync-%s copies: %s" % (stamp, ", ".join(bad))))
         record(repo, live, ref, state, at)
@@ -335,6 +367,46 @@ def selftest():
         check("a failed swap reports failure", rc_ == 1 and len(swaps) == 3)
         check("... and live is exactly as before", {n: open(os.path.join(live, n), "rb").read() for n in before_} == before_
               and not os.path.exists(os.path.join(live, "missing.txt")) and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        for n in os.listdir(live):
+            if ".bak-sync-" in n:
+                os.remove(os.path.join(live, n))
+
+        check("added files go in before changed ones", [os.path.basename(x) for x in swaps[:2]] == ["f.json", "missing.txt"])
+        # a pull killed mid-swap leaves its journal: the next --check rolls everything back and says so
+        swaps.clear()
+
+        def killing_replace(src, dst):
+            if str(src).endswith(".tmp-sync"):
+                swaps.append(dst)
+                if len(swaps) == 3:
+                    raise KeyboardInterrupt
+            return real_replace(src, dst)
+        os.replace = killing_replace
+        try:
+            cmd_pull(repo, live, "HEAD", state)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.replace = real_replace
+        check("a killed pull leaves its journal and a half-applied live", os.path.exists(state + ".pull-journal.json") and os.path.exists(os.path.join(live, "missing.txt")))
+        import threading
+        held_, go_ = threading.Event(), threading.Event()
+
+        def holder_():
+            with state_lock(state + ".pull-journal.json"):
+                held_.set()
+                go_.wait(5)
+        th_ = threading.Thread(target=holder_)
+        th_.start()
+        held_.wait(5)
+        recover(state)
+        go_.set()
+        th_.join()
+        check("a running pull's journal is left alone", os.path.exists(state + ".pull-journal.json"))
+        cmd_check(repo, live, "HEAD", state, True)
+        check("the next --check rolls the interrupted update back", not os.path.exists(state + ".pull-journal.json")
+              and {n: open(os.path.join(live, n), "rb").read() for n in before_} == before_ and not os.path.exists(os.path.join(live, "missing.txt"))
+              and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
         for n in os.listdir(live):
             if ".bak-sync-" in n:
                 os.remove(os.path.join(live, n))
