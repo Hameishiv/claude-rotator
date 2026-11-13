@@ -2,7 +2,7 @@
   "heartbeatRepo": "your-org/claude-config-backup",
   "hostId": "my-laptop",
   "repoClone": "C:\\path\\to\\your\\claude-rotator-clone",
-  "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py",
+  "_codexRedeemScript": "Optional. A script that applies one banked Codex reset: the dashboard runs it as <script> --account <seat> --confirm, then <script> --account <seat> to read the seat again, and expects one JSON report on stdout. Unset, the Codex tab offers no Apply reset. Example: \"codexRedeemScript\": \"~/path/to/codex_redeem_reset.py\"",
   "_codexUsageScript": "Optional. The command the dashboard's Refresh runs to update every Codex seat's usage before re-reading it: a .ps1 runs under pwsh, a .py under py -3. Unset, Refresh cannot update Codex and the Codex tab says so. Example (a Codex seat rotator's usage read): \"codexUsageScript\": \"C:\\path\\to\\codex-cli-account.ps1\", \"codexUsageArgs\": [\"--usage\", \"--refresh\"]",
   "_claudeResetCredits": "The usage dashboard reads each Claude seat's banked reset credits (read-only; at most one call per seat per 6 hours). Set to false to switch that off entirely.",
   "claudeResetCredits": true,

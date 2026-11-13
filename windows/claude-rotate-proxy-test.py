@@ -1,6 +1,6 @@
 """End-to-end check of claude-rotate-proxy.py against a FAKE upstream and a sandbox seat store.
 
-No real tokens, no network beyond 127.0.0.1. Run:  py -I C:\\Dev\\Rotators\\claude-rotate-proxy-test.py
+No real tokens, no network beyond 127.0.0.1. Run from the rotator folder:  py -I claude-rotate-proxy-test.py
 Covers: quota 429 -> rotate -> retry on the new seat; a foreign token passes through untouched;
 nothing to rotate to -> the client gets the original 429 (no replay); usage headers land in the
 seat's usage-cache.json; the health endpoint.

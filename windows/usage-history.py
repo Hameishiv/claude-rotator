@@ -1746,18 +1746,20 @@ def manifest():
                       {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]}
 
 
-REDEEM_DEFAULT = os.path.join(HOME, ".claude", "skills", "merge-pr", "scripts", "codex_redeem_reset.py")
 RESET_TIMEOUT = 90
 
 
 def redeem_script(cfg=None):
-    """The Codex redeem script's path: `codexRedeemScript` in rotator.local.json (next to this script), else the merge-pr skill's; None when the file is missing."""
+    """The Codex redeem script's path: `codexRedeemScript` in rotator.local.json (next to this script); None when unset or the file is
+    missing, and then the page offers no Codex Apply reset. There is no default: a redeem helper is not part of this repo."""
     try:
         with open(cfg or os.path.join(HERE, "rotator.local.json"), encoding="utf-8-sig") as fh:
             p = json.load(fh).get("codexRedeemScript")
     except (OSError, ValueError, AttributeError):
         p = None
-    p = os.path.expanduser(p) if isinstance(p, str) and p else REDEEM_DEFAULT
+    if not isinstance(p, str) or not p:
+        return None
+    p = os.path.expanduser(p)
     return p if os.path.isfile(p) else None
 
 
@@ -2878,7 +2880,7 @@ def selftest():
     with tempfile.TemporaryDirectory() as td:
         cfg, scr = os.path.join(td, "rotator.local.json"), os.path.join(td, "redeem.py")
         open(scr, "w").write("")
-        assert redeem_script(os.path.join(td, "none.json")) in (None, REDEEM_DEFAULT)                               # no config: the default, if it exists
+        assert redeem_script(os.path.join(td, "none.json")) is None                                                   # no config: no redeem script, no button
         # the Codex usage command Refresh runs: from the config only, by file type, nothing when unset or missing
         cu = os.path.join(td, "codex-usage.ps1")
         open(cu, "w").write("")
@@ -2927,7 +2929,7 @@ def selftest():
         assert redeem_script(cfg) is None                                                                            # configured but missing: no action
         assert build(cb, 1794500100, {}, False, {"canReset": redeem_script(cfg) is not None})["providers"][0]["canReset"] is False       # ... so the blob hides the button
         open(cfg, "w").write("not json")
-        assert redeem_script(cfg) in (None, REDEEM_DEFAULT)
+        assert redeem_script(cfg) is None
         os.makedirs(os.path.join(td, "homes", "A")), os.makedirs(os.path.join(td, "homes", "B")), open(os.path.join(td, "homes", "x.txt"), "w").close()
         assert codex_homes(td) == ["A", "B"]
     assert build(cb, 1794500100, {}, False, {"canReset": True})["providers"][0]["canReset"] is True

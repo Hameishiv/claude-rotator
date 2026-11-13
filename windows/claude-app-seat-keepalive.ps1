@@ -10,7 +10,7 @@ ROOT CAUSE (proven 2026-09-22 from %LOCALAPPDATA%\Claude\Logs\main*.log + the ap
   that access token is expired/near expiry, while the refresh token behind it dies much sooner
   (shortest observed: 14.0 days after issue). Nothing refreshes a seat snapshot in between, live
   or idle, so each seat hits a re-login roughly every 2-4 weeks => "every few days" across 7 seats.
-  Full evidence: C:\Dev\hameishiv-wiki\wiki\handoffs\app-seat-relogin-20260922.md
+  (Evidence gathered from the app's own logs and code on 2026-09-22.)
 
 WHAT THIS DOES
   For each captured seat that is NOT the live login (uuid in %APPDATA%\Claude\config.json):

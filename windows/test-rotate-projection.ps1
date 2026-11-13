@@ -1,7 +1,7 @@
 <#
 test-rotate-projection.ps1 — self-check for the two 2026-09-22 rotator fixes.
 
-  pwsh -NoProfile -File C:\Dev\Rotators\test-rotate-projection.ps1
+  pwsh -NoProfile -File test-rotate-projection.ps1      (from the rotator folder)
 
 Covers the logic that actually decides a rotation, not the network calls:
   1. the session-window projection (rotate BEFORE the wall at a real burn rate),

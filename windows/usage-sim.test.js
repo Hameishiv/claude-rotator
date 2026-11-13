@@ -291,4 +291,17 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(ins.includes("'Agent Dashboard.lnk'") && ins.includes("'Quota Management.lnk'") && ins.includes("'Quota.lnk'")
     && /foreach \(\$l in @\(\$lnk\) \+ \$oldLnks\)/.test(ins) && /foreach \(\$l in \$oldLnks\)/.test(ins) && ins.includes("$taskName = 'Claude usage dashboard'"));
 }
+// public install: no file names one machine's folders or one person's private notes (the merge-pr review skipping is an optional feature
+// that looks for its own state and is allowed to name it; tests may carry sample command lines)
+{
+  const fs = require('fs'), path = require('path'), root = path.join(__dirname, '..');
+  const files = [];
+  const walk = d => { for (const n of fs.readdirSync(d)) { if (n === '.git' || n === 'node_modules' || n === 'fixtures') continue; const f = path.join(d, n);
+    if (fs.statSync(f).isDirectory()) walk(f); else if (/\.(ps1|py|js|ts|vbs|json|md|html)$/.test(n) && !/\.local\./.test(n)) files.push(f); } };
+  walk(root);
+  const bad = /C:[\\/]+Dev[\\/]+Rotators|hameishiv-wiki|C:[\\/]+Dev[\\/]+hameishiv|skills[\\/]+merge-pr[\\/]+scripts[\\/]+codex_redeem/i;
+  const hits = files.filter(f => !/test-rotate-projection\.ps1$|usage-sim\.test\.js$/.test(f) && bad.test(fs.readFileSync(f, 'utf8'))).map(f => path.relative(root, f));
+  assert.deepStrictEqual(hits, []);
+  assert.ok(files.some(f => f.endsWith('check-rotate-hidden.vbs')) && /WScript\.ScriptFullName/.test(fs.readFileSync(path.join(__dirname, 'check-rotate-hidden.vbs'), 'utf8')));
+}
 console.log('usage-sim tests passed');

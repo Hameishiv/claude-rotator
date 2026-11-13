@@ -3,10 +3,10 @@
 # profile so `claude-rotator`, `claude-account`, claude1/2/3, etc. behave
 # identically in either shell (no drift). Edit here, not in the profiles.
 
-# This file lives in the Rotators directory on both machines. $PSScriptRoot is that
-# directory when the profile dot-sources it, so the same file runs on the laptop and the box.
-$RotatorDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\Dev\Rotators' }
-$ProfileHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { 'C:\Users\User' }
+# This file lives in the rotator folder. $PSScriptRoot is that folder when the profile dot-sources it
+# (`. <rotator folder>\rotator-functions.ps1`), so the same file runs wherever the folder is.
+$RotatorDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ProfileHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { [Environment]::GetFolderPath('UserProfile') }
 function Test-AccessCooldownActive([string]$Label) {
     if (-not $Label) { return $false }
     $f = Join-Path (Join-Path (Join-Path $ProfileHome '.claude-cli-accounts') $Label) 'access-disabled.json'

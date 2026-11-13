@@ -5,22 +5,46 @@ your Anthropic accounts by swapping a **long-lived setup-token**. All accounts s
 **one** `~/.claude` config — same skills, MCP connectors, and session history — and only
 the auth token changes.
 
-- **Script:** `C:\Dev\Rotators\claude-cli-account.ps1`
+- **Script:** `claude-cli-account.ps1` in your rotator folder (wherever you put this repo's `windows/` files).
 - **Invoke via** the `claude-rotator` (or `claude-cli-account`) PowerShell profile function.
 
-> **Where the scripts live** (corrected 2026-08-09 — this file used to point at
-> `~\.grok\bin\` for the two rotators, where they do not exist):
->
-> | Script | Real path |
-> |---|---|
-> | `claude-cli-account.ps1` (CLI rotator) | `C:\Dev\Rotators\` |
-> | `claude-app-rotator.ps1` (app rotator) | `C:\Dev\Rotators\` |
-> | `rotator-functions.ps1` (the profile functions) | `C:\Dev\Rotators\` |
-> | `sync-app-history.ps1` | `C:\Users\User\.grok\bin\` |
-> | `reset-seat-webview.ps1` | `C:\Users\User\.grok\bin\` |
->
-> The profile does not define the functions itself — both shells dot-source
-> `C:\Dev\Rotators\rotator-functions.ps1`, so **edit the functions there**.
+## Quick start
+
+**You need:** Windows 10 or 11; [PowerShell 7](https://aka.ms/powershell) (`pwsh`); Python 3.10+ with the `py` launcher;
+the Claude Code CLI (`claude`); Git, only for updates. Optional, each for its own tab or feature: the Claude desktop app,
+the Codex CLI, the Grok CLI, the Antigravity app (Gemini).
+
+1. **Get the files.** Clone this repo. The folder you run from (the **rotator folder**) is the repo's `windows/` folder,
+   or a copy of it anywhere you like.
+2. **Load the shortcuts.** Add one line to your PowerShell profile (`notepad $PROFILE`), then open a new terminal:
+   ```
+   . "C:\path\to\rotator-folder\rotator-functions.ps1"
+   ```
+   That defines `claude-rotator`, `claude-account`, `claude-resume` and the `claude` wrapper.
+3. **Settings (optional).** Copy `rotator.local.example.json` to `rotator.local.json` in the rotator folder. Every key is
+   optional and is explained in the example file; `repoClone` (your clone) is what `rotator-sync` needs for updates.
+4. **Add your accounts.** For each Claude account, sign in to it in a browser, run `claude setup-token`, and store the token
+   under a label of your choice (`A`, `B`, ...): `claude-rotator --capture A`. Put the account's address in
+   `%USERPROFILE%\.claude-cli-accounts\A\email.txt`. Details: *Add a new account / seat* below.
+5. **First run.** `claude-rotator --status` probes every seat and shows its usage; `claude-rotator --best` switches to the
+   seat with the most headroom.
+6. **Automatic rotation (optional).** Register the 5-minute watcher (run once; adjust the path):
+   ```
+   $a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"C:\path\to\rotator-folder\check-rotate-hidden.vbs"'
+   $t = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+   Register-ScheduledTask -TaskName 'Claude usage auto-rotate' -Action $a -Trigger $t
+   ```
+7. **The Agent Dashboard (optional).** `pwsh -File usage-app-install.ps1` in the rotator folder installs it: a local page on
+   `http://127.0.0.1:8787/` and a Start-menu entry, **Agent Dashboard**. `-Uninstall` removes it.
+
+**What each dashboard tab needs** (a tab you have not set up shows a note instead of numbers):
+
+| Tab | Needs | Optional extras |
+|---|---|---|
+| Claude | accounts added with `claude-rotator` (step 4); readings appear once the rotator has probed a seat (`--status`, or the watcher) | Banked reset credits need a full Claude login for that account, which the desktop app keeps: sign in to the account in the app and capture it with `claude-account --capture <label>` (a setup-token cannot read them). Switch buttons need the desktop app for the App role. |
+| Codex | the Codex CLI; one saved login per seat in `%USERPROFILE%\.codex\homes\<label>\`; readings come from each seat's usage cache there and from the Codex session logs | `codexUsageScript` lets Refresh update Codex; `codexRedeemScript` adds Apply reset; a `codex-app-rotator.ps1` next to the dashboard adds switch buttons. All are off until set. |
+| xAI | the Grok CLI, signed in (`grok`) | none |
+| Gemini | the Antigravity app running (not as administrator) | none |
 
 > Supersedes the old seat-based design. There are **no** separate `CLAUDE_CONFIG_DIR`
 > seat directories anymore (`~/.claude-seat2`, `~/.claude-seat3`). An empty/missing seat
@@ -316,7 +340,7 @@ live; the cache is the answer.
 
 ## Local rotate proxy (2026-10-30)
 
-`C:\Dev\Rotators\claude-rotate-proxy.py` is a small stdlib-only pass-through proxy on
+`claude-rotate-proxy.py` (in the rotator folder) is a small stdlib-only pass-through proxy on
 `127.0.0.1:18484`. It takes two ideas from doxaras/claude-rotate (MIT) and nothing else:
 
 1. **It reads usage off every real response.** The `anthropic-ratelimit-unified-*` headers,
@@ -448,7 +472,7 @@ tools label the seat with the same address.
 ## Desktop app account switcher (`claude-account`)
 
 Separate from the CLI rotator above — this swaps the **desktop app's own login**
-(`C:\Dev\Rotators\claude-app-rotator.ps1`), stored under `%APPDATA%\Claude`. Keeping the app
+(`claude-app-rotator.ps1`), stored under `%APPDATA%\Claude`. Keeping the app
 on one seat and the CLI on another is fine; they're independent systems.
 
 **Run from a plain terminal with the app fully quit** — capture/switch/rotate need it closed,
@@ -489,8 +513,8 @@ every 6 h, hidden). Refreshes the OAuth tokens inside every IDLE seat snapshot e
 live seat), and logs `DEAD` for a seat whose refresh chain has already expired, i.e. the seat that will
 say "Sign in again" on its next switch-in. `-Status` / `-DryRun` / `-SelfTest`; log
 `~\.claude-app-seats\.keepalive-log.txt`. It shares `.seat-write.lock` with `claude-account`, so a
-switch/capture waits for it (up to 90 s). Why it exists, and what it does NOT fix:
-`C:\Dev\hameishiv-wiki\wiki\handoffs\app-seat-relogin-20260922.md`.
+switch/capture waits for it (up to 90 s). Why it exists, and what it does NOT fix: the header of
+`claude-app-seat-keepalive.ps1`.
 
 ## Desktop app session history (`claude-sync-history`)
 
@@ -563,7 +587,7 @@ app update that renames these keys makes the step silently do nothing until it i
 restarted (or the workspace reopened), not in an already-open window.
 
 ```
-claude-sync-history                      # sync + prune C:\Dev\hameishiv (default: recent 7d + substantive)
+claude-sync-history                      # sync + prune the default project (default: recent 7d + substantive)
 claude-sync-history -DryRun              # preview what would add/prune, change nothing
 claude-sync-history -MaxAgeDays 14       # widen/narrow the recency window (0 = keep all ages)
 claude-sync-history -KeepResumable       # also keep interrupted / died-pre-merge runs
@@ -592,8 +616,7 @@ terminal, `pwsh -File C:\Users\User\.grok\bin\reset-seat-webview.ps1` — quits 
 MOVES that seat's web-view storage to a timestamped backup under `~/.claude-app-seats\`,
 keeps login cookies, relaunches. Confirmed working 2026-07-20 (seat B). Do NOT chase the
 `[watch-record] i.on is not a function` warning (fires on every seat, harmless) and do NOT
-assume data loss. Full record:
-`C:\Dev\hameishiv-wiki\wiki\lessons\app-seat-sidebar-empty-reset-webview.md`.
+assume data loss.
 
 ## Desktop-app install flavour (MSIX vs Squirrel) — why path matching is doubled
 
@@ -711,9 +734,8 @@ point), and prints each method's mean absolute error; run it again once more his
 Account tables badge the seat each tool is on with a blue `CLI` or violet `App` pill (Codex's app and CLI share one login, so `App`; the provider header repeats them with the seat letter) and colour
 each cell: for Claude from the API's own status for that window (`allowed`, `allowed_warning`, `rejected`), for Codex,
 xAI and Gemini green below 85 %, yellow from 85 %, red and `capped` at 100 %. A Codex seat with a banked reset gets an
-`Apply reset` button (app only; it asks first) that runs `codexRedeemScript` (`rotator.local.json`, default
-`~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py`) with `--account X --confirm`; with no such file the button is
-not shown. The script is never killed (it copies refreshed credentials back as it ends): one still running after 90 s
+`Apply reset` button (app only; it asks first) that runs `codexRedeemScript` (`rotator.local.json`; there is no default)
+with `--account X --confirm`; unset, or with no such file, the button is not shown. The script is never killed (it copies refreshed credentials back as it ends): one still running after 90 s
 gets the answer "still applying", and every other action waits (409) until it exits (`Store.codex_reset`, selftest).
 The script mints a new claim on every run, so before it runs the seat is marked unconfirmed (`codex_pending` in the
 provider cache, with the banked count). A clear answer (`redeemed`, `no_credit`) drops the mark; anything else (a crash,
