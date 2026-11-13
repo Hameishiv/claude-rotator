@@ -3455,6 +3455,9 @@ def selftest():
                 assert hp({"seat": "A"}, path=cp_)[0] == 409 and len(hc) == 1
                 hs.refreshing.release()
                 st_, body_ = hp({"seat": "A"}, path=cp_)
+                end_ = time.time() + 5                  # the handler releases the lock in `finally`, just after the reply is sent
+                while hs.refreshing.locked() and time.time() < end_:
+                    time.sleep(0.02)
                 assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("clear", "A") and not hs.refreshing.locked()
             finally:
                 globals()["codex_homes"] = keep_ch
