@@ -6,6 +6,11 @@
   },
   {
     "status": 403,
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Your organization has disabled Claude subscription access for Claude Code on this seat (oauth_org_not_allowed), and no other eligible seat is available.\"},\"error_code\":\"oauth_org_not_allowed\"}",
+    "disabled": true
+  },
+  {
+    "status": 403,
     "body": "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}",
     "disabled": true
   },

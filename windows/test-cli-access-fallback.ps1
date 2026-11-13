@@ -141,6 +141,19 @@ foreach ($case in $fix) {
   $got = Test-SubscriptionDisabled ([int]$case.status) ([string]$case.body)
   Check ("fixture http $($case.status) disabled=$($case.disabled)") ($got -eq [bool]$case.disabled) "got $got"
 }
+# every refusal fixture (the proxy's own reply included), recorded as an API-error turn, is an access stop for the session resumer
+$resAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'claude-resume-sessions.ps1'), [ref]$null, [ref]$null)
+$tsl = $resAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-StoppedByLimit' }, $true)
+. ([scriptblock]::Create($tsl.Extent.Text))
+$LimitErrors = @('rate_limit', 'billing_error')
+function Get-SessionFile([int]$p) { [pscustomobject]@{ sessionId = 's'; status = 'idle' } }
+foreach ($case in @($fix | Where-Object { $_.disabled })) {
+  $script:lastTurn = [pscustomobject]@{ type = 'assistant'; isApiErrorMessage = $true; error = 'unknown'; message = [pscustomobject]@{ content = @([pscustomobject]@{ text = "API Error: 403 $($case.body)" }) } }
+  function Get-LastExchange([string]$sid) { $script:lastTurn }
+  $v = Test-StoppedByLimit 1
+  Check ("resumer sees fixture as a limit stop: $($case.body.Substring(0, [math]::Min(60, $case.body.Length)))") ($v[0] -eq 'yes') ($v -join ' ')
+}
+
 $dirty = '403 oauth_org_not_allowed sk-ant-oat01-SEATA-TOKENVALUE Bearer sk-ant-oat01-SEATA-TOKENVALUE'
 $clean = ConvertTo-SanitizedNote $dirty
 Check 'notes redact tokens' (($clean -notmatch 'sk-ant-') -and ($clean -match 'oauth_org_not_allowed')) $clean

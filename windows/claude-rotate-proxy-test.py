@@ -186,6 +186,8 @@ def main():
         seen.clear()
         status, body = call(port, "tok-A")
         assert status == 403 and b"no other eligible seat" in body, (status, body)
+        with open(os.path.join(HERE, "fixtures", "access-responses.json"), encoding="utf-8") as fh:
+            assert any(c["body"] == body.decode() and c["disabled"] for c in json.load(fh)), body      # the refusal every classifier knows
         assert seen == [], seen
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         c.request("GET", "/__proxy/health")

@@ -154,6 +154,13 @@ def write_cache(label, data):
             log("cache write failed for %s: %s" % (key, e))
 
 
+# The proxy's own refusal (no eligible seat left), in the API's canonical shape: the code and wording every refusal classifier keys on
+# (rotator_access.DISABLED_MARKERS, claude-resume-sessions.ps1 Test-StoppedByLimit), so a session it stopped counts as an access stop.
+# The same bytes are a case in fixtures/access-responses.json.
+LOCAL_REFUSAL = (b'{"type":"error","error":{"type":"permission_error","message":"Your organization has disabled Claude subscription access for '
+                 b'Claude Code on this seat (oauth_org_not_allowed), and no other eligible seat is available."},"error_code":"oauth_org_not_allowed"}')
+
+
 def access_marker_path(label):
     return os.path.join(ROOT, label, "access-disabled.json")
 
@@ -322,8 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         # No upstream call. The body names the condition and never a token.
         log("not sending; '%s' subscription disabled and no other eligible seat" % label)
         write_health(False, label, "subscription_disabled")
-        msg = (b'{"type":"error","error":{"type":"permission_error","message":'
-               b'"Claude subscription access is disabled on this seat and no other eligible seat is available."}}')
+        msg = LOCAL_REFUSAL
         self.send_response(403)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(msg)))
@@ -466,6 +472,9 @@ def self_test():
             got = is_subscription_disabled(case["status"], case["body"])
             assert got is case["disabled"], (case["status"], got, case["disabled"])
     assert access_code(b'{"error_code":"oauth_org_not_allowed"}') == "oauth_org_not_allowed"
+    assert is_subscription_disabled(403, LOCAL_REFUSAL) and access_code(LOCAL_REFUSAL) == "oauth_org_not_allowed"
+    with open(os.path.join(here, "fixtures", "access-responses.json"), encoding="utf-8") as handle:
+        assert any(c["body"] == LOCAL_REFUSAL.decode() and c["disabled"] is True for c in json.load(handle)), "the local refusal is not a shared fixture"
     assert not is_subscription_disabled(0, "disabled Claude subscription access")
     print("self-test ok")
 
