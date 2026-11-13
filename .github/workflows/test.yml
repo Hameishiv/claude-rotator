@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer run on the same ref supersedes an older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      # Both tests are self-contained: a fake upstream on 127.0.0.1 and a temp-dir seat store, no secrets,
+      # no live accounts, no outside network. Nothing is left out. One block inside the PowerShell test
+      # (the "real launcher" checks) needs the owner's ~/.claude merge-pr launcher; it skips itself when
+      # that file is absent, as it is on a runner, so it is not faked here.
+      - name: Proxy end-to-end test (python)
+        run: python -I windows/claude-rotate-proxy-test.py
+      - name: Rotate projection test (pwsh)
+        run: pwsh -NoProfile -File windows/test-rotate-projection.ps1
