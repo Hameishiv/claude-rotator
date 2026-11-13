@@ -88,6 +88,7 @@ td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--b
 .bdg{display:inline-block;margin-left:8px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em;line-height:18px;vertical-align:1px;white-space:nowrap;background:var(--bdg-cli);color:var(--bdg-cli-ink)}
 .bdg.app{background:var(--bdg-app);color:var(--bdg-app-ink)}
 td small.ms.warn{color:var(--warn)}
+.cp{margin-left:6px;padding:1px 8px;font-size:12px;color:var(--ink)}
 .bdg.wt{background:var(--btn);color:var(--ink2);box-shadow:inset 0 0 0 1px var(--muted);font-weight:600;letter-spacing:0}
 .ph .bdg{margin-left:0;vertical-align:0}
 .inuse{display:inline-flex;flex-wrap:wrap;gap:6px}
@@ -109,7 +110,7 @@ dialog .dact{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);max-width:min(560px,calc(100vw - 32px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;z-index:5;box-shadow:0 2px 12px rgba(0,0,0,.35)}
 .toast[hidden]{display:none}
-@media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}.stat{text-align:left}th,td{padding:8px 6px}.bar{min-width:60px}td:first-child{min-width:10em}td small.pl,td small.ms{white-space:normal}}
+@media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}.stat{text-align:left}th,td{padding:8px 6px}.bar{min-width:60px}td:first-child{min-width:10em}td small.pl,td small.ms,td small.sg{white-space:normal}}
 </style>
 </head>
 <body>
@@ -397,6 +398,17 @@ function toast(text, outcome) {
   const t = $('toast'); t.textContent = text; t.dataset.outcome = outcome; t.hidden = false;
   clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, 9000);
 }
+async function copyText(text) {
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+  if (!ok) {                          // no clipboard API (plain http off localhost): select the text in a throwaway field and use the old command
+    const t = document.createElement('textarea'); t.value = text; t.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(t); t.select();
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    t.remove();
+  }
+  toast(ok ? 'Copied — paste into rotator.local.json' : 'Could not copy. Type it into rotator.local.json: ' + text, ok ? 'ok' : 'error');
+}
 async function doReset() {
   if (!rs || rs.busy) return;
   rs.busy = true;
@@ -418,6 +430,7 @@ function act(a, v, el) {
   if (a === 'rscancel') return $('rsdlg').close();
   if (a === 'rsgo') return doReset();
   if (a === 'reload') return loadData();
+  if (a === 'copyw') return copyText(v);
   if (a === 'refresh') return refreshAll();
   if (a === 'theme') { ui.theme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme]; store.set('theme', ui.theme); }
   else if (a === 'emails') { ui.emails = !ui.emails; store.set('emails', ui.emails ? '1' : '0'); }

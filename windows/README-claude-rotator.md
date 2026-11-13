@@ -718,6 +718,13 @@ between two consecutive whole-percent ticks of one log, so a seat used by severa
 in the last 21 days has no samples. A log of the active login is credited to the seat whose known weekly reset matches. Claude, xAI and Gemini show nothing:
 the rotator never sees their tokens.
 
+**Suggested weight (Codex only).** When the measurement is both steady and far from the weight, the table adds `Suggested weight ×3 (24 samples)` under the
+measured line and a `Copy setting` button that puts `"seatWeights": {"codex": {"B": 3}}` on the clipboard, for you to paste into `rotator.local.json`. Nothing
+applies it, and a seat without a suggestion keeps today's lines. The rule (`weight_suggestions` in `usage-history.py`, selftest block I): at least 20 samples in
+the last 21 days; the older and the newer half of them (by time), each measured against the same weight-1 seats, within 25 % of each other; the measured ratio
+more than 30 % away from the current weight; then rounded (`nice_weight`) to the nearest 0.5 below 3, to a whole number from 3 up, and no suggestion if that
+is the weight the seat already has. The suggestion's line and the copied fragment are `quotaSuggest` and `quotaFragment` in `usage-sim.js` (`usage-sim.test.js`).
+
 ## Keeping the install in sync (`rotator-sync`)
 
 The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:

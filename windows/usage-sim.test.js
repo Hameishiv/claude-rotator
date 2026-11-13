@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaWeight, quotaMeasure, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -101,6 +101,20 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   // under the seat name: email, then plan (underscores read as spaces), then the measured line
   assert.strictEqual(quotaSeat({ label: 'B', email: 'b@x.org', plan: 'self_serve_business_prolite', ratio: { n: 0 } }, true, esc),
     'B<small>b@x.org</small><small class="pl">Plan: self serve business prolite</small>' + quotaMeasure({ ratio: { n: 0 } }, esc));
+}
+// suggested weight (Codex): nothing without a suggestion; the line with the sample count and the copy button; the copied fragment is valid JSON once braced
+{
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  assert.strictEqual(quotaSuggest({ label: 'B' }, esc), '');
+  const b = { label: 'B', suggest: { w: 3, n: 24 } };
+  assert.strictEqual(quotaFragment(b), '"seatWeights": {"codex": {"B": 3}}');
+  assert.deepStrictEqual(JSON.parse('{' + quotaFragment(b) + '}'), { seatWeights: { codex: { B: 3 } } });
+  assert.strictEqual(quotaFragment({ label: 'C', suggest: { w: 1.5, n: 30 } }), '"seatWeights": {"codex": {"C": 1.5}}');
+  assert.strictEqual(quotaSuggest(b, esc), '<small class="sg">Suggested weight ×3 (24 samples) <button class="cp" data-a="copyw" data-v="&quot;seatWeights&quot;: {&quot;codex&quot;: {&quot;B&quot;: 3}}">Copy setting</button></small>');
+  // under the seat: after the measured line, which stays as it is (amber included)
+  const seat = { label: 'B', w: 1, ratio: { x: 3.1, n: 24 }, suggest: { w: 3, n: 24 } };
+  assert.strictEqual(quotaSeat(seat, false, esc), 'B' + quotaMeasure(seat, esc) + quotaSuggest(seat, esc));
+  assert.ok(quotaSeat(seat, false, esc).includes('class="ms warn"') && quotaSeat(seat, false, esc).indexOf('measured') < quotaSeat(seat, false, esc).indexOf('Suggested'));
 }
 // seat name: the letter always, the email under it only when shown and known
 {

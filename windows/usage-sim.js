@@ -47,9 +47,17 @@ function quotaMeasure(a, esc) {
     (off ? '. It differs from the configured weight (×' + quotaNum(w) + ') by more than 30 %: check the weight.' : '');
   return '<small class="ms' + (off ? ' warn' : '') + '" title="' + esc(tip) + '">measured ≈ ×' + String(+r.x.toFixed(1)) + ' (' + r.n + ' samples)</small>';
 }
+// Codex only: the weight the measurements suggest (a.suggest, set by the builder when the ratio is steady and far from the weight) and a button that copies the
+// settings fragment for it. Nothing applies it.
+const quotaFragment = (a) => '"seatWeights": {"codex": {' + JSON.stringify(a.label) + ': ' + quotaNum(a.suggest.w) + '}}';
+function quotaSuggest(a, esc) {
+  const s = a.suggest;
+  if (!s) return '';
+  return '<small class="sg">Suggested weight ×' + quotaNum(s.w) + ' (' + s.n + ' samples) <button class="cp" data-a="copyw" data-v="' + esc(quotaFragment(a)) + '">Copy setting</button></small>';
+}
 function quotaSeat(a, emails, esc) {
   return esc(a.label) + quotaWeight(a, esc) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '') +
-    (a.plan ? '<small class="pl">Plan: ' + esc(a.plan.replace(/_/g, ' ')) + '</small>' : '') + quotaMeasure(a, esc);
+    (a.plan ? '<small class="pl">Plan: ' + esc(a.plan.replace(/_/g, ' ')) + '</small>' : '') + quotaMeasure(a, esc) + quotaSuggest(a, esc);
 }
 // A provider header's badges with their seat letter ("CLI D", "App B") as HTML, or '' when no seat is known to be in use.
 function quotaInUse(p, esc) {
@@ -83,4 +91,4 @@ function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
