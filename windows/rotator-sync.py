@@ -196,24 +196,32 @@ def roll_back(plan):
     return done, bad
 
 
+def journal_files(j):
+    """The journal's plan (its "files" list), or None when the journal could not be read or is not one (a lock, a crash mid-write before fsync)."""
+    f = j.get("files") if isinstance(j, dict) else None
+    return f if isinstance(f, list) else None
+
+
 def update_finished(j):
     """True when no planned file of the journal's pull still has its .tmp-sync. A .tmp-sync goes away when its file is swapped in, and a rollback removes the
     leftovers only after it has restored every file, so none left means either every swap happened (the journal outlived the pull: its delete failed) or a
-    rollback already put everything back. A pull killed before its first swap, or part-way through them, still has .tmp-sync files: not finished, rolled back."""
-    plan = j.get("files")
-    if not isinstance(plan, list):
-        return True
+    rollback already put everything back. A pull killed before its first swap, or part-way through them, still has .tmp-sync files: not finished, rolled back.
+    A journal with no readable plan is never "finished" (roll_back_journal leaves it in place)."""
+    plan = journal_files(j)
+    if plan is None:
+        return False
     return not any(isinstance(e, list) and e and isinstance(e[0], str) and os.path.exists(e[0] + ".tmp-sync") for e in plan)
 
 
 def roll_back_journal(jpath):
-    """Roll back the journal at `jpath` and delete it (a delete that fails leaves it, with a warning). The caller holds the journal's lock. -> (put back, could not) or None if there is none. A journal whose every
-    swap happened (no planned .tmp-sync is left) is only deleted: nothing is restored."""
+    """Roll back the journal at `jpath` and delete it (a delete that fails leaves it, with a warning). The caller holds the journal's lock. -> (put back, could not), or None when there is none, when every swap
+    happened (no planned .tmp-sync is left: it is only deleted, nothing is restored), or when it cannot be read (left in place, with a warning: --pull stops on it)."""
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away
     j = load_json(jpath)
-    if not isinstance(j.get("files"), list):         # unreadable: no plan to judge the swaps by, so neither "finished" nor a rollback; --pull stops on it
-        sys.stderr.write("rotator-sync: the update journal %s cannot be read; left in place. Check the live files (or run --pull after deleting it by hand)\n" % jpath)
+    if journal_files(j) is None:         # unreadable: no plan to judge the swaps by, so neither "finished" nor a rollback; --pull stops on it
+        sys.stderr.write("rotator-sync: the update journal %s cannot be read just now (it may be held for a moment: try again); left in place."
+                         " If it stays unreadable, check the live files, delete it by hand, then run --pull\n" % jpath)
         return None
     if update_finished(j):
         drop_journal(jpath)
@@ -303,6 +311,9 @@ PROXY_TASK = "Claude rotate proxy"
 
 def pull_locked(repo, live, ref, state, jpath):
     say_recovered(roll_back_journal(jpath))
+    if os.path.exists(jpath) and journal_files(load_json(jpath)) is None:
+        sys.stderr.write("rotator-sync: the earlier update's journal %s cannot be read, so nothing was changed (see above)\n" % jpath)
+        return 1
     if os.path.exists(jpath):                           # recovery could not delete it: staging would write a new journal over it
         sys.stderr.write("rotator-sync: the earlier update's journal %s could not be deleted; delete it by hand once nothing holds it, then run --pull again; nothing was changed\n" % jpath)
         return 1

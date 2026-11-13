@@ -5,7 +5,8 @@ user:profile"); the desktop app's own login for the same account can.
 
 Where it reads (the same places claude-app-rotator.ps1 and claude-app-seat-keepalive.ps1 use):
   ~/.claude-app-seats/<seat>/config.json   the seat's saved app login (the live seat: %APPDATA%\Claude\config.json,
-                                            the app's own and fresher copy, chosen when its lastKnownAccountUuid matches)
+                                            the app's own and fresher copy, chosen when its lastKnownAccountUuid matches
+                                            and it holds a login: a signed-out live config does not hide the snapshot)
   oauth:tokenCacheV2                        Electron safeStorage v10 = AES-256-GCM, key DPAPI-wrapped in
                                             %APPDATA%\Claude\Local State
 It never refreshes a token and never writes any file. Output, one line of JSON on stdout:
@@ -18,7 +19,7 @@ It never refreshes a token and never writes any file. Output, one line of JSON o
                                                   account (its lastKnownAccountUuid is not the seat's owner: a poisoned snapshot,
                                                   the rule claude-app-seat-keepalive.ps1 applies), or no user:profile entry of that
                                                   account
-  {"state":"busy","why":"..."}                    the login files could not be read just now (a lock, the app rewriting config.json): a
+  {"state":"busy","why":"..."}                    the login files could not be read just now (a lock, the app rewriting config.json, Local State empty or without its key yet): a
                                                   passing failure, not "no login"
   {"state":"unreadable","why":"..."}              a login is saved and was read but could not be decrypted (not the same as none: the
                                                   caller must not treat it as "no login")
