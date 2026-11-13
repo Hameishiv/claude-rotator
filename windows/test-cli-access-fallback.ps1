@@ -10,6 +10,7 @@ any rotation if either mock is not the live definition, and the process environm
   pwsh -NoProfile -File windows/test-cli-access-fallback.ps1
 #>
 $ErrorActionPreference = 'Stop'
+try { (Get-Process -Id $PID).PriorityClass = 'Idle' } catch {}      # first: every child below inherits Idle
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
   if ($ok) { Write-Host "  PASS  $name" -ForegroundColor Green }
@@ -184,6 +185,22 @@ Check 'fresh install: the heartbeat seat is written to .active' ((Test-Path (Joi
 Check 'fresh install: the app seat resolves to C' ((Get-AppSeatLabel) -eq 'C') (Get-AppSeatLabel)
 Clear-AppIdentity
 
+# --- the CLI version is read once per run, with a timeout, from the `claude` on PATH; unreadable -> the fallback ---
+$stubDir = Join-Path $root 'stub-claude'
+New-Item -ItemType Directory -Path $stubDir -Force | Out-Null
+$pathKeep = $env:PATH
+try {
+  $env:PATH = $stubDir + [IO.Path]::PathSeparator + $env:PATH
+  Set-Content -LiteralPath (Join-Path $stubDir 'claude.cmd') -Value "@echo off`r`necho 9.8.7 (Claude Code)" -Encoding ASCII
+  $script:CliVersion = $null
+  Check 'the CLI version is the one `claude --version` prints' ((Get-CliVersion) -eq '9.8.7') (Get-CliVersion)
+  Remove-Item (Join-Path $stubDir 'claude.cmd') -Force
+  Check 'it is cached: a second call spawns nothing' ((Get-CliVersion) -eq '9.8.7')
+  Set-Content -LiteralPath (Join-Path $stubDir 'claude.cmd') -Value "@echo off`r`necho not a version" -Encoding ASCII
+  $script:CliVersion = $null
+  Check 'an unreadable version falls back to 2.1.322' ((Get-CliVersion) -eq '2.1.322') (Get-CliVersion)
+} finally { $env:PATH = $pathKeep; $script:CliVersion = '2.1.322' }      # the rest of the run never spawns the real CLI
+
 # --- active B is subscription-disabled; A is the best eligible seat and must be selected ---
 Reset-Case
 Clear-AppIdentity
@@ -229,6 +246,20 @@ $script:head['C'] = 0.40
 $rc = Invoke-CheckRotate 0 $false $true 'test'
 Check 'a Fable access refusal disqualifies A; C is the target' (($rc -eq 0) -and ((Get-ActiveLabel) -eq 'C')) "rc=$rc active=$(Get-ActiveLabel)"
 Check 'A got the access marker' (Test-Path (Join-Path (Join-Path $Root 'A') 'access-disabled.json'))
+
+# --- the ACTIVE seat's armed Fable probe is an explicit 403: rotate now, never declare the seat ready ---
+Reset-Case
+Clear-AppIdentity
+Set-Active 'A'
+$script:plan['A'] = 'fable-disabled'
+$script:head['C'] = 0.30
+$nowTs = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+# Haiku not due for hours (so only the Fable ladder runs); Fable armed (10 points from the cap) and due.
+@{ acct='A'; nextHaiku=($nowTs + 36000); lastWorst=0; lastTs=0; fableBase=90; fableTs=($nowTs - 60); nextFable=0; rotations=@() } | ConvertTo-Json | Set-Content -LiteralPath $RotateState -Encoding UTF8
+$rc = Invoke-CheckRotate 0 $false $false 'test'
+Check 'an armed Fable refusal on the active seat rotates off it' (($rc -eq 0) -and ((Get-ActiveLabel) -ne 'A')) "rc=$rc active=$(Get-ActiveLabel)"
+Check '... through the access path (marker on A), not declared ready' ((Test-Path (Join-Path (Join-Path $Root 'A') 'access-disabled.json')) -and
+  ((Get-Content (Join-Path $Root '.rotate-log.txt') -Raw) -match 'subscription access disabled \(403 oauth_org_not_allowed\)')) (Get-Content (Join-Path $Root '.rotate-log.txt') -Raw -ErrorAction SilentlyContinue)
 
 # --- only a successful Fable probe clears the shared refusal marker: a Haiku success beside a refused Fable probe does not ---
 Reset-Case

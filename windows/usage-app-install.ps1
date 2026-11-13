@@ -9,6 +9,7 @@
 param([switch]$Uninstall, [int]$Port = 8787)
 
 $ErrorActionPreference = 'Stop'
+try { (Get-Process -Id $PID).PriorityClass = 'Idle' } catch {}      # first: every child below (schtasks, the shortcut writer) inherits Idle
 $dir = $PSScriptRoot
 $script = Join-Path $dir 'usage-history.py'
 $taskName = 'Claude usage dashboard'

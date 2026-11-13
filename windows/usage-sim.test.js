@@ -237,6 +237,9 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const cxT = accounts({ id: 'codex', canReset: true, limits: [], accounts: [{ label: 'B', windows: [], banked: 0, resetPending: true }] });
   assert.ok(cxT.includes('Last reset unconfirmed') && cxT.includes('data-a="rsclear"'), cxT);
   assert.ok(!accounts({ id: 'codex', canReset: true, limits: [], accounts: [{ label: 'B', windows: [] }] }).includes('Banked resets'));
+  // setup-token-only Claude seats have no count but a note saying why: the column (and that explanation) stays
+  const noteT = accounts({ id: 'claude', canReset: true, limits: [], accounts: [{ label: 'A', windows: [], bankedNote: 'Reset credits need a full Claude login' }] });
+  assert.ok(noteT.includes('<th>Banked resets</th>'), noteT);
   // the hand clear asks first, with Cancel as the default
   const clrSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
   const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
@@ -245,7 +248,7 @@ assert.strictEqual(quotaShare(600, 600), 100);
   fns.openClear('B');
   assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Only clear this after codex-usage shows the reset was not used. Clearing lets you apply a reset on this seat again.')
     && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg.innerHTML) && fns.st().clear === true, dlg.innerHTML);
-  assert.ok(/rs\.clear \? '\/api\/codex-reset-clear'/.test(tpl) && /a === 'rsclear'\) return openClear\(v\)/.test(tpl));
+  assert.ok(/rs\.clear \? \(cl \? '\/api\/claude-reset-clear' : '\/api\/codex-reset-clear'\)/.test(tpl) && /a === 'rsclear'\) return openClear\(v, el\.dataset\.p, el\.dataset\.k\)/.test(tpl));
 }
 // a Claude seat+kind with a pending (unsettled) claim is offered as a resend, even with no credit of that kind listed, and its dialog says so
 {
@@ -253,9 +256,12 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const btnSrc = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction accounts('));
   const resetBtn = new Function('D', 'esc', 'QUOTA_RESET_KINDS', btnSrc + '\nreturn resetBtn;')({ app: true }, s => String(s), QUOTA_RESET_KINDS);
   const cl = { id: 'claude', canReset: true };
+  // a pending claim that never settles can be cleared by hand: a Clear beside its Resend, and none beside a plain Apply
   assert.strictEqual(resetBtn(cl, { label: 'A', resets: [{ kind: 'full', pending: true }] }),
-    '<button class="rs" data-a="reset" data-p="claude" data-v="A" data-k="full">Resend pending full reset</button>');
+    '<button class="rs" data-a="reset" data-p="claude" data-v="A" data-k="full">Resend pending full reset</button>' +
+    '<button class="rs" data-a="rsclear" data-p="claude" data-v="A" data-k="full">Clear</button>');
   assert.ok(resetBtn(cl, { label: 'A', resets: [{ kind: 'full', left: 1, endsAt: null }] }).includes('>Apply full reset<'));
+  assert.ok(!resetBtn(cl, { label: 'A', resets: [{ kind: 'full', left: 1, endsAt: null }] }).includes('rsclear'));
   const dlgSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
   const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
   const D = { now: 1000, providers: [{ id: 'claude', accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true }] }] }] };
@@ -269,12 +275,19 @@ assert.strictEqual(quotaShare(600, 600), 100);
   D.providers[0].accounts[0].resets = [{ kind: 'full', pending: true, rid: 'r-1' }, { kind: 'fable', left: 1, endsAt: null }];
   const sent = [], dlg2 = Object.assign(dlg, { close() {}, querySelector: () => ({}), querySelectorAll: () => [] });
   const pair = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', 'fetch', 'toast', 'loadData',
-    dlgSrc + '\n' + doSrc + '\nreturn { openReset, doReset };')(D, () => dlg2, s => String(s), { emails: false }, String, String, QUOTA_RESET_KINDS,
+    dlgSrc + '\n' + doSrc + '\nreturn { openReset, openClear, doReset };')(D, () => dlg2, s => String(s), { emails: false }, String, String, QUOTA_RESET_KINDS,
     async (u, o) => { sent.push([u, JSON.parse(o.body)]); return { status: 200, json: async () => ({ outcome: 'ok', text: 'x' }) }; }, () => {}, () => {});
   (async () => {
     pair.openReset('claude', 'A', 'full'); await pair.doReset();
     pair.openReset('claude', 'A', 'fable'); await pair.doReset();
     assert.deepStrictEqual(sent, [['/api/claude-reset', { seat: 'A', kind: 'full', resend: true, requestId: 'r-1' }], ['/api/claude-reset', { seat: 'A', kind: 'fable' }]]);
+    // the hand clear of a pending Claude claim asks first (Cancel is the default), then names only the seat and kind: never a request id
+    pair.openClear('A', 'claude', 'full');
+    assert.ok(dlg2.innerHTML.includes('Clear the pending full reset on seat A?') && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg2.innerHTML), dlg2.innerHTML);
+    await pair.doReset();
+    pair.openClear('A', 'claude', 'nonsense');                                    // an unknown kind opens nothing
+    assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full' }]);
+    assert.strictEqual(sent.length, 3);
   })().catch(e => { console.error(e); process.exit(1); });
 }
 // the update notice speaks to an end user: what is out of date and the one command that fixes it; no --push

@@ -15,7 +15,8 @@ the Claude Code CLI (`claude`); Git, only for updates. Optional, each for its ow
 the Codex CLI, the Grok CLI, the Antigravity app (Gemini).
 
 1. **Get the files.** Clone this repo. The folder you run from (the **rotator folder**) is the repo's `windows/` folder,
-   or a copy of it anywhere you like.
+   or a copy of it anywhere you like. Run from the clone itself, updates come from `git pull`: `rotator-sync` is for a
+   separate copy and refuses to run inside the clone.
 2. **Load the shortcuts.** Add one line to your PowerShell profile (`notepad $PROFILE`), then open a new terminal:
    ```
    . "C:\path\to\rotator-folder\rotator-functions.ps1"
@@ -226,6 +227,7 @@ Gate C simply waits.
 Why this is cheap: a **capped** account 429s instantly and spends nothing, so the only state that
 costs anything is "high but not yet capped". A quiet day costs **zero** Fable tokens; a seat parked
 at 90% costs 48 probes/day (~1.5k tokens), and at the 15-min floor at most 96/day (~3k).
+An armed Fable probe that is refused outright (a 403 subscription refusal) rotates the active seat at once, through the same access trigger as a refused Haiku probe.
 
 ⚠ **No safety net, by explicit choice.** While disarmed nothing re-reads Fable, so a seat that
 climbs past the arming line with no rotation and no manual `--usage`/`--status`/`--best` in between
@@ -483,7 +485,7 @@ a Claude session.
 |---|---|
 | `claude-account --status` | App state, live account + account UUID, captured profiles |
 | `claude-account --switch <label>` | Back up the current login, load profile `<label>` |
-| `claude-account --switch <label> --relaunch` | Close the running app first (asks its windows to close, waits up to 30 s, and aborts without force-closing if it is still running), switch, then reopen the installed app (the Squirrel `claude.exe` the Start-menu shortcut runs, else `Update.exe --processStart claude.exe`, else the MSIX package). A refused switch reopens the app on its old login. Tests: `test-app-relaunch.ps1` |
+| `claude-account --switch <label> --relaunch` | Close the running app first (asks its windows to close, waits up to 30 s, and aborts without force-closing if it is still running, telling you to quit it from the system tray if that is where it lives), switch, then reopen the installed app (the Squirrel `claude.exe` the Start-menu shortcut runs, else `Update.exe --processStart claude.exe`, else the MSIX package). A refused switch reopens the app on its old login. Tests: `test-app-relaunch.ps1` |
 | `claude-account --rotate [label]` | Cycle to the next profile (or switch straight to `<label>`) |
 | `claude-account --capture <label>` | Save the CURRENT app login as profile `<label>` |
 | `claude-account --list` / `--help` | List profiles / print help |
@@ -787,11 +789,11 @@ login (not a setup-token)" and that seat is asked again only after **7 days**. S
 account** (`~/.claude-app-seats/<seat>/config.json`, kept by `claude-account`), the credit read and the Apply use it. "The same account" is
 checked three ways: the app seat's `email.txt` or `meta.txt` names the seat's `email.txt` address; the snapshot is pinned to the app seat's
 `owner-uuid.txt` (a snapshot of another account is refused, as `claude-app-seat-keepalive.ps1` does) and only that account's token entries are
-read; and the token's organization is the one the seat's own probe recorded. Then that login's `user:profile` token is used. `app-login-token.ps1` decrypts it **read-only** (it never refreshes a token
+read; and the token's organization is the one the seat's own probe recorded (until it is recorded the seat shows no credits yet: nothing is sent, the setup-token is not tried instead, and no hold is set, so the first read after a probe records the organization uses the login). Then that login's `user:profile` token is used. `app-login-token.ps1` decrypts it **read-only** (it never refreshes a token
 and never writes a file; the live seat is read from the app's own `%APPDATA%\Claude\config.json`); an expired one shows "app login expired; open the
 app on this seat to refresh" (`app_login`, `seat_token`, selftest; `app-login-token.ps1 -SelfTest`). This read changes nothing. The token is sent only in
 that request's header and is never logged or stored. A seat that was read and holds no credits shows an empty cell, one never read `–`, and a seat with a
-note (sign-in needed, rate limited, the two above) shows it; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
+note (sign-in needed, rate limited, the two above) shows it, and the column stays for that note even when no seat holds a credit; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
 buttons below included.
 
 **Apply reset (Claude).** In the app, a seat whose last reading has a credit usable now gets one button per kind: `Apply Fable reset`, `Apply full reset`, and
@@ -800,8 +802,8 @@ credit it uses and when that expires, and warns when the window it refills renew
 `{seat, kind}` to the dashboard (same Host and `X-Quota-App` guards as Refresh, one request at a time across Refresh and both resets). The dashboard picks
 the credit itself from the last reading, soonest expiry first, and never takes a credit id from the page; then it makes Claude Code's claim,
 `POST https://api.anthropic.com/api/organizations/<org>/reset_rate_limits` with `{"program": "cedar_ember", "grant_id": ..., "request_id": ...}` (the
-organization from the seat's `usage-cache.json`), and reads that seat's credits again. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
-keeps its `request_id` in the provider cache, however old, until a resend settles it, so applying again retries the same claim instead of spending a second reset. While it is pending, that seat and kind keep a `Resend pending <kind>` button even when the reading no longer lists a credit of that kind (the blob's `resets[].pending`, from `pending_claims`), and the click resends the stored grant id and request id, never a new grant. A 429, 401/403 or missing sign-in on such a resend keeps the claim. Code: `Store.claude_reset`,
+organization from the seat's `usage-cache.json`), and, on a confirmed reset, takes the spent credit off that seat's cached grants straight away (so the page never offers it again while the follow-up read is held by a 429, sign-in or scope hold, which would otherwise mint a second claim for it), then reads that seat's credits again. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
+keeps its `request_id` in the provider cache, however old, until a resend settles it, so applying again retries the same claim instead of spending a second reset. While it is pending, that seat and kind keep a `Resend pending <kind>` button even when the reading no longer lists a credit of that kind (the blob's `resets[].pending`, from `pending_claims`), and the click resends the stored grant id and request id, never a new grant. A 429, 401/403 or missing sign-in on such a resend keeps the claim. A claim whose resend never gets an answer Claude recognises would stay pending for good, so next to `Resend pending` the seat shows `Clear`: it asks first (Cancel is the default) and then drops that seat-and-kind claim (`POST /api/claude-reset-clear` `{seat, kind}`, same Host and `X-Quota-App` guards, one request at a time, `Store.claude_reset_clear`). Use it only once the seat's limit shows the reset was not used: the next Apply then starts a new claim with a new request id. Code: `Store.claude_reset`,
 `consume_reset` and `usable_grants` in `usage-history.py` (selftest block K); the kinds' wording is `QUOTA_RESET_KINDS` in `usage-sim.js`.
 
 **Switching seats from the dashboard.** In the app, each seat row has a Switch column and each provider header a button; they run the rotators next to
@@ -843,7 +845,7 @@ exists.
 | Command | What it does |
 |---|---|
 | `rotator-sync --check [--quiet]` | Fetches the clone (at most every 6 h), then compares every file under `windows/` at `origin/main` with the live folder, ignoring CRLF/LF and a UTF-8 BOM. Lists `differing` and `missing-live` files; files only in the live folder and `rotator.local.json` / `*.local.*` are ignored. Exit 1 if anything differs. Writes `~/.claude-cli-accounts/.rotator-drift.json`. |
-| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. All or nothing: every new version is first written to a temporary sibling (nothing live is touched yet), then each is backed up and swapped in; if any swap fails, every file already swapped is put back and every added one removed, and the failure is reported (exit 1). Added files go in before changed ones, and the plan is journaled (`<state>.pull-journal.json`) before the first swap, so a pull that is killed mid-way is rolled back by the next `--pull` or `--check` ("recovered an interrupted update"). It resolves the ref to one commit after fetching and installs exactly that commit. |
+| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. All or nothing: every new version is first written to a temporary sibling (nothing live is touched yet), then each is backed up and swapped in; if any swap fails, every file already swapped is put back and every added one removed, and the failure is reported (exit 1). Added files go in before changed ones, and the plan is journaled (`<state>.pull-journal.json`) before the first swap, so a pull that is killed mid-way is rolled back by the next `--pull` or `--check` ("recovered an interrupted update"). It resolves the ref to one commit after fetching and installs exactly that commit. One lock spans the whole run (recovery, staging, install), so a second `--pull` stops with "another update is running; nothing was changed". If it replaces `usage-history.py`, `usage-dashboard.template.html` or `usage-sim.js`, it says to restart the dashboard (the `Claude usage dashboard` scheduled task): the running server keeps serving the old files until then. When the live folder is the clone's own `windows/` folder (or anywhere inside the clone), `--pull` is refused and `--check` says to use `git pull` and reports no drift. |
 | `rotator-sync --selftest` | Runs the built-in checks in a temporary repo. |
 
 Options: `--repo <clone>`, `--live <folder>`, `--ref <ref>` (default `origin/main`). The usage dashboard shows

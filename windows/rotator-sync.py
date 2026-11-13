@@ -8,11 +8,13 @@
 Config (rotator.local.json next to this script, all keys optional):
   repoClone  path of a local clone of the repo        (or pass --repo)
   liveDir    folder the rotator runs from             (default: the folder this script is in)
+Run from inside the clone itself (liveDir in the clone), there is nothing to sync: --pull is refused and --check reports no drift; `git pull` is the update there.
 Python standard library only. It only ever reads the clone: it never commits, pushes or opens a PR.
 """
 import argparse
 import contextlib
 import fnmatch
+import io
 import json
 import os
 import shutil
@@ -181,28 +183,42 @@ def roll_back(plan):
                 done += 1
         except OSError:
             bad.append(dest)
-        for junk in (dest + ".tmp-sync", "%s.part" % bak):
-            with contextlib.suppress(OSError):
-                os.remove(junk)
+        for junk in (dest + ".tmp-sync", bak and bak + ".part"):   # an added file has no backup (bak None): no "None.part" to remove
+            if junk:
+                with contextlib.suppress(OSError):
+                    os.remove(junk)
     return done, bad
+
+
+def roll_back_journal(jpath):
+    """Roll back the journal at `jpath` and delete it. The caller holds the journal's lock. -> (put back, could not) or None if there is none."""
+    if not os.path.exists(jpath):
+        return None                                     # the pull finished meanwhile and took its journal away
+    res = roll_back([tuple(e) for e in load_json(jpath).get("files") or []])
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(jpath)
+    return res
+
+
+def say_recovered(res):
+    if res:
+        done, bad = res
+        sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (done, "; restore by hand: " + ", ".join(bad) if bad else ""))
 
 
 def recover(state):
     """A --pull that died mid-swap left its journal (<state>.pull-journal.json): put every file back and say so. Skipped while a pull holds
-    the journal's lock, so a --check never undoes a pull that is still running."""
+    the journal's lock, so a --check never undoes a pull that is still running. (--pull itself holds that lock for its whole run and calls
+    roll_back_journal directly: the lock is not re-entrant, a second handle on it would always be refused.)"""
     jpath = state + ".pull-journal.json"
     if not os.path.exists(jpath):
         return
     try:
         with state_lock(jpath, wait=0):
-            if not os.path.exists(jpath):
-                return                                  # the pull finished meanwhile and took its journal away
-            done, bad = roll_back([tuple(e) for e in load_json(jpath).get("files") or []])
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(jpath)
+            res = roll_back_journal(jpath)
     except TimeoutError:
         return
-    sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (done, "; restore by hand: " + ", ".join(bad) if bad else ""))
+    say_recovered(res)
 
 
 def cmd_check(repo, live, ref, state, quiet):
@@ -222,7 +238,28 @@ def cmd_check(repo, live, ref, state, quiet):
 
 
 def cmd_pull(repo, live, ref, state):
-    recover(state)
+    # ONE lock spans the whole pull -- recovery, fetch, staging, swap, cleanup -- and is taken without waiting. The staged copies have fixed
+    # <dest>.tmp-sync names, so a second pull that staged before it learned of the first would overwrite, then delete, the first one's files
+    # mid-install. A second pull therefore stops here, before it has written anything.
+    jpath = state + ".pull-journal.json"
+    lock = state_lock(jpath, wait=0)
+    try:
+        lock.__enter__()
+    except TimeoutError:
+        sys.stderr.write("rotator-sync: another update is running; nothing was changed\n")
+        return 1
+    try:
+        return pull_locked(repo, live, ref, state, jpath)
+    finally:
+        lock.__exit__(None, None, None)
+
+
+RESTART_FILES = ("usage-history.py", "usage-dashboard.template.html", "usage-sim.js")
+DASHBOARD_TASK = "Claude usage dashboard"           # the logon task usage-app-install.ps1 registers
+
+
+def pull_locked(repo, live, ref, state, jpath):
+    say_recovered(roll_back_journal(jpath))
     maybe_fetch(repo, ref, state, force=True)
     at = resolve(repo, ref)
     differing, missing = compare(repo, live, at)
@@ -247,32 +284,19 @@ def cmd_pull(repo, live, ref, state):
                 os.remove(dest + ".tmp-sync")
         raise
     plan = [(dest, "%s.bak-sync-%s" % (dest, stamp) if rel in differing else None) for rel, dest in staged]
-    jpath = state + ".pull-journal.json"
+    if plan:
+        write_state(jpath, {"files": plan})
     try:
-        lock = state_lock(jpath)
-        lock.__enter__()
-    except TimeoutError:                                # another pull holds it: this one stops, its staged copies cleaned up
-        for _, dest in staged:
-            with contextlib.suppress(OSError):
-                os.remove(dest + ".tmp-sync")
-        sys.stderr.write("rotator-sync: another update is running; nothing was changed\n")
-        return 1
-    try:
-        if plan:
-            write_state(jpath, {"files": plan})
-        try:
-            for dest, bak in plan:
-                if bak:
-                    shutil.copy2(dest, bak + ".part")
-                    os.replace(bak + ".part", bak)      # a backup exists only once it is complete
-                os.replace(dest + ".tmp-sync", dest)
-            err = None
-        except OSError as e:
-            err, (_, bad) = e, roll_back(plan)
-        with contextlib.suppress(OSError):
-            os.remove(jpath)
-    finally:
-        lock.__exit__(None, None, None)
+        for dest, bak in plan:
+            if bak:
+                shutil.copy2(dest, bak + ".part")
+                os.replace(bak + ".part", bak)          # a backup exists only once it is complete
+            os.replace(dest + ".tmp-sync", dest)
+        err = None
+    except OSError as e:
+        err, (_, bad) = e, roll_back(plan)
+    with contextlib.suppress(OSError):
+        os.remove(jpath)
     if err:
         e = err
         sys.stderr.write("rotator-sync: the update failed (%s: %s); %s\n" % (type(e).__name__, e, "every file was put back as it was" if not bad else
@@ -283,6 +307,10 @@ def cmd_pull(repo, live, ref, state):
         print("%s %s" % ("added   " if rel in missing else "replaced", rel))
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
+    if any(rel in RESTART_FILES for rel, _ in staged):
+        # the running dashboard server loaded the old script and template at start and keeps serving them
+        print("rotator-sync: the usage dashboard's files changed; restart it so the running server picks them up "
+              "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s')" % (DASHBOARD_TASK, DASHBOARD_TASK))
     record(repo, live, ref, state, at)
     return 0
 
@@ -464,6 +492,7 @@ def selftest():
         th_ = threading.Thread(target=holder_)
         th_.start()
         held_.wait(5)
+        write(os.path.join(live, "b.py.tmp-sync"), b"the first pull's staged copy")     # what the running pull has staged, under the fixed name
         globals()["state_lock"] = lambda path, wait=30: real_lock(path, 0.3 if path == jp_ else wait)
         try:
             rc_ = cmd_pull(repo, live, "HEAD", state)
@@ -471,8 +500,15 @@ def selftest():
             globals()["state_lock"] = real_lock
             go_.set()
             th_.join()
+        # the lock is taken before anything is staged: the blocked pull must not overwrite or delete the first pull's staged file
+        check("a pull blocked by another pull does not touch the running pull's staged copies",
+              rc_ == 1 and open(os.path.join(live, "b.py.tmp-sync"), "rb").read() == b"the first pull's staged copy")
+        os.remove(os.path.join(live, "b.py.tmp-sync"))
         check("a pull blocked by another pull changes nothing and leaves no temp", rc_ == 1 and open(os.path.join(live, "b.py"), "rb").read() == b"print(5)\n"
               and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        # a stale journal is rolled back by a --pull itself, under the lock that pull already holds (the lock is not re-entrant)
+        write(os.path.join(live, "stale-added.txt"), b"added by a killed pull\n")
+        write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None]]})
         write(os.path.join(live, "b.py"), before_["b.py"])
         for n in os.listdir(live):
             if ".bak-sync-" in n:
@@ -482,6 +518,8 @@ def selftest():
         cmd_pull(repo, live, "HEAD", state)
         names = os.listdir(live)
         check("pull restored the files", compare(repo, live, "HEAD") == ([], []))
+        check("a pull rolls back a stale journal first (and does not deadlock on its own lock)",
+              not os.path.exists(os.path.join(live, "stale-added.txt")) and not os.path.exists(jp_))
         check("pull backed up what it overwrote", sum(n.startswith("b.py.bak-sync-") for n in names) == 1
               and sum(n.startswith("a.ps1.bak-sync-") for n in names) == 1)
         check("pull left live-only and local files", "live-only.ps1" in names and "rotator.local.json" in names)
@@ -537,6 +575,51 @@ def selftest():
         th.join()
         st = load_json(state)
         check("an overlapping --check neither loses the other run's write nor its own result", st["fetched"] == 12345 and st["checked"] > 0 and st["ref"].startswith("HEAD "))
+        # roll_back of an added file (backup None) must not remove a relative "None.part" from the working directory
+        cwd_, nd = os.getcwd(), os.path.join(root, "nonepart")
+        write(os.path.join(nd, "None.part"), b"unrelated")
+        os.chdir(nd)
+        try:
+            roll_back([(os.path.join(nd, "added.txt"), None)])
+        finally:
+            os.chdir(cwd_)
+        check("roll_back of an added file leaves an unrelated None.part alone", os.path.exists(os.path.join(nd, "None.part")))
+        # running from inside the clone: --pull is refused, --check reports no drift
+        check("the clone's own windows/ folder is inside the clone", inside_repo(os.path.join(repo, "windows"), repo) and inside_repo(repo, repo)
+              and not inside_repo(live, repo) and not inside_repo(repo + "-other", repo))
+        st_in = os.path.join(root, "in-state.json")
+        write(os.path.join(repo, "windows", "b.py"), b"print(1)\n")        # the working tree differs from the committed b.py: not drift
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_in = main(["--check", "--repo", repo, "--live", os.path.join(repo, "windows"), "--state", st_in])
+        check("--check inside the clone says to use git pull and reports no drift", rc_in == 0 and "git pull" in buf.getvalue()
+              and load_json(st_in)["differing"] == [])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc_in = main(["--pull", "--repo", repo, "--live", os.path.join(repo, "windows"), "--state", st_in])
+        check("--pull inside the clone is refused and changes nothing", rc_in == 1 and "git pull" in buf.getvalue()
+              and open(os.path.join(repo, "windows", "b.py"), "rb").read() == b"print(1)\n")
+        # a pull that replaces a dashboard file says to restart the dashboard
+        repo2, live2, st2 = (os.path.join(root, n) for n in ("repo2", "live2", "state2.json"))
+        os.makedirs(repo2)
+        git(repo2, "init", "-q")
+        for k_, v_ in (("user.name", "Self Test"), ("user.email", "selftest@example.com"), ("commit.gpgsign", "false"), ("core.autocrlf", "false")):
+            git(repo2, "config", k_, v_)
+        write(os.path.join(repo2, "windows", "usage-history.py"), b"new\n")
+        write(os.path.join(repo2, "windows", "other.ps1"), b"o\n")
+        git(repo2, "add", "--", "windows/usage-history.py", "windows/other.ps1")
+        git(repo2, "commit", "-q", "-m", "init")
+        write(os.path.join(live2, "usage-history.py"), b"old\n")
+        write(os.path.join(live2, "other.ps1"), b"o\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_2 = cmd_pull(repo2, live2, "HEAD", st2)
+        check("a pull that replaces usage-history.py names the dashboard task to restart", rc_2 == 0 and DASHBOARD_TASK in buf.getvalue())
+        write(os.path.join(live2, "other.ps1"), b"changed\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_pull(repo2, live2, "HEAD", st2)
+        check("... and one that replaces only other files does not", "restart" not in buf.getvalue())
         # Idle priority: from Normal, this script lowers itself; the profile's rotator-sync function starts it at Idle and its shell
         # goes back to its own priority afterwards (a copy of the function runs a stand-in script that prints its own class)
         if os.name == "nt":
@@ -572,6 +655,19 @@ def lower_priority():
         k.SetPriorityClass(k.GetCurrentProcess(), 0x40)
 
 
+def inside_repo(live, repo):
+    """True when the live folder is the clone's own windows/ folder or anywhere else inside the clone (real paths, case-insensitively on Windows)."""
+    def real(p):
+        return os.path.normcase(os.path.realpath(p))
+    try:
+        return os.path.commonpath([real(live), real(repo)]) == real(repo)
+    except ValueError:                                  # different drives
+        return False
+
+
+IN_REPO = "rotator-sync: %s is inside the clone %s, so there is nothing to sync: update it with `git pull` in the clone"
+
+
 def main(argv=None):
     lower_priority()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -592,6 +688,14 @@ def main(argv=None):
     if not repo:
         raise SystemExit("rotator-sync: no clone: set repoClone in rotator.local.json or pass --repo")
     live = a.live or cfg.get("liveDir") or HERE
+    if inside_repo(live, repo):
+        # Running from the clone itself: the files ARE the clone's working tree, so comparing them with the ref would only report whatever
+        # the checkout is behind or ahead by as an "update available", and --pull would overwrite the working tree. `git pull` is the update here.
+        if a.check:
+            update_state(a.state, lambda st: st.update({"checked": int(time.time()), "ref": "%s (in the clone)" % a.ref, "differing": [], "missingLive": []}))
+        if not a.quiet or a.pull:
+            (sys.stdout if a.check else sys.stderr).write((IN_REPO % (live, repo)) + "\n")
+        return 0 if a.check else 1
     if a.check:
         return cmd_check(repo, live, a.ref, a.state, a.quiet)
     return cmd_pull(repo, live, a.ref, a.state)

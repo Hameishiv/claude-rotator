@@ -34,6 +34,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -179,7 +180,11 @@ def in_use(cli_root=None, app_root=None, appdata=None, codex_dir=None):
 
 def read_claude():
     seats = {}
-    for name in sorted(os.listdir(ROOT)):
+    try:
+        names = sorted(os.listdir(ROOT))
+    except OSError:
+        return seats        # no seats folder (yet, or any more): no Claude data, but the other providers are still recorded
+    for name in names:
         d = os.path.join(ROOT, name)
         if name[:1] in "._" or not os.path.isdir(d) or not glob.glob(os.path.join(d, "usage-cache*.json")):
             continue    # only a folder that holds a usage cache is a seat
@@ -261,13 +266,20 @@ def read_codex(cdir=None, sink=None):
     return seats, emails
 
 
+def _fromiso(s):
+    """datetime.fromisoformat, accepting a trailing Z too: Python 3.10 (the README's floor) rejects it, 3.11+ does not. Raises what fromisoformat raises."""
+    from datetime import datetime
+    if isinstance(s, str) and s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
 def parse_grok(j):
     """Billing response -> seat dict, or None when the shape is not the expected one."""
-    from datetime import datetime
     try:
         cfg = j["config"]
         cp = cfg["currentPeriod"]
-        start, end = (datetime.fromisoformat(cp[k]).timestamp() for k in ("start", "end"))
+        start, end = (_fromiso(cp[k]).timestamp() for k in ("start", "end"))
         used = float(cfg["creditUsagePercent"]) / 100
     except (KeyError, TypeError, ValueError):
         return None
@@ -396,7 +408,6 @@ def parse_gemini(j, now):
     """GetUserStatus -> seat dict with one window per (remainingFraction, resetTime) group, or None when the shape is not the expected one.
     seat["n"] maps window id -> label. Antigravity gives a group no name of its own, so a group of several models is "Pool 1", "Pool 2"...
     in the order it lists them, and only a group of exactly one model (a limit of that model alone) is named after it (owner, r11)."""
-    from datetime import datetime
     try:
         cfgs = j["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"]
         groups = {}
@@ -405,7 +416,7 @@ def parse_gemini(j, now):
             if not isinstance(q, dict) or not q.get("resetTime"):
                 continue                # no quota on this model
             frac = round(float(q.get("remainingFraction") or 0), 4)     # proto3 JSON leaves a zero out
-            reset = int(datetime.fromisoformat(q["resetTime"]).timestamp())
+            reset = int(_fromiso(q["resetTime"]).timestamp())
             fam = re.sub(r"\s*\((?:Low|Medium|High|XHigh)\)\s*$", "", str(c["label"])).strip()
             fams = groups.setdefault((frac, reset), [])
             if fam not in fams:
@@ -626,8 +637,9 @@ NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
 def app_login(label, run=subprocess.run):
     """The seat's full desktop-app login, READ-ONLY, when the app saved one for the SAME account: its email matches the seat's email.txt, the
     helper took it from a snapshot pinned to the app seat's owner-uuid.txt (and only that account's entries), and its organization is the one
-    the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), or (None, None) when there is none
-    or anything does not match. The setup-token in token.txt cannot read reset
+    the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), ("pending", None) when the login is this
+    account's but the seat's organization is not recorded yet (it cannot be tied to the seat, so it is not used, and the setup-token must not be tried
+    instead: it can only be refused for its scope), or (None, None) when there is none or anything does not match. The setup-token in token.txt cannot read reset
     credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
     prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored."""
     app = os.path.join(APP_SEATS, label)
@@ -646,19 +658,24 @@ def app_login(label, run=subprocess.run):
         return None, None
     owner, org = _read(os.path.join(app, "owner-uuid.txt")), claude_org(label)
     if isinstance(j, dict) and j.get("state") == "ok" and isinstance(j.get("token"), str) and j["token"]:
-        if not owner or j.get("accountUuid") != owner or not org or str(j.get("orgUuid") or "").lower() != org.lower():
+        if not owner or j.get("accountUuid") != owner:
             return None, None           # another account's login, or one that cannot be tied to this seat: never used
+        if not org:
+            return "pending", None      # this account's own login, its organization not recorded yet: wait for the probe to record it
+        if str(j.get("orgUuid") or "").lower() != org.lower():
+            return None, None
         return "ok", j["token"]
     return ("expired", None) if isinstance(j, dict) and j.get("state") == "expired" else (None, None)
 
 
 def seat_token(label, login=app_login):
-    """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so."""
+    """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so, and so does one whose
+    seat organization is not known yet ("pending": no fallback to token.txt, which cannot read credits and would only earn a week-long scope hold)."""
     st, tok = login(label)
     if st == "ok":
         return tok, None
-    if st == "expired":
-        return None, "expired"
+    if st in ("expired", "pending"):
+        return None, st
     return _read(os.path.join(ROOT, label, "token.txt")) or None, None
 
 
@@ -669,11 +686,12 @@ def token_seats():
 
 def read_credits(label, now, fetch=http_json, ver=None, login=app_login):
     """One GET of the seat's reset credits -> (state, reading): "ok" (reading), "rl" (429), "scope" (403: the token cannot read credits, a
-    setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "none" (no token), "fail". The seat's full app login is
-    used when it has one (seat_token). The token stays in this function: never logged, stored or returned."""
+    setup-token), "auth" (other 401/403), "expired" (the seat's app login has expired), "pending" (it has an app login but the seat's organization is
+    not recorded yet: nothing is sent), "none" (no token), "fail". The seat's full app login is used when it has one (seat_token). The token stays in
+    this function: never logged, stored or returned."""
     tok, why = seat_token(label, login)
-    if why == "expired":
-        return "expired", None
+    if why in ("expired", "pending"):
+        return why, None
     if not tok:
         return "none", None
     req = urllib.request.Request(CREDITS_URL, headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20",
@@ -709,6 +727,16 @@ def usable_grants(entry, kind, now):
     if not any(g["id"] == entry.get("nextId") for g in gs):
         return []
     return sorted((g for g in gs if g["kind"] == kind), key=lambda g: (g["endsAt"] is None, g["endsAt"] or 0))
+
+
+def spend_grant(cache, seat, gid):
+    """Take one reset off grant `gid` in the provider cache's reading of `seat`, dropping the grant at 0: a confirmed claim spent it, and the next read (which
+    replaces the grants) may be refused by a hold. Without this the spent grant stays offered with its old count, and the next Apply would mint a new request id for it."""
+    e = (cache.get("credits") or {}).get(seat)
+    if not isinstance(e, dict):
+        return
+    e["grants"] = [dict(g, left=g["left"] - 1) if g.get("id") == gid else g for g in e.get("grants") or []]
+    e["grants"] = [g for g in e["grants"] if g.get("id") != gid or g["left"] > 0]
 
 
 def claude_org(label):
@@ -1367,10 +1395,17 @@ def page_html(data):
 
 
 def render(data):
-    tmp = OUT + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(page_html(data))
-    os.replace(tmp, OUT)
+    # a temp file of its own per render: the server and a one-shot --render can run at once, and sharing OUT + ".tmp" let one
+    # truncate the page the other was about to os.replace into place
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(OUT) or ".", prefix=os.path.basename(OUT) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(page_html(data))
+        os.replace(tmp, OUT)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 # ---------------------------------------------------------------- codex history from session logs
@@ -1396,7 +1431,6 @@ def rollout_files(cdir, now, since):
 
 def rollout_events(path):
     """(t, {window id: (used fraction, reset, period)}) for each usable token_count line, read streaming; bad lines are skipped."""
-    from datetime import datetime
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -1406,7 +1440,7 @@ def rollout_events(path):
                     j = json.loads(line)
                     p = j["payload"]
                     rl = p["rate_limits"] if p["type"] == "token_count" else None
-                    t = datetime.fromisoformat(j["timestamp"]).timestamp()
+                    t = _fromiso(j["timestamp"]).timestamp()
                 except (ValueError, KeyError, TypeError):
                     continue
                 if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
@@ -1468,10 +1502,15 @@ def rollout_records(events, taken, rebuilt, hist=()):
     return recs
 
 
+CODEX_WINDOW_KEYS = ("w", "wr", "wp", "s", "sr", "sp", "ts")    # what a rollout log can measure; banked / bankedList come only from the cache
+
+
 def newest_codex(rec, hist, new=()):
     """Each Codex seat in sample `rec` keeps the newest measurement (by its own ts) among this sample's cache reading, the rollout points just read
     (`new`) and every earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
-    so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note) is left as it is."""
+    so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note) is left as it is.
+    A newer record supplies only the usage-window fields (CODEX_WINDOW_KEYS): its banked / bankedList were copied forward from older
+    records by rollout_records, and would overwrite the cache's fresher count of banked resets."""
     cur = rec.get("codex")
     if not isinstance(cur, dict):
         return rec
@@ -1479,7 +1518,7 @@ def newest_codex(rec, hist, new=()):
         for seat, v in (h.get("codex") or {}).items():
             c = cur.get(seat)
             if isinstance(c, dict) and isinstance(v, dict) and c.get("ts") and (v.get("ts") or 0) > c["ts"]:
-                cur[seat] = dict(v)
+                cur[seat] = dict({k: x for k, x in c.items() if k not in CODEX_WINDOW_KEYS}, **{k: x for k, x in v.items() if k in CODEX_WINDOW_KEYS})
     return rec
 
 
@@ -1518,7 +1557,7 @@ def rollout_tokens(path):
                     j = json.loads(line)
                     p = j["payload"]
                     rl = p["rate_limits"] if p["type"] == "token_count" else None
-                    t = datetime.fromisoformat(j["timestamp"]).timestamp()
+                    t = _fromiso(j["timestamp"]).timestamp()
                 except (ValueError, KeyError, TypeError):
                     continue
                 if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
@@ -2051,7 +2090,8 @@ class Store:
 
     def credits_read(self, label, now, fetch=http_json, force=False, ver=None, login=app_login):
         """Read one Claude seat's reset credits into the provider cache (`credits`: {seat: {ts, eligible, grants, next, hold, note}}). `next` is claimed before the
-        call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read. Returns the read's state, or None when it was skipped."""
+        call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read; "pending" (an app login whose organization is
+        not known yet) sets none. Returns the read's state, or None when it was skipped."""
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
@@ -2073,6 +2113,7 @@ class Store:
                 e["note"] = {"rl": "rate limited", "auth": "sign-in needed", "scope": NOTE_SCOPE}[state]
             elif state == "expired":
                 e["note"] = NOTE_APP_EXPIRED
+            # "pending": no hold and no note; the next read (the normal retry, or a Refresh) asks again, by when a probe has recorded the organization
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
@@ -2217,7 +2258,7 @@ class Store:
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
         the last reading, never taken from the page. The claim (grant id + request id) is saved per seat and kind before the call and kept while the outcome
         is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
-        claim that landed), so a retry can never spend a second grant. `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
+        claim that landed), so a retry can never spend a second grant. A confirmed reset also takes its grant off the cached reading at once (spend_grant). `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
         settled meanwhile (by another window), it is refused, never a new claim. Returns {"outcome", "text"}."""
         now = time.time()
         with self.lock, pcache_txn() as cache:
@@ -2241,10 +2282,25 @@ class Store:
         if not keep:
             with self.lock, pcache_txn() as cache:
                 (cache.get("credits_claims") or {}).pop(key, None)
+                if settled and res["outcome"] in ("redeemed", "alreadyRedeemed"):
+                    spend_grant(cache, seat, gid)        # the follow-up read below is refused while the seat is held (429 / sign-in / scope): the page must not offer the spent grant again meanwhile
         self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
         with self.lock:
             self.rebuild(time.time())
         return res
+
+    def claude_reset_clear(self, seat, kind):
+        """Drop a pending Claude claim (seat + kind) by hand (the caller holds `refreshing`): a resend of it never got an answer Claude recognises, so it would stay
+        pending, and resent, forever. The user checked that the reset was not used. The next Apply then starts a new claim with a new request id."""
+        key = seat + ":" + kind
+        with self.lock:
+            with pcache_txn() as c:
+                had = (c.get("credits_claims") or {}).pop(key, None) is not None
+            if had:
+                applog("claude reset: seat %s %s pending claim cleared by hand" % (seat, kind))
+                self.rebuild(time.time())
+        return {"outcome": "ok", "text": "Cleared. Apply %s is back on seat %s." % (CREDIT_KINDS[kind].lower(), seat)} if had else \
+            {"outcome": "error", "text": "Seat %s has no pending %s to clear." % (seat, CREDIT_KINDS[kind].lower())}
 
 
 def probe_claude():
@@ -2310,7 +2366,7 @@ def make_handler(store, port):
             if not host_ok(self.headers.get("Host"), port):
                 return self.refuse(403, "forbidden")
             path = self.path.split("?")[0]
-            if path not in ("/api/refresh", "/api/codex-reset", "/api/codex-reset-clear", "/api/claude-reset", "/api/switch"):
+            if path not in ("/api/refresh", "/api/codex-reset", "/api/codex-reset-clear", "/api/claude-reset", "/api/claude-reset-clear", "/api/switch"):
                 return self.refuse(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
                 return self.refuse(403, "forbidden")
@@ -2320,6 +2376,8 @@ def make_handler(store, port):
                 return self.codex_reset_clear()
             if path == "/api/claude-reset":
                 return self.claude_reset()
+            if path == "/api/claude-reset-clear":
+                return self.claude_reset_clear()
             if path == "/api/switch":
                 return self.switch()
             if not store.refreshing.acquire(blocking=False):
@@ -2412,6 +2470,25 @@ def make_handler(store, port):
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
+            finally:
+                store.refreshing.release()
+
+        def claude_reset_clear(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else {}
+                seat, kind = b.get("seat"), b.get("kind")
+            except (ValueError, AttributeError):
+                seat = kind = None
+            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS:
+                return self.js(400, {"outcome": "error", "text": "Unknown Claude seat or reset kind."})
+            if not store.refreshing.acquire(blocking=False):
+                return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
+            try:
+                self.js(200, store.claude_reset_clear(seat, kind))
+            except Exception as e:   # shortcut: same broad catch as refresh
+                applog("claude reset clear error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"outcome": "error", "text": "Could not clear it: %s." % type(e).__name__})
             finally:
                 store.refreshing.release()
 
@@ -2851,6 +2928,40 @@ def selftest():
         got_ = newest_codex({"t": N, "codex": {"A": {"ts": N - 900, "w": 0.1}}}, [{"t": N - 50, "codex": {"A": {"ts": N - 40, "w": 0.9}}},
                                                                          {"t": N - 10, "codex": {"A": {"ts": N - 500, "w": 0.5}}}])["codex"]
         assert got_["A"] == {"ts": N - 40, "w": 0.9}, got_
+        # a newer log record carries only its usage-window fields: the cache's banked count (the credit was spent elsewhere: 0) is not
+        # replaced by the banked 1 that rollout_records copied forward from an older record
+        WK_, F_, T_ = 604800, N - 600, N - 300
+        hb_ = [{"t": N - 1200, "codex": {"A": {"ts": N - 1260, "w": 0.30, "wr": N + WK_, "wp": WK_, "banked": 1, "bankedList": [{"title": "x", "expiresAt": N}]}}}]
+        nb_ = rollout_records([(T_, "A", {"w": (0.35, N + WK_, WK_)})], set(), False, hb_)
+        assert nb_[0]["codex"]["A"]["banked"] == 1, nb_                                       # the premise: the log record is built on the old sample
+        got_ = newest_codex({"t": N, "codex": {"A": {"ts": F_, "w": 0.32, "wr": N + WK_, "wp": WK_, "banked": 0, "bankedList": []}}}, hb_, nb_)["codex"]["A"]
+        assert got_["w"] == 0.35 and got_["ts"] == T_ and got_["banked"] == 0 and got_["bankedList"] == [], got_
+        # Z-suffixed timestamps parse on every Python 3.10+ (3.10's fromisoformat rejects the Z)
+        assert _fromiso("2026-11-12T20:15:30Z") == _fromiso("2026-11-12T20:15:30+00:00") and _fromiso("2026-11-12T20:15:30.123z").microsecond == 123000
+        assert parse_grok({"config": {"currentPeriod": {"start": "2026-11-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}, "creditUsagePercent": 5}})["w"] == 0.05
+        # no seats folder: read_claude gives no Claude data instead of raising, so the other providers are still sampled
+        keep_root_ = ROOT
+        globals().update(ROOT=os.path.join(td, "no-such-seats-folder"))
+        try:
+            assert read_claude() == {}
+        finally:
+            globals().update(ROOT=keep_root_)
+        # render writes through a temp file of its own and leaves none behind, on success or failure
+        rd_ = os.path.join(td, "render-dir")
+        os.makedirs(rd_)
+        keep_out_, real_ph_ = OUT, page_html
+        globals().update(OUT=os.path.join(rd_, "page.html"))
+        try:
+            render({"x": 1})
+            assert os.listdir(rd_) == ["page.html"], os.listdir(rd_)
+            globals()["page_html"] = lambda d: 1 / 0
+            try:
+                render({})
+            except ZeroDivisionError:
+                pass
+            assert os.listdir(rd_) == ["page.html"], os.listdir(rd_)
+        finally:
+            globals().update(OUT=keep_out_, page_html=real_ph_)
         # the sampler's import: nothing on the first run (sets the watermark), then only files modified since, recorded (not b), merged in time order
         keep, HIST, PCACHE = (HIST, PCACHE), os.path.join(td, "h.jsonl"), os.path.join(td, "p.json")
         try:
@@ -3539,10 +3650,19 @@ def selftest():
                 return r
             ok_ = lambda acct, org=ORG_: hp_(json.dumps({"state": "ok", "token": "tok-app", "expiresAt": 1, "accountUuid": acct, "orgUuid": org}).encode())
             okr = ok_("acct-A")
+            os.makedirs(os.path.join(APP_SEATS, "E"))
+            os.makedirs(os.path.join(jd, "E"))
+            for fn_, txt_ in (("config.json", "{}"), ("meta.txt", "captured=1 account=e@x.example" + chr(10)), ("owner-uuid.txt", "acct-E")):
+                open(os.path.join(APP_SEATS, "E", fn_), "w").write(txt_)
+            open(os.path.join(jd, "E", "email.txt"), "w").write("e@x.example")
+            open(os.path.join(jd, "E", "token.txt"), "w").write("secret-E")                  # a setup-token, which cannot read credits
             if os.name == "nt":
+                # an app login that is this account's, with the seat's organization not recorded yet (no usage-cache): pending, never the setup-token
+                assert app_login("E", ok_("acct-E")) == ("pending", None) and app_login("E", ok_("acct-B")) == (None, None) and app_login("E", hp_(b"junk")) == (None, None)
+                assert app_login("E", hp_(b'{"state":"expired","expiresAt":1}')) == ("expired", None)
                 assert app_login("A", okr) == ("ok", "tok-app") and app_login("B", ok_("acct-B")) == ("ok", "tok-app")     # email from meta.txt, or email.txt
-                assert runs[0][0][-2:] == ["-Seat", "A"] and runs[0][0][-3].endswith("app-login-token.ps1") and runs[0][1]["creationflags"] == CHILD_FLAGS
-                assert app_login("C", okr) == (None, None) and app_login("D", okr) == (None, None) and len(runs) == 2      # another account's login, or none: never asked
+                assert runs[4][0][-2:] == ["-Seat", "A"] and runs[4][0][-3].endswith("app-login-token.ps1") and runs[4][1]["creationflags"] == CHILD_FLAGS
+                assert app_login("C", okr) == (None, None) and app_login("D", okr) == (None, None) and len(runs) == 6      # another account's login, or none: never asked
                 assert app_login("A", hp_(b'{"state":"expired","expiresAt":1}')) == ("expired", None)
                 assert app_login("A", hp_(b"junk")) == (None, None) and app_login("A", hp_(b'{"state":"ok","token":""}')) == (None, None)
                 assert app_login("A", ok_("acct-B")) == (None, None)                                  # the helper's account is not this seat's owner
@@ -3557,6 +3677,15 @@ def selftest():
                 assert r_.returncode == 0 and b"app-login-token selftest: ok" in r_.stdout, r_.stdout[-400:]
         finally:
             globals()["APP_SEATS"] = keep_as
+        # a seat with an app login but no known organization: the credit read sends nothing (no setup-token fallback), sets no hold and no note, and
+        # asks again on the normal retry, which works once the organization is recorded
+        pend_ = lambda l: ("pending", None)
+        assert seat_token("E", pend_) == (None, "pending") and read_credits("E", JN, lambda req: 1 / 0, None, pend_) == ("pending", None)
+        n_ = len(calls)
+        assert st.credits_read("E", JN + 60 * CREDITS_EVERY, fx, force=True, login=pend_) == "pending" and len(calls) == n_
+        ee_ = load_pcache()["credits"]["E"]
+        assert "hold" not in ee_ and "note" not in ee_, ee_
+        assert st.credits_read("E", JN + 60 * CREDITS_EVERY + 1, fx, force=True, login=lambda l: ("ok", "secret-appE")) == "ok" and calls[-1][1] == "Bearer secret-appE"
         n_ = len(calls)
         off = os.path.join(jd, "off.json")
         open(off, "w").write('{"claudeResetCredits": false}')
@@ -3645,6 +3774,35 @@ def selftest():
         pc = load_pcache()
         assert pc["credits_claims"] == {} and [g["id"] for g in pc["credits"]["A"]["grants"]][0] == "g2" and usable_grants(pc["credits"]["A"], "fable", KN) == []
         assert "secret-" not in open(PCACHE).read() and "secret-" not in open(APPLOG).read() and "seat A fable -> redeemed" in open(APPLOG).read()
+        # a confirmed reset spends its grant in the cache even when the follow-up read is refused by a hold: the page must not offer the spent grant
+        # as a fresh Apply (a new request id for the same grant would be a second spend); the hold itself is not weakened
+        hid_ = lambda it=iter("ridH%d" % i for i in range(9)): next(it)         # ids of their own: the checks below count on rid2, rid3
+        hold_ = int(time.time()) + DAY
+        save_pcache({"credits": {"A": dict(ke, hold=hold_)}})
+        n_ = len(kc)
+        post.append((200, {"result": "reset"}))
+        assert ks.claude_reset("A", "fable", kf, hid_)["outcome"] == "redeemed" and len(kc) == n_ + 1 and kc[-1][0] == "POST"      # no GET: the hold refused it
+        e_ = load_pcache()["credits"]["A"]
+        assert e_["hold"] == hold_ and [g["left"] for g in e_["grants"] if g["id"] == "g1"] == [1], e_
+        assert build(kh, KN + 10, {}, False, dict(kx, credits={"A": e_}))["providers"][0]["accounts"][0]["resets"][0] == {"kind": "fable", "left": 1, "endsAt": KN + 3 * DAY}
+        post.append((200, {"result": "reset"}))
+        assert ks.claude_reset("A", "fable", kf, hid_)["outcome"] == "redeemed"                                                    # its last one
+        e_ = load_pcache()["credits"]["A"]
+        assert not any(g["id"] == "g1" for g in e_["grants"]) and usable_grants(e_, "fable", KN) == [] and load_pcache()["credits_claims"] == {}, e_
+        assert not any(r["kind"] == "fable" for r in build(kh, KN + 10, {}, False, dict(kx, credits={"A": e_}))["providers"][0]["accounts"][0].get("resets", []))
+        assert ks.claude_reset("A", "fable", kf, hid_)["outcome"] == "noCredit" and len(kc) == n_ + 2                              # no third claim goes out
+        # an unconfirmed outcome spends nothing
+        save_pcache({"credits": {"A": dict(ke, hold=hold_)}})
+        post.append(TimeoutError("t"))
+        ks.claude_reset("A", "fable", kf, hid_)
+        assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2]
+        # a pending claim that never settles is cleared by hand (and only that seat and kind)
+        save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:full": {"id": "ridP", "gid": "g2", "at": 1}, "A:fable": {"id": "ridF", "gid": "g1", "at": 1}}})
+        assert ks.claude_reset_clear("A", "full") == {"outcome": "ok", "text": "Cleared. Apply full reset is back on seat A."}
+        assert list(load_pcache()["credits_claims"]) == ["A:fable"] and "pending claim cleared by hand" in open(APPLOG).read()
+        assert ks.claude_reset_clear("A", "full") == {"outcome": "error", "text": "Seat A has no pending full reset to clear."}
+        assert ks.claude_reset_clear("B", "fable")["outcome"] == "error" and list(load_pcache()["credits_claims"]) == ["A:fable"]
+        save_pcache({"credits": {"A": dict(ke)}})
         # an unconfirmed claim keeps its request id; the retry of the same grant reuses it; a settled answer drops it
         save_pcache({"credits": {"A": dict(ke)}})
         kc.clear(), post.extend([TimeoutError("t"), (200, {"result": "already_used"}), (200, {"result": "reset"})])
@@ -3809,6 +3967,22 @@ def selftest():
                 assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("clear", "A") and not hs.refreshing.locked()
             finally:
                 globals()["codex_homes"] = keep_ch
+            # the hand clear of a pending Claude claim: the same guards (origin header, loopback host, body size), a known seat and kind, single flight
+            hs.claude_reset_clear = lambda seat, kind: (hc.append(("cclear", seat, kind)), {"outcome": "ok", "text": "c"})[1]
+            cc_, n_ = "/api/claude-reset-clear", len(hc)
+            assert hp(ok_, path=cc_, app=None)[0] == 403 and hp(ok_, host="evil.example:%d" % port, path=cc_)[0] == 403 and hp(ok_, path=cc_, app="0")[0] == 403
+            for bad in ({"seat": "Z", "kind": "fable"}, {"seat": "A/../B", "kind": "fable"}, {"seat": "A", "kind": "other"}, {"seat": "A", "kind": ["fable"]}, {"seat": "A"},
+                        {"seat": "A", "kind": "fable", "pad": "x" * 1100}, ["A"], b"not json", b""):
+                assert hp(bad, path=cc_)[0] == 400, bad
+            hs.refreshing.acquire()
+            assert hp(ok_, path=cc_)[0] == 409
+            hs.refreshing.release()
+            assert len(hc) == n_
+            st_, body_ = hp(ok_, path=cc_)
+            end_ = time.time() + 5
+            while hs.refreshing.locked() and time.time() < end_:
+                time.sleep(0.02)
+            assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("cclear", "A", "fable") and not hs.refreshing.locked()
         finally:
             srv.shutdown()
             srv.server_close()

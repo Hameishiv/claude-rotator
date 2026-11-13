@@ -10,6 +10,25 @@ import sys
 import tempfile
 import time
 
+
+
+def _lower_priority():
+    """This process at Idle CPU priority before it starts any child: Windows IDLE_PRIORITY_CLASS, else nice 19."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.WinDLL("kernel32")
+            k.GetCurrentProcess.restype = wintypes.HANDLE
+            k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            k.SetPriorityClass(k.GetCurrentProcess(), 0x40)
+        else:
+            os.nice(19)
+    except (OSError, AttributeError):
+        pass
+
+
+_lower_priority()
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from rotator_access import classify_hook, is_subscription_disabled

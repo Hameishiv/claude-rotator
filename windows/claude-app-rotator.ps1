@@ -173,7 +173,7 @@ function Invoke-SwitchRelaunch([string]$label) {
   # afterwards, on the new login, or on the old one when the switch refused (Invoke-Switch exits, so this runs in finally).
   $wasRunning = @(Get-AppProcs).Count -gt 0
   if (-not (Close-AppGracefully)) {
-    Write-Host "ABORTED: the Claude app was still running $($script:CloseWaitSec) s after it was asked to close. Nothing was switched; it was not force-closed (that can tear the login storage)." -ForegroundColor Red
+    Write-Host "ABORTED: the Claude app was still running $($script:CloseWaitSec) s after it was asked to close (if it lives in the system tray, quit it from the tray icon and run this again). Nothing was switched; it was not force-closed (that can tear the login storage)." -ForegroundColor Red
     exit 1
   }
   $script:SwitchDone = $false

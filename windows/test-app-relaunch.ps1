@@ -70,6 +70,7 @@ Invoke-SwitchRelaunch B
   $out = & pwsh -NoProfile -Command $child 2>&1 | Out-String
   Check 'stuck app: --relaunch aborts with exit 1' ($LASTEXITCODE -eq 1 -and $out -match 'ABORTED') "rc=$LASTEXITCODE out=$out"
   Check 'stuck app: no switch, no kill, no launch' ($out -cnotmatch 'SWITCHED|KILLED|LAUNCHED') $out
+  Check 'stuck app: the abort says to quit it from the tray and retry' ($out -match 'system tray' -and $out -match 'tray icon') $out
 
   # an app that closes: returns $true
   $script:closed = @()

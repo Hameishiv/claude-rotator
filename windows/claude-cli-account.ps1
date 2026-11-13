@@ -272,6 +272,28 @@ function Resolve-ProbeCatalogModel {
   return $current[0].id
 }
 
+# The installed CLI's version, read ONCE per script run (cached in $script:CliVersion) with a hard timeout: it used to be spawned on every probe with none, so a
+# hung `claude` froze every probe. Only the process started here is ever killed, and only by its pid. The fallback is for when `claude` is not runnable.
+function Get-CliVersion {
+  if ($script:CliVersion) { return $script:CliVersion }
+  $v = ''
+  $exe = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($exe) {
+    $p = $null
+    try {
+      $psi = [System.Diagnostics.ProcessStartInfo]::new($exe.Source, '--version')
+      $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      $p = [System.Diagnostics.Process]::Start($psi)
+      $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()      # both drained, so a chatty stderr cannot fill its pipe and stall the wait
+      if ($p.WaitForExit(15000)) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
+      else { try { $p.Kill() } catch {} }                 # our own child, by handle: never by name
+    } catch { $v = '' } finally { if ($p) { $p.Dispose() } }
+  }
+  if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = '2.1.322' }
+  $script:CliVersion = $v
+  return $v
+}
+
 function Probe-Usage {
   param([string]$Label, [string]$Model = 'haiku')
   # Regression tests inject a fixture. Production never sets the variable, so this is not a backdoor.
@@ -283,8 +305,7 @@ function Probe-Usage {
   $tok = (Get-Content $tf -Raw).Trim()
   if (-not $tok) { return (New-ProbeUnknownResult $Label 'empty token') }
   # The fable gate rejects UAs older than its minimum, so track the installed CLI; the fallback is only for when `claude` is not runnable.
-  $cliVer = try { ((& claude --version 2>$null | Out-String) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() } catch { '' }
-  if ($cliVer -notmatch '^\d+\.\d+\.\d+$') { $cliVer = '2.1.322' }
+  $cliVer = Get-CliVersion
   $hdr  = @{ Authorization = "Bearer $tok"; 'anthropic-version' = '2023-06-01'
              'anthropic-beta' = 'oauth-2025-04-20,claude-code-20250219'
              'User-Agent' = "claude-cli/$cliVer (external, cli)" }
@@ -424,14 +445,16 @@ function Prefetch-Usage {
     foreach ($l in $Labels) { foreach ($mm in $models) { $null = Get-UsageCached $l $Refresh $mm.m $mm.s $false $HonorAccessCooldown } }
     return
   }
-  $fnText = ('Profile-TokenFile','ConvertTo-SanitizedNote','Test-SubscriptionDisabled','Get-AccessCode','Get-ErrorMessage','Get-AccessMarkerPath','Read-AccessDisabled','Write-AccessDisabled','Clear-AccessDisabled','New-AccessDisabledResult','New-ProbeUnknownResult','Resolve-ProbeCatalogModel','Probe-Usage','Get-UsageCached' |
+  $fnText = ('Profile-TokenFile','ConvertTo-SanitizedNote','Test-SubscriptionDisabled','Get-AccessCode','Get-ErrorMessage','Get-AccessMarkerPath','Read-AccessDisabled','Write-AccessDisabled','Clear-AccessDisabled','New-AccessDisabledResult','New-ProbeUnknownResult','Resolve-ProbeCatalogModel','Get-CliVersion','Probe-Usage','Get-UsageCached' |
     ForEach-Object { "function $_ {" + (Get-Command $_ -CommandType Function).Definition + "}" }) -join "`n"
   $work = @(foreach ($l in $Labels) { foreach ($mm in $models) { @{ l=$l; m=$mm.m; s=$mm.s } } })
+  $cliVer = Get-CliVersion      # once, here: each clean runspace below would otherwise start its own `claude --version`
   $memo = $work | ForEach-Object -ThrottleLimit 12 -Parallel {
     # Re-create what the probe needs inside the runspace: -Parallel starts a clean session,
     # so script-scope functions and variables are NOT inherited.
     $Root = $using:Root; $UsageTTL = $using:UsageTTL; $FableTTL = $using:FableTTL; $AccessCooldownSec = $using:AccessCooldownSec
     $script:UnknownProbeMemo = @{}
+    $script:CliVersion = $using:cliVer
     . ([scriptblock]::Create($using:fnText))
     $null = Get-UsageCached $_.l $using:Refresh $_.m $_.s $false $using:HonorAccessCooldown
     # A failed probe is memoized in this runspace only: hand it back, so the ranking below does not probe it again.
@@ -940,7 +963,13 @@ function Invoke-CheckRotateCore {
     if (-not $trigger -and [int64]$st.fableTs -gt 0 -and $dist -le $FableArmAt) {
       if ($now -ge [int64]$st.nextFable) {
         $fu = Get-UsageCached $act $true 'fable' '-fable'
-        if ($fu.ok -and $null -ne $fu.oi7_util) {
+        # An explicit 403 on the Fable probe is the same subscription refusal as on the Haiku one (Get-UsageCached has already written the
+        # disabled marker): rotate now through the same access trigger. Falling through left $trigger unset, so the seat was declared 'ready'
+        # until the NEXT tick read the marker.
+        if (-not $fu.ok -and $fu.access -eq 'disabled') {
+          $trigger = "subscription access disabled (403 $($fu.code))"
+          $capped = 'access'
+        } elseif ($fu.ok -and $null -ne $fu.oi7_util) {
           $st.fableBase = [int][math]::Round([double]$fu.oi7_util * 100)
           # Record the CACHE's timestamp, not $now. Get-UsageCached stamps the file a second or
           # two later than this function's $now, so storing $now leaves our own write looking
