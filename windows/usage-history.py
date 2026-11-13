@@ -2223,19 +2223,21 @@ class Store:
 
     def import_codex(self, now, cdir=None):
         """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
-        self.append_rollouts(self.read_rollouts(now, cdir, mark=False))
-        self.mark_import(now)
+        new = self.read_rollouts(now, cdir, mark=False)
+        if new is not None:                 # a failed import leaves the watermark, so those logs are read again
+            self.append_rollouts(new)
+            self.mark_import(now)
 
     def read_rollouts(self, now, cdir=None, rec=None, mark=True):
         """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it.
         With mark=False the watermark is left for the caller to move (mark_import) once the points and the sample are saved: a save that fails
-        then re-reads the same logs next tick instead of skipping them."""
+        then re-reads the same logs next tick instead of skipping them. -> None when the import itself failed (the watermark is not moved)."""
         since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
             new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
             applog("codex import error: %s: %s" % (type(e).__name__, e))
-            return []
+            return None
         if mark:
             self.mark_import(now)
         return new
@@ -2346,9 +2348,11 @@ class Store:
             now = time.time()
             rec = sample(now, force)
             new = self.read_rollouts(now, mark=False)       # first, and every point of them, so the sample is merged with all the logs saw
-            self.hist = save(self.hist, newest_codex(rec, self.hist, new), now)
-            self.append_rollouts([r for r in new if r["t"] // BUCKET5 != rec["t"] // BUCKET5])     # the sample now holds its own bucket (carry records are dropped there)
-            self.mark_import(now)                           # only now: a save above that raised leaves the logs to be read again
+            self.hist = save(self.hist, newest_codex(rec, self.hist, new or []), now)
+            held = {h["t"] // BUCKET5 for h in self.hist if "codex" in h}     # as on disk after save: the sample's bucket, and any point a failed earlier append or a --backfill wrote
+            self.append_rollouts([r for r in new or [] if r["t"] // BUCKET5 not in held])     # (carry records are dropped there)
+            if new is not None:
+                self.mark_import(now)                       # only now, and only after a good import: otherwise the logs are read again
             return self.rebuild(now)
 
     def codex_reset(self, seat, script, popen=subprocess.Popen):
@@ -3294,6 +3298,32 @@ def selftest():
             finally:
                 globals()["sample"], globals()["save"], time.time = keep_s, keep_save, real_time
             assert load_pcache()["codex_import"] == wm_, "the watermark moved past a sample that was not saved"
+            keep_ir = import_rollouts
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": dict(stale_)}}
+                globals()["import_rollouts"] = lambda *a, **k: (_ for _ in ()).throw(OverflowError("cannot convert float infinity to integer"))
+                time.time = lambda: K_ + 3 * BUCKET5
+                st.take()
+            finally:
+                globals()["sample"], globals()["import_rollouts"], time.time = keep_s, keep_ir, real_time
+            assert st.hist[-1]["t"] == K_ + 3 * BUCKET5 and load_pcache()["codex_import"] == wm_, "a failed import moved the watermark"
+            # a point already on disk (a failed earlier append, a --backfill) is not appended twice
+            n_ = len(st.hist)
+            dup_ = {"t": K_ + 3 * BUCKET5 + 40, "codex": {"A": {"ts": K_ + 3 * BUCKET5 + 40, "w": 0.66}}}
+            with open(HIST, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(dup_) + chr(10))
+            keep_rr2 = st.read_rollouts
+            try:
+                globals()["sample"] = lambda now, force=False: {"t": int(now), "codex": {"A": dict(stale_)}}
+                st.read_rollouts = lambda now, cdir=None, rec=None, **kw: [dict(dup_)]
+                time.time = lambda: K_ + 4 * BUCKET5
+                st.take()
+            finally:
+                globals()["sample"], time.time = keep_s, real_time
+                st.read_rollouts = keep_rr2
+            with open(HIST, encoding="utf-8") as fh:
+                ts_ = [json.loads(l)["t"] for l in fh if l.strip()]
+            assert ts_.count(dup_["t"]) == 1, ts_[-4:]
         finally:
             HIST, PCACHE = keep
         # an active-login event inside SLOP of two seats' resets is skipped, of one seat's is that seat's
@@ -4458,7 +4488,8 @@ def selftest():
             except PcacheError:
                 pass
             assert open(PCACHE, "rb").read() == bad_
-            assert isinstance(st.read_rollouts(JN, rd_), list) and open(PCACHE, "rb").read() == bad_      # the sampler's import logs it and carries on
+            rr_ = st.read_rollouts(JN, rd_)
+            assert (rr_ is None or isinstance(rr_, list)) and open(PCACHE, "rb").read() == bad_      # the sampler's import logs it and carries on (None: it failed, the watermark stays)
             copies_ = glob.glob(PCACHE + ".bad-*")
             assert len(copies_) == 1 and open(copies_[0], "rb").read() == bad_, copies_            # the same bad file is copied once
             os.remove(copies_[0])
