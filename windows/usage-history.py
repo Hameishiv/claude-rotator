@@ -1067,10 +1067,11 @@ def build_provider(hist, pid, emails, now, extra):
         if acts:                            # the switch buttons: roles whose rotator can use this seat, minus the one it already holds
             a["switch"] = acts
         rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
-        pend = {k for k, _ in rk if "%s:%s" % (label, k) in (extra.get("claims") or ())}
+        claims = extra.get("claims") or {}
+        pend = {k: claims.get("%s:%s" % (label, k)) for k, _ in rk if "%s:%s" % (label, k) in claims}
         if any(gs for _, gs in rk) or pend:  # what the Apply buttons and their dialog need: no grant ids, the server picks the grant again on the click
             # a kind with an unsettled claim stays offered (as a resend of that claim) even when no credit of it is listed any more
-            a["resets"] = [dict({"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} if gs else {"kind": k}, **({"pending": True} if k in pend else {}))
+            a["resets"] = [dict({"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} if gs else {"kind": k}, **({"pending": True, "rid": pend[k]} if k in pend else {}))
                            for k, gs in rk if gs or k in pend]
         accounts.append(a)
     if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
@@ -1202,8 +1203,9 @@ def load_emails():
 # ---------------------------------------------------------------- storage and rendering
 
 def pending_claims(c):
-    """The provider cache's unsettled Claude claims as "seat:kind" keys (a claim under the older per-grant key is left out: it is re-keyed on its next click)."""
-    return sorted(k for k, v in (c.get("credits_claims") or {}).items() if isinstance(v, dict) and v.get("gid") and k.split(":", 1)[-1] in RESET_KINDS)
+    """The provider cache's unsettled Claude claims as {"seat:kind": request id} (a claim under the older per-grant key is left out: it is re-keyed
+    on its next click). The request id goes to the page so a resend names the claim it means; grant ids never do."""
+    return {k: v.get("id") for k, v in (c.get("credits_claims") or {}).items() if isinstance(v, dict) and v.get("gid") and k.split(":", 1)[-1] in RESET_KINDS}
 
 
 def load_extra():
@@ -2201,16 +2203,19 @@ class Store:
         with self.lock:
             self.rebuild(time.time())
 
-    def claude_reset(self, seat, kind, fetch=None, new_id=None):
+    def claude_reset(self, seat, kind, fetch=None, new_id=None, resend_rid=None):
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
         the last reading, never taken from the page. The claim (grant id + request id) is saved per seat and kind before the call and kept while the outcome
         is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
-        claim that landed), so a retry can never spend a second grant. Returns {"outcome", "text"}."""
+        claim that landed), so a retry can never spend a second grant. `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
+        settled meanwhile (by another window), it is refused, never a new claim. Returns {"outcome", "text"}."""
         now = time.time()
         with self.lock, pcache_txn() as cache:
             key = seat + ":" + kind
             claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict)}     # kept, whatever their age, until a resend settles them
             resend = bool((claims.get(key) or {}).get("gid"))     # an earlier, unconfirmed claim is sent again
+            if resend_rid is not None and not (resend and claims[key].get("id") == resend_rid):
+                return {"outcome": "error", "text": "That pending reset was already settled; reload to see the result."}
             if not resend:                                      # nothing pending for this seat and kind: a grant from the last reading
                 gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
                 if not gs:
@@ -2381,17 +2386,17 @@ def make_handler(store, port):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else {}
-                seat, kind = b.get("seat"), b.get("kind")
+                seat, kind, rid = b.get("seat"), b.get("kind"), b.get("requestId") if b.get("resend") is True else None
             except (ValueError, AttributeError):
-                seat = kind = None
+                seat = kind = rid = None
             if not credits_enabled():
                 return self.js(404, {"outcome": "error", "text": "Claude resets are switched off on this PC (claudeResetCredits in rotator.local.json)."})
-            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS:
+            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS or (b.get("resend") is True and not isinstance(rid, str)):
                 return self.js(400, {"outcome": "error", "text": "Unknown Claude seat or reset kind."})
             if not store.refreshing.acquire(blocking=False):
                 return self.js(409, {"outcome": "error", "text": "A refresh or another reset is running; try again in a minute."})
             try:
-                self.js(200, store.claude_reset(seat, kind))
+                self.js(200, store.claude_reset(seat, kind, resend_rid=rid) if rid is not None else store.claude_reset(seat, kind))
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
@@ -3514,10 +3519,10 @@ def selftest():
     assert "resets" not in kp["accounts"][1] and kp["accounts"][1]["banked"] == 7                       # counted, but no Apply without the next grant
     assert "g1" not in json.dumps(kp)                                                                   # no grant id reaches the page
     # a kind with an unsettled claim is offered as a resend even when its credit is no longer listed
-    assert pending_claims({"credits_claims": {"A:full": {"id": "r", "gid": "g2"}, "A:g9": {"id": "o"}, "B:fable": {"id": "x"}, "C:weekly": "junk"}}) == ["A:full"]
-    kq = build(kh, KN + 10, {}, False, dict(kx, claims=["A:full", "B:session"]))["providers"][0]
-    assert kq["accounts"][0]["resets"][1] == {"kind": "full", "left": 2, "endsAt": KN + 5 * DAY, "pending": True}, kq["accounts"][0]["resets"]
-    assert kq["accounts"][1]["resets"] == [{"kind": "session", "pending": True}] and "pending" not in kq["accounts"][0]["resets"][0]
+    assert pending_claims({"credits_claims": {"A:full": {"id": "r", "gid": "g2"}, "A:g9": {"id": "o"}, "B:fable": {"id": "x"}, "C:weekly": "junk"}}) == {"A:full": "r"}
+    kq = build(kh, KN + 10, {}, False, dict(kx, claims={"A:full": "rA", "B:session": "rB"}))["providers"][0]
+    assert kq["accounts"][0]["resets"][1] == {"kind": "full", "left": 2, "endsAt": KN + 5 * DAY, "pending": True, "rid": "rA"}, kq["accounts"][0]["resets"]
+    assert kq["accounts"][1]["resets"] == [{"kind": "session", "pending": True, "rid": "rB"}] and "pending" not in kq["accounts"][0]["resets"][0]
     kp = build(kh, KN + 10, {}, False, dict(kx, claudeReset=False))["providers"][0]
     assert "canReset" not in kp and "resets" not in kp["accounts"][0] and kp["accounts"][0]["banked"] == 7                # switched off: the count stays, the buttons go
     keep = {k: globals()[k] for k in ("ROOT", "PCACHE", "APPLOG", "STATE", "credits_enabled")}
@@ -3598,6 +3603,14 @@ def selftest():
         post.append((200, {"result": "already_used"}))
         ks.claude_reset("A", "full", kf, nid)
         assert load_pcache()["credits_claims"] == {} and "(refused; the earlier claim is kept)" in open(APPLOG).read()
+        # the page's resend names its claim: settled meanwhile (another window), or another claim now, it is refused, never a new claim
+        n_ = len(kc)
+        save_pcache({"credits": {"A": dict(ke)}})
+        assert ks.claude_reset("A", "full", kf, nid, resend_rid="ridGone") == {"outcome": "error", "text": "That pending reset was already settled; reload to see the result."}
+        save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:full": {"id": "ridNow", "gid": "g2", "at": 1}}})
+        assert "already settled" in ks.claude_reset("A", "full", kf, nid, resend_rid="ridGone")["text"] and len(kc) == n_ and load_pcache()["credits_claims"]["A:full"]["id"] == "ridNow"
+        post.append((200, {"result": "already_used"}))
+        assert ks.claude_reset("A", "full", kf, nid, resend_rid="ridNow")["outcome"] == "alreadyRedeemed" and b'"request_id": "ridNow"' in kc[-2][2]
         # every other outcome
         for ans, oc, text, kept in [((200, {"result": "not_limited"}), "nothingToReset", "Seat A had nothing to reset right now.", False),
                                     ((200, {"result": "ineligible"}), "noCredit", "Claude says seat A has no 5-hour reset to apply.", False),

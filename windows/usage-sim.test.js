@@ -256,6 +256,18 @@ assert.strictEqual(quotaShare(600, 600), 100);
   openReset('claude', 'A', 'full');
   assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Resend the pending full reset to seat A?') && dlg.innerHTML.includes('>Resend full reset</button>')
     && dlg.innerHTML.includes('cannot use a second reset') && !dlg.innerHTML.includes("can't be undone"), dlg.innerHTML);
+  // confirming a resend names its claim (resend + request id), so a claim settled meanwhile is refused rather than replaced by a new one
+  const doSrc = tpl.slice(tpl.indexOf('async function doReset() {'), tpl.indexOf('\n// The rotator actions'));
+  D.providers[0].accounts[0].resets = [{ kind: 'full', pending: true, rid: 'r-1' }, { kind: 'fable', left: 1, endsAt: null }];
+  const sent = [], dlg2 = Object.assign(dlg, { close() {}, querySelector: () => ({}), querySelectorAll: () => [] });
+  const pair = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', 'fetch', 'toast', 'loadData',
+    dlgSrc + '\n' + doSrc + '\nreturn { openReset, doReset };')(D, () => dlg2, s => String(s), { emails: false }, String, String, QUOTA_RESET_KINDS,
+    async (u, o) => { sent.push([u, JSON.parse(o.body)]); return { status: 200, json: async () => ({ outcome: 'ok', text: 'x' }) }; }, () => {}, () => {});
+  (async () => {
+    pair.openReset('claude', 'A', 'full'); await pair.doReset();
+    pair.openReset('claude', 'A', 'fable'); await pair.doReset();
+    assert.deepStrictEqual(sent, [['/api/claude-reset', { seat: 'A', kind: 'full', resend: true, requestId: 'r-1' }], ['/api/claude-reset', { seat: 'A', kind: 'fable' }]]);
+  })().catch(e => { console.error(e); process.exit(1); });
 }
 // the update notice speaks to an end user: what is out of date and the one command that fixes it; no --push
 {

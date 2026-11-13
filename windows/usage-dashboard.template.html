@@ -399,7 +399,7 @@ function openReset(pid, label, kind) {
   const rw = k ? win(k.win) || w : w;      // the window this reset refills (Fable falls back to the weekly when the seat has no Fable reading)
   const soon = rw && rw.id !== 's' && rw.reset && rw.reset - D.now <= 86400;
   const exp = t => esc(fmtDT(t)) + ' (in ' + quotaIn(t - D.now) + ')', cr = (a.bankedList || [])[0];
-  rs = { pid, label, kind, busy: false };
+  rs = { pid, label, kind, rid: resend ? r.rid : undefined, busy: false };
   const d = $('rsdlg');
   d.innerHTML = `<h2 id="rsT">${resend ? 'Resend the pending ' + esc(k.noun) + ' to' : 'Apply a ' + (k ? esc(k.noun) : 'banked reset') + ' to'} seat ${esc(label)}?</h2><dl>` +
     `<dt>Seat</dt><dd>${esc(label)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd>` +
@@ -449,7 +449,7 @@ async function doReset() {
   try {
     const cl = rs.pid === 'claude';      // Claude sends the kind only: the server picks the grant
     const r = await fetch(rs.clear ? '/api/codex-reset-clear' : cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
-      body: JSON.stringify(cl ? { seat: rs.label, kind: rs.kind } : { seat: rs.label }) });
+      body: JSON.stringify(cl ? Object.assign({ seat: rs.label, kind: rs.kind }, rs.rid ? { resend: true, requestId: rs.rid } : {}) : { seat: rs.label }) });     // a resend names its claim
     const j = await r.json().catch(() => ({}));
     text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
   } catch (e) {}
