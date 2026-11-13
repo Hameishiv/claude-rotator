@@ -154,10 +154,12 @@ PROVIDER_NOTE = {"grok": "Cursor's Grok usage counts against this same xAI quota
 
 
 def _f(x):
+    """x as a finite float, else None: a NaN or infinity read from a log or cache is treated as missing, never stored or converted with int()."""
     try:
-        return float(x)
-    except (TypeError, ValueError):
+        v = float(x)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return v if math.isfinite(v) else None
 
 
 def say(*a):
@@ -1731,7 +1733,7 @@ def rollout_tokens(path):
                     p = j["payload"]
                     rl = p["rate_limits"] if p["type"] == "token_count" else None
                     t = _fromiso(j["timestamp"]).timestamp()
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, RecursionError):
                     continue
                 if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
                     continue
@@ -2227,14 +2229,15 @@ class Store:
     def import_codex(self, now, cdir=None):
         """Recorded points from the rollout logs modified since the last import (the mtime watermark lives in the provider cache)."""
         new = self.read_rollouts(now, cdir, mark=False)
-        if new is not None:                 # a failed import leaves the watermark, so those logs are read again
+        if new is not None:                 # a failed import leaves the watermark (read again next time, up to IMPORT_RETRIES in a row)
             self.append_rollouts(new)
             self.mark_import(now)
 
     def read_rollouts(self, now, cdir=None, rec=None, mark=True):
         """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it.
         With mark=False the watermark is left for the caller to move (mark_import) once the points and the sample are saved: a save that fails
-        then re-reads the same logs next tick instead of skipping them. -> None when the import itself failed (the watermark is not moved)."""
+        then re-reads the same logs next tick instead of skipping them. -> None when the import itself failed (the watermark is not moved), unless it
+        has failed IMPORT_RETRIES times in a row: then -> [] and the watermark moves past those logs, so one that always fails cannot pin it."""
         since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
         try:
             new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
@@ -2244,6 +2247,8 @@ class Store:
             if self._import_fails < IMPORT_RETRIES:
                 return None      # retried next tick from the same watermark
             self._import_fails = 0
+            if mark:
+                self.mark_import(now)
             return []            # still failing: give up on these logs, so one that always fails cannot pin the watermark for good
         self._import_fails = 0
         if mark:
@@ -3321,12 +3326,26 @@ def selftest():
             finally:
                 globals()["import_rollouts"] = keep_ir
             assert got_[:-1] == [None] * (IMPORT_RETRIES - 2) and got_[-1] == [] and st._import_fails == 0, got_
+            try:                                                    # a good import in between starts the count again
+                globals()["import_rollouts"] = lambda *a, **k: (_ for _ in ()).throw(OverflowError("x"))
+                st.read_rollouts(K_ + 3 * BUCKET5, mark=False)
+                globals()["import_rollouts"] = lambda *a, **k: ([], None)
+                st.read_rollouts(K_ + 3 * BUCKET5, mark=False)
+                globals()["import_rollouts"] = lambda *a, **k: (_ for _ in ()).throw(OverflowError("x"))
+                got_ = [st.read_rollouts(K_ + 3 * BUCKET5, mark=False) for _ in range(IMPORT_RETRIES - 1)]
+            finally:
+                globals()["import_rollouts"] = keep_ir
+            assert got_ == [None] * (IMPORT_RETRIES - 1), got_
+            st._import_fails = 0
             bl_ = os.path.join(tempfile.mkdtemp(), "r.jsonl")       # one non-finite line is skipped; the good line beside it still counts
             ln_ = lambda r: json.dumps({"timestamp": "2026-11-13T10:00:00Z", "payload": {"type": "token_count", "rate_limits": {"primary": {"window_minutes": 300, "used_percent": 40, "resets_at": r}}}})
             with open(bl_, "w", encoding="utf-8") as fh:
-                fh.write(ln_(1e999).replace("Infinity", "1e999") + chr(10) + ln_(float("nan")) + chr(10) + ln_(1800000000) + chr(10))
+                fh.write(ln_(1e999).replace("Infinity", "1e999") + chr(10) + ln_(float("nan")) + chr(10) + ln_(1800000000) + chr(10)
+                         + ln_(1800000000).replace('"used_percent": 40', '"used_percent": NaN') + chr(10)
+                         + ln_(1800000000).replace('"window_minutes": 300', '"window_minutes": NaN') + chr(10))
             ev_ = list(rollout_events(bl_))
             assert len(ev_) == 1 and list(ev_[0][1].values())[0][1] == 1800000000, ev_
+            assert all(r_[2] is None or math.isfinite(r_[2]) for r_ in rollout_tokens(bl_)), rollout_tokens(bl_)   # the token parser reads the same lines
             # a point already on disk (a failed earlier append, a --backfill) is not appended twice
             n_ = len(st.hist)
             dup_ = {"t": K_ + 3 * BUCKET5 + 40, "codex": {"A": {"ts": K_ + 3 * BUCKET5 + 40, "w": 0.66}}}
