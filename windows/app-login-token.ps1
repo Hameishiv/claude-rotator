@@ -31,9 +31,8 @@ param([string]$Seat, [string]$AppDir = (Join-Path $env:APPDATA 'Claude'), [strin
 $ErrorActionPreference = 'Stop'
 (Get-Process -Id $PID).PriorityClass = 'Idle'
 
-function Get-AppKey([string]$Dir, $ls = $null) {
+function Get-AppKey($ls) {           # $ls: Local State, already read and checked by the caller
   Add-Type -AssemblyName System.Security
-  if (-not $ls) { $ls = Get-Content -LiteralPath (Join-Path $Dir 'Local State') -Raw | ConvertFrom-Json }
   $ek = [Convert]::FromBase64String($ls.os_crypt.encrypted_key)
   [Security.Cryptography.ProtectedData]::Unprotect($ek[5..($ek.Length - 1)], $null, 'CurrentUser')     # strip 'DPAPI'
 }
@@ -62,13 +61,14 @@ function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$
     $live = Join-Path $AppDir 'config.json'
     if (Test-Path -LiteralPath $live) {
       $lc = Get-Content -LiteralPath $live -Raw | ConvertFrom-Json -AsHashtable
-      if ($lc['lastKnownAccountUuid'] -eq $owner) { $cfg = $lc }        # the live seat: the app's own, fresher copy
+      if ($lc['lastKnownAccountUuid'] -eq $owner -and $lc['oauth:tokenCacheV2']) { $cfg = $lc }        # the live seat: the app's own, fresher copy (not a signed-out one with no login in it)
     }
     if (-not $cfg['oauth:tokenCacheV2']) { return @{ state = 'none'; why = 'no app login token in it' } }
     $ls = Get-Content -LiteralPath (Join-Path $AppDir 'Local State') -Raw | ConvertFrom-Json
+    if (-not $ls -or -not $ls.os_crypt.encrypted_key) { throw 'Local State has no key yet' }     # empty / truncated: ConvertFrom-Json gives $null without throwing
   } catch { return @{ state = 'busy'; why = 'app login files could not be read just now' } }
   try {
-    $cache = Unprotect-Blob (Get-AppKey $AppDir $ls) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
+    $cache = Unprotect-Blob (Get-AppKey $ls) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
   } catch { return @{ state = 'unreadable'; why = 'app login could not be decrypted' } }
   $now = if ($NowMs) { $NowMs } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
   # entry keys: acct:<account>|<client>:<organization>:https://api.anthropic.com:<scopes>; only this seat's own account counts
@@ -142,10 +142,19 @@ if ($SelfTest) {
     T 'every user:profile entry expired -> expired, no token' ($b.state -eq 'expired' -and -not $b.token)
     $c = Get-AppLogin 'C' $app $seats $now
     T "the live seat reads the app's own, fresher config" ($c.state -eq 'ok' -and $c.token -eq 'tC-live' -and $c.orgUuid -eq 'o9')
+    $liveKeep = Get-Content -LiteralPath (Join-Path $app 'config.json') -Raw
+    Set-Content -LiteralPath (Join-Path $app 'config.json') -Value '{"lastKnownAccountUuid":"u-c"}'
+    T 'a signed-out live config (no login in it) does not hide the seat snapshot' ((Get-AppLogin 'C' $app $seats $now).state -eq 'expired')
+    Set-Content -LiteralPath (Join-Path $app 'config.json') -Value $liveKeep -NoNewline
     T 'no saved login -> none' ((Get-AppLogin 'Z' $app $seats $now).state -eq 'none')
     T 'a path in the seat name is refused' ((Get-AppLogin '..\A' $app $seats $now).state -eq 'none')
     Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b", half-written'
     T 'a config.json that cannot be parsed just now -> busy, not unreadable' ((Get-AppLogin 'B' $app $seats $now).state -eq 'busy')
+    $lsPath = Join-Path $app 'Local State'; $lsKeep = Get-Content -LiteralPath $lsPath -Raw
+    Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b","oauth:tokenCacheV2":"djEwgarbage"}'
+    Set-Content -LiteralPath $lsPath -Value ''
+    T 'an empty Local State (mid-rewrite) -> busy, not unreadable' ((Get-AppLogin 'B' $app $seats $now).state -eq 'busy')
+    Set-Content -LiteralPath $lsPath -Value $lsKeep -NoNewline
     Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b","oauth:tokenCacheV2":"djEwgarbage"}'
     $before = & $hashes
     T 'an undecryptable login -> unreadable, not none' ((Get-AppLogin 'B' $app $seats $now).state -eq 'unreadable')

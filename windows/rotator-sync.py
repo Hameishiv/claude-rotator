@@ -104,6 +104,8 @@ def write_state(state, data):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())                      # a power cut after the replace must not leave an empty journal or state
         os.replace(tmp, state)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -210,6 +212,9 @@ def roll_back_journal(jpath):
     if not os.path.exists(jpath):
         return None                                     # the pull finished meanwhile and took its journal away
     j = load_json(jpath)
+    if not isinstance(j.get("files"), list):         # unreadable: no plan to judge the swaps by, so neither "finished" nor a rollback; --pull stops on it
+        sys.stderr.write("rotator-sync: the update journal %s cannot be read; left in place. Check the live files (or run --pull after deleting it by hand)\n" % jpath)
+        return None
     if update_finished(j):
         drop_journal(jpath)
         return None
@@ -557,6 +562,12 @@ def selftest():
         os.remove(os.path.join(live, "b.py.tmp-sync"))
         check("a pull blocked by another pull changes nothing and leaves no temp", rc_ == 1 and open(os.path.join(live, "b.py"), "rb").read() == b"print(5)\n"
               and not any(n.endswith(".tmp-sync") for n in os.listdir(live)))
+        # an unreadable journal is neither treated as finished nor rolled back: it is left, and a --pull stops on it
+        with open(jp_, "wb") as fh_:
+            fh_.write(b"")
+        check("an unreadable journal is left in place, not deleted as finished", roll_back_journal(jp_) is None and os.path.exists(jp_))
+        check("... and a --pull stops on it", cmd_pull(repo, live, "HEAD", state) == 1 and os.path.exists(jp_))
+        os.remove(jp_)
         # a stale journal is rolled back by a --pull itself, under the lock that pull already holds (the lock is not re-entrant)
         write(os.path.join(live, "stale-added.txt"), b"added by a killed pull\n")
         write_state(jp_, {"files": [[os.path.join(live, "stale-added.txt"), None], [os.path.join(live, "pending.txt"), None]]})   # the second was never swapped

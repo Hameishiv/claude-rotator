@@ -745,9 +745,9 @@ def app_login(label, run=run_bounded):
     the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), ("pending", None) when the login is this
     account's but the seat's organization is not recorded yet (it cannot be tied to the seat, so it is not used, and the setup-token must not be tried
     instead: it can only be refused for its scope), ("org", None) when it is this account's but has no entry for the seat's organization (the same:
-    never used, never the setup-token, but not retried soon, since the probe cannot change it), ("unreadable", None) when the helper says a login is saved but it could not be read or
+    never used, never the setup-token, but not retried soon, since the probe cannot change it), ("unreadable", None) when the helper says a login is saved and was read but could not be
     decrypted (it will not be, until the app signs in again: the seat gets a note saying so), ("fail", None) when the login belongs to the seat (owner and organization
-    are known) but the helper could not tell (timed out, could not run, answered something unreadable): not a reason to try the setup-token, nor
+    are known) but the helper could not tell (timed out, could not run, answered "busy" or something unreadable): not a reason to try the setup-token, nor
     to hold the seat, just an ordinary failed read, or (None, None) when there is none or anything does not match. The setup-token in token.txt cannot read reset
     credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
     prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored.
@@ -792,7 +792,7 @@ def app_login(label, run=run_bounded):
 
 def seat_token(label, login=app_login):
     """(token for the credit calls or None, why not): the app login when it is usable, else token.txt; an expired app login says so, and so does one whose
-    seat organization is not known yet ("pending"), has no entry for it ("org"), could not be read ("unreadable") or could not be read just now ("fail"): no fallback to token.txt for those, which cannot read
+    seat organization is not known yet ("pending"), has no entry for it ("org"), was read but could not be decrypted ("unreadable") or could not be read just now ("fail"): no fallback to token.txt for those, which cannot read
     credits and would only earn a week-long scope hold."""
     st, tok = login(label)
     if st == "ok":
@@ -2261,7 +2261,7 @@ class Store:
         call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read; "pending" (an app login whose organization is
         not known yet) sets no hold but a short `next` (CREDITS_PENDING_RETRY, for the first CREDITS_PENDING_TRIES - 1 reads in a row, then the ordinary interval) and a note;
         the run is counted in the entry's `pend`, which any other result clears. credits_tick reads a seat with that note early (forced, whatever is left of `next`) once its
-        organization is recorded. "org" (an app login with no entry for the seat's organization) sets only its note, "unreadable" (a saved app login the helper could not read) sets only its own note, which a later "fail" leaves and an ok read clears, and "fail" (a failed call, or a helper
+        organization is recorded. "org" (an app login with no entry for the seat's organization) sets only its note, "unreadable" (a saved app login the helper read but could not decrypt) sets only its own note, which a later "fail" leaves and an ok read clears, and "fail" (a failed call, or a helper
         that gave no answer) sets nothing and clears a pending or org note: none of them holds the seat, and all are asked again at the ordinary interval. Returns the read's state, "stale"
         when a later read owns the entry, or None when it was skipped."""
         with self.lock, pcache_txn() as cache:
@@ -4027,7 +4027,7 @@ def selftest():
         assert st.credits_read("E", t4_, fx, force=True, login=fail_) == "fail" and len(calls) == n_
         ee_ = load_pcache()["credits"]["E"]
         assert "hold" not in ee_ and "pend" not in ee_ and "note" not in ee_ and ee_["next"] == t4_ + CREDITS_EVERY, ee_
-        # an app login the helper reported as saved but unreadable: its own note (not silent), nothing sent, no hold, no setup-token fallback; a later transient "fail" keeps the
+        # an app login the helper reported as read but not decryptable: its own note (not silent), nothing sent, no hold, no setup-token fallback; a later transient "fail" keeps the
         # note, an ok read clears it; a claim is refused naming it
         unr_ = lambda l: ("unreadable", None)
         assert seat_token("E", unr_) == (None, "unreadable") and read_credits("E", JN, lambda req: 1 / 0, None, unr_) == ("unreadable", None)
