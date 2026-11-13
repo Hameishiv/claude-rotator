@@ -25,7 +25,7 @@ function quotaProject(seats, ratePerHour, now, horizonSec = 14 * 86400, stepSec 
   return { pts, empty };
 }
 // A seat's name for a table or list: always its letter, the email under it (muted, smaller) when emails are shown. `esc` escapes HTML.
-// Its weight badge (a neutral "×5", only when the weight is not 1) and in-use badges (CLI / App, coloured pills) sit right after the letter.
+// Its weight badge (a neutral "×5", only when the weight is not 1) and in-use badges (CLI / App, coloured pills) sit right after the letter; under it the email, the plan and the measured ratio.
 const QUOTA_BADGE = { CLI: ['cli', 'Claude Code CLI'], App: ['app', 'Desktop app'] };
 const quotaBadge = (b, seat, esc) => {
   const [cls, who] = QUOTA_BADGE[b] || ['', b], tip = who + (seat ? ' is on seat ' + seat : ' is on this seat');
@@ -37,8 +37,19 @@ function quotaWeight(a, esc) {
   const tip = (a.w === 0 ? 'Left out of the pooled numbers' : 'Counts as ' + quotaNum(a.w) + ' regular seats') + (a.wsrc ? ' (from ' + a.wsrc + ')' : '');
   return '<span class="bdg wt" role="img" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">×' + esc(quotaNum(a.w)) + '</span>';
 }
+// Codex only: the measured capacity ratio (tokens per 1 % of weekly use against the weight-1 seats) as a muted line; amber when it is more than 30 % away from the weight.
+function quotaMeasure(a, esc) {
+  const r = a.ratio;
+  if (!r) return '';
+  if (r.x == null) return '<small class="ms" title="' + esc('Needs 5 token measurements from the last 21 days; ' + r.n + ' so far') + '">measured: not enough data</small>';
+  const w = a.w == null ? 1 : a.w, off = w > 0 && Math.max(r.x / w, w / r.x) > 1.3;
+  const tip = 'Tokens per 1 % of weekly use over the last 21 days (input minus cached plus output), relative to the regular seats' +
+    (off ? '. It differs from the configured weight (×' + quotaNum(w) + ') by more than 30 %: check the weight.' : '');
+  return '<small class="ms' + (off ? ' warn' : '') + '" title="' + esc(tip) + '">measured ≈ ×' + String(+r.x.toFixed(1)) + ' (' + r.n + ' samples)</small>';
+}
 function quotaSeat(a, emails, esc) {
-  return esc(a.label) + quotaWeight(a, esc) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '');
+  return esc(a.label) + quotaWeight(a, esc) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '') +
+    (a.plan ? '<small>Plan: ' + esc(a.plan.replace(/_/g, ' ')) + '</small>' : '') + quotaMeasure(a, esc);
 }
 // A provider header's badges with their seat letter ("CLI D", "App B") as HTML, or '' when no seat is known to be in use.
 function quotaInUse(p, esc) {
@@ -72,4 +83,4 @@ function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };

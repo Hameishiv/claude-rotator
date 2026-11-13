@@ -750,6 +750,11 @@ def build_provider(hist, pid, emails, now, extra):
             live = [x for x in bs.get("bankedList") or [] if x["expiresAt"] > now]
             a["banked"], a["bankedList"] = max(bs["banked"] - (len(bs.get("bankedList") or []) - len(live)), len(live)), live
         accounts.append(a)
+    if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
+        meas = measured_ratios((extra.get("codex") or {}).get("pairs") or {}, now)
+        for a in accounts:
+            x, n = meas.get(a["label"], (None, 0))
+            a["ratio"] = dict({"n": n}, **({"x": round(x, 2)} if x is not None else {}))
     dflt = {w: p for w, _, p in wins}
     limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
     out = {"id": pid, "name": name, "total": len(accounts), "loaded": sum(a["ok"] for a in accounts),
@@ -862,14 +867,15 @@ def load_emails():
 
 def load_extra():
     """What build() takes besides history and emails: account/provider notes from the provider cache, the rotator drift file."""
-    c, drift, plans = load_pcache(), None, codex_measure()[0]
+    c, drift = load_pcache(), None
+    plans, pairs = codex_measure()
     try:
         with open(os.path.join(ROOT, ".rotator-drift.json"), encoding="utf-8-sig") as fh:
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
     return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
-            "weights": dict(read_weights_cfg(), plans={"codex": plans})}
+            "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
 
 
 def load():
@@ -1099,6 +1105,16 @@ def token_pairs(events):
                 out.append((t, (tok - a[2]) / (used - a[1])))
             a = (t, used, tok, reset)
     return out
+
+
+def measured_ratios(pairs, now, days=21, minn=5):
+    """{seat: (ratio or None, samples)} from codex_measure's pairs: a seat's median tokens per 1 % over the last `days` days (at least `minn` pairs, else no ratio),
+    divided by the median of that figure over the weight-1 seats that have one. A sanity check on the configured weights, not an input to them."""
+    recent = {s: [v for t, v in p if t >= now - days * DAY] for s, p in pairs.items()}
+    med = {s: statistics.median(v) for s, v in recent.items() if len(v) >= minn}
+    ref = [m for s, m in med.items() if wt("codex", s)[0] == 1]
+    base = statistics.median(ref) if ref else None
+    return {s: (med[s] / base if s in med and base else None, len(v)) for s, v in recent.items()}
 
 
 def codex_measure(cdir=None, now=None):
@@ -2118,6 +2134,42 @@ def selftest():
     assert lm["cap"] == 600 and lm["now"] == 500.0 and [s.get("w") for s in lm["seats"]] == [None, 5.0] and lm["hist"][0][1] == 500.0, lm      # Z is out of the pool
     assert [a.get("w") for a in wl["accounts"]] == [None, 5.0, 0.0] and wl["accounts"][1]["wsrc"] == "seatWeights"
     set_weights(None)
+    # H: measured ratio of a Codex seat's capacity: uncached tokens per 1 % of weekly use over the last 21 days, against the weight-1 seats
+    def steps(t0, start, n, per, reset):
+        """An anchor event, then n whole-percent ticks each preceded by a half-way event at the old percent; `per` = (input, cached, output) tokens added per percent."""
+        ev, used, tot = [tk(t0, start, reset, 0, 0, 0)], start, [0, 0, 0]
+        for i in range(n):
+            for half, u in ((1, used), (2, used + 1)):
+                tot = [tot[0] + per[0] / 2, tot[1] + per[1] / 2, tot[2] + per[2] / 2]
+                ev.append(tk(t0 + 1200 * i + 600 * half, u, reset, int(tot[0]), int(tot[1]), int(tot[2])))
+            used += 1
+        return ev
+    with tempfile.TemporaryDirectory() as td:
+        for lab in "ABCD":
+            os.makedirs(os.path.join(td, "homes", lab))
+        # per percent, uncached = input - cached + output: A 1500 - 700 + 200 = 1000 tokens, B 6000 - 2500 + 1500 = 5000, C 1000 but only 3 percents
+        roll(os.path.join(td, "homes", "A", "sessions", "rollout-a.jsonl"), steps(N - 80_000, 10, 8, (1500, 700, 200), WA)
+             + steps(N - 40 * 86400 + 100, 10, 8, (10_000_000, 0, 0), WA - 30 * 86400), N - 100)       # old pairs (a different window, 40 days back) are not counted
+        roll(os.path.join(td, "homes", "B", "sessions", "rollout-b.jsonl"), steps(N - 80_000, 40, 8, (6000, 2500, 1500), WB), N - 100)
+        roll(os.path.join(td, "homes", "C", "sessions", "rollout-c.jsonl"), steps(N - 80_000, 5, 3, (1500, 700, 200), WB + 100_000), N - 100)
+        plans, pairs = codex_measure(td, N)
+        assert len(pairs["A"]) == 8 + 8 and len(pairs["B"]) == 8 and len(pairs["C"]) == 3 and "D" not in pairs, {k: len(v) for k, v in pairs.items()}     # ticks, not adjacent events
+        assert sorted(round(v) for t, v in pairs["B"]) == [5000] * 8 and sorted(round(v) for t, v in pairs["C"]) == [1000] * 3, pairs["B"]
+        set_weights({"seat": {"codex": {"B": 5.0}}})
+        m = measured_ratios(pairs, N)
+        assert m["A"] == (1.0, 8) and m["B"] == (5.0, 8) and m["C"] == (None, 3), m      # 5 pairs needed; A's 40-day-old pairs left out; B over the weight-1 seat A
+        set_weights(None)
+        m = measured_ratios(pairs, N)           # every seat weight 1: the reference is the median of A and B (3000)
+        assert abs(m["B"][0] - 5000 / 3000) < 1e-9 and abs(m["A"][0] - 1000 / 3000) < 1e-9
+        assert measured_ratios({"A": [(N, 1000.0)] * 4}, N) == {"A": (None, 4)} and measured_ratios({}, N) == {}
+        # a token counter that goes back (a new session) and a window change start a fresh anchor; a tick with no tokens in it is skipped
+        e = lambda t, u, r, k: (t, None, u, r, k)
+        assert token_pairs([e(1, 10, 99, 100), e(2, 11, 99, 50), e(3, 12, 99, 250), e(4, 13, 99, 250), e(5, 14, 99 + 5000, 900), e(6, 15, 99 + 5000, 1900)]) == [(3, 200.0), (6, 1000.0)]
+        blob = build([{"t": N, "codex": {s: {"w": .2, "wr": N + 9999, "wp": WEEK, "ts": N} for s in "ABCD"}}], N, {}, False,
+                     {"weights": {"seat": {"codex": {"B": 5.0}}}, "codex": {"pairs": pairs}})["providers"][0]["accounts"]
+        assert [a["ratio"] for a in blob] == [{"n": 8, "x": 1.0}, {"n": 8, "x": 5.0}, {"n": 3}, {"n": 0}], [a["ratio"] for a in blob]
+        assert "ratio" not in build([{"t": N, "s": {"A": {"w": .2, "wr": N + 9999}}}], N, {}, False, {})["providers"][0]["accounts"][0]       # Codex only
+        set_weights(None)
     # the page keeps both placeholders from being re-scanned and escapes </
     assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
     # icons: a valid PNG signature and an ICO header

@@ -709,6 +709,14 @@ Every pooled number is weighted the same way: the headline, chips, history line,
 capacity is used) and `--backtest`. A seat of weight 0 is left out of all of them. The per-seat percents in the table stay per seat, and "left across N seats"
 counts seats, not weights. The **current** weights are applied to the whole recorded history, so changing a weight redraws the past too.
 
+**Measured check (Codex only).** The weight is your statement, so the Codex table also shows a measured one, as a sanity check: from the rollout logs, the
+tokens a seat spends per 1 % of its weekly allowance (input minus cached input plus output, the same for every seat), the median over the last 21 days, divided by
+the same figure for the seats of weight 1. It reads `measured ≈ ×4.6 (12 samples)` under the seat, needs at least 5 samples (`not enough data` otherwise), and turns
+amber when it is more than 30 % away from the configured weight (a ratio of the two, either way). It never feeds the pooled numbers. A sample is the tokens
+between two consecutive whole-percent ticks of one log, so a seat used by several sessions at once reads cheaper per percent than it is, and a seat nobody ran
+in the last 21 days has no samples. A log of the active login is credited to the seat whose known weekly reset matches. Claude, xAI and Gemini show nothing:
+the rotator never sees their tokens.
+
 ## Keeping the install in sync (`rotator-sync`)
 
 The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:

@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaWeight, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaWeight, quotaMeasure, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -81,6 +81,26 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.ok(quotaWeight({ w: 0.5 }, esc).includes('×0.5') && quotaWeight({ w: 0.5 }, esc).includes('Counts as 0.5 regular seats'));
   assert.ok(quotaWeight({ w: 0, wsrc: 'seatWeights' }, esc).includes('Left out of the pooled numbers (from seatWeights)'));
   assert.strictEqual(quotaSeat({ label: 'B', w: 5, wsrc: 'seatWeights', badges: ['App'] }, false, esc), 'B' + quotaWeight({ w: 5, wsrc: 'seatWeights' }, esc) + '<span class="bdg app" role="img" title="Desktop app is on this seat" aria-label="Desktop app is on this seat">App</span>');
+}
+// measured ratio (Codex): nothing without a ratio; "not enough data" without x; amber when it is more than 30 % off the weight (a ratio of the two, either way)
+{
+  const esc = s => String(s).replace(/</g, '&lt;');
+  assert.strictEqual(quotaMeasure({ label: 'A' }, esc), '');
+  assert.strictEqual(quotaMeasure({ label: 'A', ratio: { n: 3 } }, esc), '<small class="ms" title="Needs 5 token measurements from the last 21 days; 3 so far">measured: not enough data</small>');
+  const line = a => quotaMeasure(a, esc);
+  assert.ok(line({ w: 5, ratio: { x: 4.6, n: 12 } }).includes('>measured ≈ ×4.6 (12 samples)</small>'));
+  assert.ok(!line({ w: 5, ratio: { x: 4.6, n: 12 } }).includes('warn'));                   // 5 / 4.6 = 1.09
+  assert.ok(!line({ ratio: { x: 1.29, n: 6 } }).includes('warn'));                          // weight 1: 1.29 is within 30 %
+  assert.ok(line({ ratio: { x: 1.31, n: 6 } }).includes('class="ms warn"'));
+  assert.ok(line({ ratio: { x: 0.76, n: 6 } }).includes('class="ms warn"'));                // 1 / 0.76 = 1.32: below the weight counts too
+  assert.ok(!line({ ratio: { x: 0.78, n: 6 } }).includes('warn'));
+  const off = line({ w: 5, wsrc: 'seatWeights', ratio: { x: 2.9, n: 14 } });
+  assert.ok(off.includes('class="ms warn"') && off.includes('differs from the configured weight (×5) by more than 30 %') && off.includes('×2.9 (14 samples)'));
+  assert.ok(!line({ w: 0, ratio: { x: 3, n: 9 } }).includes('warn'));                       // weight 0: nothing to compare
+  assert.ok(line({ ratio: { x: 1, n: 8 } }).includes('×1 (8 samples)'));
+  // under the seat name: email, then plan (underscores read as spaces), then the measured line
+  assert.strictEqual(quotaSeat({ label: 'B', email: 'b@x.org', plan: 'self_serve_business_prolite', ratio: { n: 0 } }, true, esc),
+    'B<small>b@x.org</small><small>Plan: self serve business prolite</small>' + quotaMeasure({ ratio: { n: 0 } }, esc));
 }
 // seat name: the letter always, the email under it only when shown and known
 {
