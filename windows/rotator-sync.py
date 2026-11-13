@@ -229,19 +229,23 @@ def selftest():
         git(repo, "config", "user.email", "selftest@example.com")
         git(repo, "config", "commit.gpgsign", "false")
         git(repo, "config", "core.autocrlf", "false")  # the real repo is `* -text`; keep the self-test bytes as written
-        files = {"a.ps1": b"one\r\ntwo\r\n", "b.py": b"print(1)\n", "c.ps1": b"x\r\n", "fixtures/f.json": b"{}\n", "missing.txt": b"m\n"}
-        for rel, data in files.items():
-            write(os.path.join(repo, "windows", rel), data)
-        git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", "init")
-        for rel, data in files.items():
-            if rel != "missing.txt":
-                write(os.path.join(live, rel), data)
 
         def check(label, cond):
             print("  %s  %s" % ("ok  " if cond else "FAIL", label))
             if not cond:
                 raise SystemExit(1)
+
+        files = {"a.ps1": b"one\r\ntwo\r\n", "b.py": b"print(1)\n", "c.ps1": b"x\r\n", "fixtures/f.json": b"{}\n", "missing.txt": b"m\n"}
+        for rel, data in files.items():
+            write(os.path.join(repo, "windows", rel), data)
+        write(os.path.join(repo, "stray.txt"), b"not a fixture\n")      # an untracked file the fixture commit must not take
+        git(repo, "add", "--", *["windows/" + rel for rel in files])
+        check("the fixture files, and only they, are staged", git(repo, "diff", "--cached", "--name-only").stdout.decode().split()
+              == sorted("windows/" + rel for rel in files))
+        git(repo, "commit", "-q", "-m", "init")
+        for rel, data in files.items():
+            if rel != "missing.txt":
+                write(os.path.join(live, rel), data)
 
         d, m = compare(repo, live, "HEAD")
         check("identical files are not reported; absent one is missing-live", d == [] and m == ["missing.txt"])
