@@ -13,6 +13,7 @@ Config (rotator.local.json next to this script, all keys optional):
 Python standard library only. Never pushes and never opens a PR.
 """
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
@@ -93,17 +94,63 @@ def maybe_fetch(repo, ref, state, force=False):
     if p.returncode:  # offline etc.: compare against what the clone already has
         sys.stderr.write("rotator-sync: fetch failed, using the clone as it is: %s\n" % p.stderr.decode("utf-8", "replace").strip())
         return
-    st = load_json(state)
-    st["fetched"] = int(time.time())
-    write_state(state, st)
+    update_state(state, lambda st: st.__setitem__("fetched", int(time.time())))
 
 
 def write_state(state, data):
+    """Replace the state file atomically, through a temp file of its own (two writers never share one)."""
     os.makedirs(os.path.dirname(state) or ".", exist_ok=True)
-    tmp = state + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, state)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state) or ".", prefix=os.path.basename(state) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, state)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def state_lock(state, wait=30):
+    """An OS lock on <state>.lock (msvcrt.locking / fcntl.flock), released when its holder exits: the dashboard's --check can overlap a
+    --pull, and neither may write the state from a stale read. Waits up to `wait` s, then TimeoutError."""
+    os.makedirs(os.path.dirname(state) or ".", exist_ok=True)
+    fh = open(state + ".lock", "a+b")
+    try:
+        end = time.time() + wait
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= end:
+                    raise TimeoutError("state lock held over %d s: %s.lock" % (wait, state))
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def update_state(state, change):
+    """One read-modify-write of the state file under state_lock(): `change(st)` edits only its own keys of the file as it is now."""
+    with state_lock(state):
+        st = load_json(state)
+        change(st)
+        write_state(state, st)
 
 
 def resolve(repo, ref):
@@ -115,9 +162,8 @@ def record(repo, live, ref, state, at=None):
     """Compare live with `at` (a resolved commit; default `ref`) and write the drift state, labelled with `ref`."""
     differing, missing = compare(repo, live, at or ref)
     sha = git(repo, "rev-parse", "--short", at or ref).stdout.decode().strip()
-    st = load_json(state)
-    st.update({"checked": int(time.time()), "ref": "%s %s" % (ref, sha), "differing": sorted(differing + missing), "missingLive": missing})
-    write_state(state, st)
+    update_state(state, lambda st: st.update({"checked": int(time.time()), "ref": "%s %s" % (ref, sha), "differing": sorted(differing + missing),
+                                              "missingLive": missing}))
     return differing, missing, sha
 
 
@@ -155,9 +201,7 @@ def cmd_pull(repo, live, ref, state):
     if not (differing or missing):
         print("rotator-sync: nothing to pull, live already matches the ref")
     record(repo, live, ref, state, at)
-    st = load_json(state)
-    st["installed"] = at        # --push exports changes relative to this
-    write_state(state, st)
+    update_state(state, lambda st: st.__setitem__("installed", at))        # --push exports changes relative to this
     return 0
 
 
@@ -368,6 +412,32 @@ def selftest():
         check("a fetch mid-push: the branch is built on the commit it checked", len(moved) == 2
               and git(wt, "rev-parse", "HEAD~1").stdout.decode().strip() == moved[0])
         git(repo, "worktree", "remove", "--" + "force", wt)
+
+        # state updates are locked read-modify-writes through a temp file of their own: a --check overlapping a --pull keeps its `installed`
+        os.mkdir(state + ".tmp")                     # the old shared temp name, taken: a write must not depend on it
+        check("state written past a taken .tmp name", cmd_check(repo, live, "HEAD", state, True) in (0, 1) and load_json(state)["checked"] > 0)
+        import threading
+        held, inst = threading.Event(), load_json(state)["installed"]
+
+        def pull_side():                             # --pull: reads the state under the lock, then writes `installed` a moment later
+            with state_lock(state):
+                st_ = load_json(state)
+                held.set()
+                time.sleep(0.4)
+                st_["installed"] = "f" * 40
+                write_state(state, st_)
+        st0 = load_json(state)
+        st0.update(checked=0, ref="old")
+        write_state(state, st0)
+        th = threading.Thread(target=pull_side)
+        th.start()
+        held.wait(5)
+        record(repo, live, "HEAD", state)            # the dashboard's --check meanwhile
+        th.join()
+        st = load_json(state)
+        check("an overlapping --check neither loses `installed` nor its own result", st["installed"] == "f" * 40 and st["checked"] > 0 and st["ref"].startswith("HEAD "))
+        st["installed"] = inst
+        write_state(state, st)
     finally:
         rmtree(root)
     print("rotator-sync selftest: all passed")
