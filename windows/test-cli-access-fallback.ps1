@@ -214,6 +214,28 @@ $rc = Invoke-CheckRotate 0 $false $true 'test'
 Check 'a Fable access refusal disqualifies A; C is the target' (($rc -eq 0) -and ((Get-ActiveLabel) -eq 'C')) "rc=$rc active=$(Get-ActiveLabel)"
 Check 'A got the access marker' (Test-Path (Join-Path (Join-Path $Root 'A') 'access-disabled.json'))
 
+# --- only a successful Fable probe clears the shared refusal marker: a Haiku success beside a refused Fable probe does not ---
+Reset-Case
+Clear-AppIdentity
+$markerA = Join-Path (Join-Path $Root 'A') 'access-disabled.json'
+Write-AccessDisabled 'A' 403 'oauth_org_not_allowed'
+$null = Get-UsageCached 'A' $true 'haiku' '' $false $false
+Check 'a Haiku success leaves the refusal marker' (Test-Path $markerA)
+$null = Get-UsageCached 'A' $true 'fable' '-fable' $false $false
+Check 'a Fable success clears it' (-not (Test-Path $markerA))
+
+# --- ranking rejects a Fable refusal by itself, even with no marker on disk (so --switch best skips the seat) ---
+Reset-Case
+Clear-AppIdentity
+$script:plan['A'] = 'fable-disabled'
+$script:head['A'] = 0.01
+$origWrite = ${function:Write-AccessDisabled}
+function Write-AccessDisabled { param([string]$Label, [int]$Http = 403, [string]$Code = '') }    # the marker write is lost
+try { $rows = @(Rank-Accounts $true $true) } finally { ${function:Write-AccessDisabled} = $origWrite }
+$rowA = $rows | Where-Object label -eq 'A'
+Check 'ranking: a Fable 403 makes A unusable' ((-not $rowA.usable) -and $rowA.access -eq 'disabled') "usable=$($rowA.usable) access=$($rowA.access)"
+Check 'ranking: the best usable seat is not A' ((@($rows | Where-Object usable)[0]).label -ne 'A')
+
 # --- ensure leaves a cooled-down seat and does not touch a healthy one ---
 Reset-Case
 Clear-AppIdentity

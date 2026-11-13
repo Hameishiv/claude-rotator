@@ -388,7 +388,8 @@ function Get-UsageCached {
   if ($d.access -eq 'disabled') {
     Write-AccessDisabled $Label 403 $(if ($d.code) { [string]$d.code } else { 'oauth_org_not_allowed' })
   } elseif ($d.ok) {
-    Clear-AccessDisabled $Label
+    # Only Fable clears the seat's shared refusal marker: a Haiku probe running beside a refused Fable one must not erase it.
+    if ($Model -like '*fable*') { Clear-AccessDisabled $Label }
     if ($script:UnknownProbeMemo.ContainsKey($memoKey)) { [void]$script:UnknownProbeMemo.Remove($memoKey) }
     try { @{ ts=$now; data=$d } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cf -Encoding UTF8 } catch {}
   } elseif ($HonorAccessCooldown -and $d.access -eq 'unknown') {
@@ -626,13 +627,15 @@ function Rank-Accounts {
     # for another. An UNKNOWN fable reading is deliberately treated as not-capped — excluding on
     # a probe hiccup would wedge rotation entirely, which is the worse failure.
     $fCapped = ($fu.ok -and $fu.oi7_stat -eq 'rejected')
+    $fDenied = ($fu.access -eq 'disabled')     # Fable's explicit access refusal rules the seat out, like Haiku's does above
     $isApp   = ($appSeat -and ($l -ieq $appSeat))
     $why = if ($isApp) { 'claude-account (desktop app) is on this seat' }
+           elseif ($fDenied) { 'Fable access refused (403)' }
            elseif ($capped -and $fCapped) { 'capped + fable capped' }
            elseif ($capped) { 'capped' }
            elseif ($fCapped) { 'fable capped (needed for Gate C)' } else { '' }
     [pscustomobject]@{
-      label = $l; usable = (-not $capped -and -not $fCapped -and -not $isApp); why = $why; access = 'ok'
+      label = $l; usable = (-not $capped -and -not $fCapped -and -not $fDenied -and -not $isApp); why = $why; access = $(if ($fDenied) { 'disabled' } else { 'ok' })
       w7reset = $(if ($u.w7_reset) { [int64]$u.w7_reset } else { [int64]::MaxValue })
       score = [math]::Max($s5, $w7); s5 = $s5; w7 = $w7
       fable = $(if ($fu.ok -and $null -ne $fu.oi7_util) { [double]$fu.oi7_util } else { $null })
