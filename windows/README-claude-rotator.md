@@ -731,7 +731,18 @@ is the weight the seat already has. The suggestion's line and the copied fragmen
 dashboard's sampler (`Store.credits_tick` and `Store.credits_read` in `usage-history.py`, parsed by `parse_cedar`, selftest block J) reads one seat per
 5-minute tick and each seat at most once every **6 hours**; a 429 or a sign-in error holds that seat for 6 hours, any other failure keeps the last good reading.
 This read changes nothing. The token is sent only in that request's header and is never logged or stored. A seat that was read and holds no credits shows an
-empty cell, one never read `–`; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off.
+empty cell, one never read `–`; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
+buttons below included.
+
+**Apply reset (Claude).** In the app, a seat whose last reading has a credit usable now gets one button per kind: `Apply Fable reset`, `Apply full reset`, and
+`Apply weekly reset` / `Apply 5-hour reset` when such credits exist. Each asks first, in a dialog naming the seat, its usage, what that kind refills, which
+credit it uses and when that expires, and warns when the window it refills renews on its own within 24 h. Confirming sends `POST /api/claude-reset`
+`{seat, kind}` to the dashboard (same Host and `X-Quota-App` guards as Refresh, one request at a time across Refresh and both resets). The dashboard picks
+the credit itself from the last reading, soonest expiry first, and never takes a credit id from the page; then it makes Claude Code's claim,
+`POST https://api.anthropic.com/api/organizations/<org>/reset_rate_limits` with `{"program": "cedar_ember", "grant_id": ..., "request_id": ...}` (the
+organization from the seat's `usage-cache.json`), and reads that seat's credits again. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
+keeps its `request_id` in the provider cache, so applying again retries the same claim instead of spending a second reset. Code: `Store.claude_reset`,
+`consume_reset` and `usable_grants` in `usage-history.py` (selftest block K); the kinds' wording is `QUOTA_RESET_KINDS` in `usage-sim.js`.
 
 ## Keeping the install in sync (`rotator-sync`)
 

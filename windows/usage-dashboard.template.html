@@ -266,7 +266,10 @@ const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 108
 // A reset time more than 6 days away would read like the weekday just gone ("Thu" on a Friday): give it its date.
 const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
 const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a.bankedNote || ''].filter(Boolean).join(' · '); return t ? ` title="${esc(t)}"` : ''; };
-const resetBtn = (p, a) => D.app && p.canReset && a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
+// Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
+const resetBtn = (p, a) => !D.app || !p.canReset ? '' : p.id === 'claude'
+  ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">Apply ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>`).join('')
+  : a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
 function accounts(p) {
   const wl = {}, ids = [];
@@ -376,23 +379,30 @@ async function refreshAll() {
   busy = false; render();
 }
 
-let rs = null;   // the reset dialog's seat: {label, busy}
-function openReset(pid, label) {
+let rs = null;   // the reset dialog's seat: {pid, label, kind (Claude only), busy}
+function openReset(pid, label, kind) {
   const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label);
   if (!a || rs) return;
-  const w = a.windows.find(x => x.id === 'w'), s = a.windows.find(x => x.id === 's'), cr = (a.bankedList || [])[0];
+  const win = id => a.windows.find(x => x.id === id), w = win('w'), s = win('s');
   const used = x => x ? Math.round(x.used * 100) + '%' : '–';
-  const soon = w && w.reset && w.reset - D.now <= 86400;
-  rs = { label, busy: false };
+  const k = pid === 'claude' ? QUOTA_RESET_KINDS[kind] : null, r = k && (a.resets || []).find(x => x.kind === kind);
+  if (pid === 'claude' && !r) return;
+  const rw = k ? win(k.win) || w : w;      // the window this reset refills (Fable falls back to the weekly when the seat has no Fable reading)
+  const soon = rw && rw.id !== 's' && rw.reset && rw.reset - D.now <= 86400;
+  const exp = t => esc(fmtDT(t)) + ' (in ' + quotaIn(t - D.now) + ')', cr = (a.bankedList || [])[0];
+  rs = { pid, label, kind, busy: false };
   const d = $('rsdlg');
-  d.innerHTML = `<h2 id="rsT">Apply a banked reset to seat ${esc(label)}?</h2><dl>` +
-    `<dt>Seat</dt><dd>${esc(label)}${a.email ? ' · ' + esc(a.email) : ''}</dd>` +
-    `<dt>Used now</dt><dd>Weekly ${used(w)}${s ? ' · 5 h ' + used(s) : ''}</dd>` +
-    (w && w.reset ? `<dt>Weekly renews</dt><dd>${esc(fmtDT(w.reset))} (in ${quotaIn(w.reset - D.now)})</dd>` : '') +
-    `<dt>Credit used</dt><dd>${cr ? esc(cr.title) + ' · expires ' + esc(fmtDT(cr.expiresAt)) + ' (in ' + quotaIn(cr.expiresAt - D.now) + ')' : 'One banked reset (its expiry was not supplied)'}</dd></dl>` +
+  d.innerHTML = `<h2 id="rsT">Apply a ${k ? esc(k.noun) : 'banked reset'} to seat ${esc(label)}?</h2><dl>` +
+    `<dt>Seat</dt><dd>${esc(label)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd>` +
+    (k ? `<dt>Used now</dt><dd>${[s && '5 h ' + used(s), w && 'Weekly ' + used(w), win('f') && 'Fable ' + used(win('f'))].filter(Boolean).join(' · ') || '–'}</dd>` +
+         `<dt>Refills</dt><dd>${esc(k.refills)}</dd>`
+       : `<dt>Used now</dt><dd>Weekly ${used(w)}${s ? ' · 5 h ' + used(s) : ''}</dd>`) +
+    (rw && rw.reset ? `<dt>${esc(rw.label)} renews</dt><dd>${exp(rw.reset)}</dd>` : '') +
+    (k ? `<dt>Reset used</dt><dd>${esc(k.noun[0].toUpperCase() + k.noun.slice(1))}${r.endsAt ? ' · expires ' + exp(r.endsAt) : ' · no expiry given'}${r.left > 1 ? ` · 1 of ${r.left} banked` : ''}</dd></dl>`
+       : `<dt>Credit used</dt><dd>${cr ? esc(cr.title) + ' · expires ' + exp(cr.expiresAt) : 'One banked reset (its expiry was not supplied)'}</dd></dl>`) +
     `<p class="warn">This uses up the reset and can't be undone.</p>` +
-    (soon ? `<p class="warn">The weekly limit renews on its own in ${Math.max(1, Math.round((w.reset - D.now) / 3600))} h, so this would buy little.</p>` : '') +
-    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Apply reset</button></div>`;
+    (soon ? `<p class="warn">The ${esc(rw.label.replace('Weekly', 'weekly'))} limit renews on its own in ${Math.max(1, Math.round((rw.reset - D.now) / 3600))} h, so this would buy little.</p>` : '') +
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Apply ${k ? esc(k.noun) : 'reset'}</button></div>`;
   d.showModal();
 }
 function toast(text, outcome) {
@@ -418,7 +428,9 @@ async function doReset() {
   go.textContent = 'Applying…';
   let text = 'Reset failed: could not reach the app.', outcome = 'error';
   try {
-    const r = await fetch('/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ seat: rs.label }) });
+    const cl = rs.pid === 'claude';      // Claude sends the kind only: the server picks the grant
+    const r = await fetch(cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(cl ? { seat: rs.label, kind: rs.kind } : { seat: rs.label }) });
     const j = await r.json().catch(() => ({}));
     text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
   } catch (e) {}
@@ -427,7 +439,7 @@ async function doReset() {
 }
 
 function act(a, v, el) {
-  if (a === 'reset') return openReset(el.dataset.p, v);
+  if (a === 'reset') return openReset(el.dataset.p, v, el.dataset.k);
   if (a === 'rscancel') return $('rsdlg').close();
   if (a === 'rsgo') return doReset();
   if (a === 'reload') return loadData();

@@ -88,9 +88,17 @@ function quotaLevel(pid, w) {
   const p = Math.round(w.used * 100);
   return p >= 100 ? 'bad' : p >= 85 ? 'warn' : 'ok';
 }
+// Claude's reset kinds, as the Apply buttons and their confirmation name them: the noun ("Apply " + noun is the button), what the reset refills, and the window
+// whose renewal the dialog shows (and warns about when it is within 24 h; the 5-hour window always is, so it never warns).
+const QUOTA_RESET_KINDS = {
+  fable: { noun: 'Fable reset', win: 'f', refills: "Refills your Fable allowance and gives back what Fable used of your weekly limit; it doesn't reset the whole week." },
+  full: { noun: 'full reset', win: 'w', refills: 'Refills your 5-hour and weekly limits.' },
+  weekly: { noun: 'weekly reset', win: 'w', refills: 'Refills your weekly limit.' },
+  session: { noun: '5-hour reset', win: 's', refills: 'Refills your 5-hour limit.' },
+};
 // Sum of banked resets over a provider's seats, or null when none of them reports any.
 function quotaBankedTotal(p) {
   const s = p.accounts.filter(a => a.banked != null);
   return s.length ? s.reduce((n, a) => n + a.banked, 0) : null;
 }
-if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal };
+if (typeof module !== 'undefined') module.exports = { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS };

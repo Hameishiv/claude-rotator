@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal } = require('./usage-sim.js');
+const { quotaProject, quotaWeight, quotaMeasure, quotaFragment, quotaSuggest, quotaSeat, quotaInUse, quotaShare, quotaLevel, quotaIn, quotaBankedCell, quotaBankedTotal, QUOTA_RESET_KINDS } = require('./usage-sim.js');
 const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
 
 // two seats at 50% used, far resets, 50 %/h: 100% left, drains empty after 2 h
@@ -153,6 +153,15 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.strictEqual(quotaBankedCell({ bankedNote: 'sign-in needed' }, now, fmt, id), '–');
   assert.strictEqual(quotaBankedTotal({ accounts: [two, { banked: 1 }, {}] }), 3);
   assert.strictEqual(quotaBankedTotal({ accounts: [{}, {}] }), null);
+}
+// Claude's Apply kinds: the four the server accepts (usage-history.py RESET_KINDS), the owner's wording for Fable and full, a window each
+{
+  assert.deepStrictEqual(Object.keys(QUOTA_RESET_KINDS), ['fable', 'full', 'weekly', 'session']);
+  assert.strictEqual('Apply ' + QUOTA_RESET_KINDS.fable.noun, 'Apply Fable reset');
+  assert.strictEqual('Apply ' + QUOTA_RESET_KINDS.full.noun, 'Apply full reset');
+  assert.strictEqual(QUOTA_RESET_KINDS.fable.refills, "Refills your Fable allowance and gives back what Fable used of your weekly limit; it doesn't reset the whole week.");
+  assert.strictEqual(QUOTA_RESET_KINDS.full.refills, 'Refills your 5-hour and weekly limits.');
+  assert.deepStrictEqual(Object.values(QUOTA_RESET_KINDS).map(k => k.win), ['f', 'w', 'w', 's']);
 }
 // share of the whole pool: 162 of 600 -> 27 %, a pooled 3.6 %/h over 6 seats -> 0.6 %/h; a missing cap means one seat
 assert.strictEqual(Math.round(quotaShare(162, 600)), 27);

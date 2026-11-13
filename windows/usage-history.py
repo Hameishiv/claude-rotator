@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import statistics
 import struct
@@ -257,10 +258,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def http_json(req):
+def http_json(req, timeout=10):
     """(status, parsed json or None). Redirects are not followed; the caller's headers never leave the host."""
     try:
-        with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -545,8 +546,9 @@ def parse_cedar(block, now):
             end = _iso(ends)
             if end is None or end <= now:
                 continue
-        out.append({"id": g["id"], "kind": grant_kind(g), "left": left, "endsAt": end})
-    return {"eligible": True, "grants": out}
+        out.append({"id": g["id"], "kind": grant_kind(g), "left": left, "endsAt": end, "usable": g.get("usable_now") is True})
+    nid = block.get("next_grant_id")
+    return dict({"eligible": True, "grants": out}, **({"nextId": nid} if isinstance(nid, str) and GRANT_ID.fullmatch(nid) else {}))
 
 
 def parse_usage(j, now):
@@ -576,6 +578,68 @@ def read_credits(label, now, fetch=http_json, ver=None):
         return "auth", None
     r = parse_usage(j, now) if code == 200 else None
     return ("ok", dict(r, ts=int(now))) if r else ("fail", None)
+
+
+# ---------------------------------------------------------------- Claude Apply reset (owner-approved: one button per kind; the server picks the grant)
+
+RESET_KINDS = ("fable", "full", "weekly", "session")      # the kinds the page may ask for, in button order; "other" grants get no button
+RESET_URL = "https://api.anthropic.com/api/organizations/%s/reset_rate_limits"
+CONSUME_TIMEOUT = 25
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def usable_grants(entry, kind, now):
+    """The grants of `kind` an Apply may use, soonest expiry first (no expiry last): usable_now, resets left, unexpired. As in T3 Code's reader, nothing is
+    usable unless the reading named a next grant that is itself usable. `entry` is a seat's provider-cache credits entry."""
+    if not entry.get("eligible"):
+        return []
+    gs = [g for g in entry.get("grants") or [] if g.get("usable") and g["left"] > 0 and (g["endsAt"] is None or g["endsAt"] > now)]
+    if not any(g["id"] == entry.get("nextId") for g in gs):
+        return []
+    return sorted((g for g in gs if g["kind"] == kind), key=lambda g: (g["endsAt"] is None, g["endsAt"] or 0))
+
+
+def claude_org(label):
+    """The seat's organization uuid, as the rotator's probe and proxy record it (usage-cache*.json data.org, from the anthropic-organization-id header); '' when unknown."""
+    for suf in ("", "-fable"):
+        try:
+            with open(os.path.join(ROOT, label, "usage-cache%s.json" % suf), encoding="utf-8-sig") as fh:
+                o = (json.load(fh).get("data") or {}).get("org")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(o, str) and UUID.fullmatch(o.strip()):
+            return o.strip()
+    return ""
+
+
+def consume_reset(label, kind, gid, rid, fetch, ver=None):
+    """One claim of grant `gid` with idempotency key `rid` -> ({"outcome", "text"}, settled). Not settled (no answer, a 5xx, `unavailable`) means the claim may
+    or may not have landed: the caller keeps `rid` so a retry addresses the same claim. The token stays in this function: never logged, stored or returned."""
+    tok, org, name = _read(os.path.join(ROOT, label, "token.txt")), claude_org(label), CREDIT_KINDS[kind]
+    if not tok or not org:
+        return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh all credentials, then try again." % label}, True
+    req = urllib.request.Request(RESET_URL % org, method="POST", data=json.dumps({"program": "cedar_ember", "grant_id": gid, "request_id": rid}).encode("utf-8"),
+                                 headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20", "content-type": "application/json",
+                                          "user-agent": "claude-cli/%s (external, cli)" % (ver or CLI_FALLBACK)})
+    try:
+        code, j = fetch(req)
+    except Exception as e:   # shortcut: whatever a fetch raises is an unanswered claim; only its type is kept
+        code, j = 0, type(e).__name__
+    if code == 429:
+        return {"outcome": "error", "text": "Claude is rate limiting resets. Try again later."}, True
+    if code in (401, 403):
+        return {"outcome": "error", "text": "Seat %s needs to sign in to Claude again." % label}, True
+    res = j.get("result") if code == 200 and isinstance(j, dict) else None
+    done = {"reset": ("redeemed", "%s applied to seat %s." % (name, label)),
+            "already_used": ("alreadyRedeemed", "That reset was already applied; nothing more was used."),
+            "not_limited": ("nothingToReset", "Seat %s had nothing to reset right now." % label),
+            "cooldown": ("error", "Claude resets are cooling down. Try again later."),
+            "ineligible": ("noCredit", "Claude says seat %s has no %s to apply." % (label, name.lower()))}
+    if isinstance(res, str) and res in done:
+        return {"outcome": done[res][0], "text": done[res][1]}, True
+    why = "Claude did not confirm it" if res == "unavailable" else "HTTP %s" % code if code else "Claude could not be reached"
+    return {"outcome": "error", "text": "The reset on seat %s is unconfirmed (%s). If the seat is still limited in a minute, apply it again: the retry "
+                                        "cannot use a second reset." % (label, why)}, False
 
 
 def sample(now, force=False):
@@ -879,6 +943,9 @@ def build_provider(hist, pid, emails, now, extra):
                 a["bankedList"] = [dict({"title": CREDIT_KINDS.get(g["kind"], "Reset"), "expiresAt": g["endsAt"]}, **({"n": g["left"]} if g["left"] > 1 else {})) for g in gs]
         if cr.get("note"):
             a["bankedNote"] = cr["note"]
+        rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
+        if any(gs for _, gs in rk):         # what the Apply buttons and their dialog need: no grant ids, the server picks the grant again on the click
+            a["resets"] = [{"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} for k, gs in rk if gs]
         accounts.append(a)
     if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
         meas = measured_ratios((extra.get("codex") or {}).get("pairs") or {}, now)
@@ -896,6 +963,8 @@ def build_provider(hist, pid, emails, now, extra):
         out["inUse"] = use
     if pid == "codex":
         out["canReset"] = bool(extra.get("canReset"))      # the redeem script exists: the page may offer Apply reset
+    if pid == "claude" and extra.get("claudeReset"):
+        out["canReset"] = True                             # claudeResetCredits is on: the page may offer the per-kind Apply buttons
     note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
     mixed = sorted({a["plan"] for a in accounts if a.get("plan") and "w" not in a})
     if len(mixed) > 1:                      # seats on different plans counted as equal: the pool is only meaningful once the user sizes them
@@ -1011,7 +1080,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs}}
 
 
@@ -1594,7 +1663,9 @@ class Store:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if state == "ok":
                 e.update(ts=rd["ts"], eligible=rd["eligible"], grants=rd["grants"])
-                e.pop("note", None), e.pop("hold", None)
+                e.pop("note", None), e.pop("hold", None), e.pop("nextId", None)
+                if rd.get("nextId"):
+                    e["nextId"] = rd["nextId"]
             elif state in ("rl", "auth"):
                 e["hold"] = int(now + CREDITS_EVERY)
                 e["note"] = "rate limited" if state == "rl" else "sign-in needed"
@@ -1641,6 +1712,34 @@ class Store:
                 self.rebuild(now)
         return res
 
+    def claude_reset(self, seat, kind, fetch=None, new_id=None):
+        """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
+        the last reading, never taken from the page. The request id is saved before the call and kept while the outcome is unconfirmed, so a retry of the same
+        grant reuses it; a settled outcome drops it. Returns {"outcome", "text"}."""
+        now = time.time()
+        with self.lock:
+            cache = load_pcache()
+            gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
+            if not gs:
+                return {"outcome": "noCredit", "text": "Seat %s has no %s to apply." % (seat, CREDIT_KINDS[kind].lower())}
+            key = seat + ":" + gs[0]["id"]
+            claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict) and now - (v.get("at") or 0) < DAY}
+            if key not in claims:
+                claims[key] = {"id": (new_id or (lambda: secrets.token_urlsafe(16)))(), "at": int(now)}
+            cache["credits_claims"] = claims
+            save_pcache(cache)
+        res, settled = consume_reset(seat, kind, gs[0]["id"], claims[key]["id"], fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
+        applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], "" if settled else " (unconfirmed)"))
+        if settled:
+            with self.lock:
+                cache = load_pcache()
+                (cache.get("credits_claims") or {}).pop(key, None)
+                save_pcache(cache)
+        self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
+        with self.lock:
+            self.rebuild(time.time())
+        return res
+
 
 def probe_claude():
     """The one live Claude read: the rotator's own --status, with no console window."""
@@ -1650,9 +1749,9 @@ def probe_claude():
     return r.returncode
 
 
-def serve(port):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    store = Store()
+def make_handler(store, port):
+    """The request handler over `store`, answering only on 127.0.0.1/localhost:`port` (a function of its own so the selftest can drive it)."""
+    from http.server import BaseHTTPRequestHandler
     ctype = {"/icon.svg": ("icon.svg", "image/svg+xml"), "/icon-192.png": ("icon-192.png", "image/png"),
              "/icon-512.png": ("icon-512.png", "image/png")}
 
@@ -1695,12 +1794,14 @@ def serve(port):
             if not host_ok(self.headers.get("Host"), port):
                 return self.send(403, "forbidden")
             path = self.path.split("?")[0]
-            if path not in ("/api/refresh", "/api/codex-reset"):
+            if path not in ("/api/refresh", "/api/codex-reset", "/api/claude-reset"):
                 return self.send(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
                 return self.send(403, "forbidden")
             if path == "/api/codex-reset":
                 return self.codex_reset()
+            if path == "/api/claude-reset":
+                return self.claude_reset()
             if not store.refreshing.acquire(blocking=False):
                 return self.send(409, "a refresh is already running")
             try:
@@ -1737,6 +1838,35 @@ def serve(port):
                 self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
             finally:
                 store.refreshing.release()
+
+        def claude_reset(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else {}
+                seat, kind = b.get("seat"), b.get("kind")
+            except (ValueError, AttributeError):
+                seat = kind = None
+            if not credits_enabled():
+                return self.js(404, {"outcome": "error", "text": "Claude resets are switched off on this PC (claudeResetCredits in rotator.local.json)."})
+            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS:
+                return self.js(400, {"outcome": "error", "text": "Unknown Claude seat or reset kind."})
+            if not store.refreshing.acquire(blocking=False):
+                return self.js(409, {"outcome": "error", "text": "A refresh or another reset is running; try again in a minute."})
+            try:
+                self.js(200, store.claude_reset(seat, kind))
+            except Exception as e:   # shortcut: same broad catch as refresh
+                applog("claude reset error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
+            finally:
+                store.refreshing.release()
+
+    return H
+
+
+def serve(port):
+    from http.server import ThreadingHTTPServer
+    store = Store()
+    H = make_handler(store, port)
 
     def sampler():
         while True:
@@ -2488,6 +2618,146 @@ def selftest():
         globals()["ROOT"], globals()["PCACHE"] = keep_root, keep_pc
         _ver[:] = [0, ""]
         __import__("shutil").rmtree(jd, ignore_errors=True)
+    # K: Claude Apply reset - the grant the server picks, the claim (request id kept while unconfirmed), every outcome, the re-read after, and the HTTP guards.
+    # No network: fetch is injected, and the handler runs on a spare loopback port against a fake store.
+    import http.client
+    from http.server import ThreadingHTTPServer
+    KN = int(time.time())                                                                # Store.claude_reset reads the clock itself
+    kblk = {"eligible": True, "next_grant_id": "g1", "grants": [gr("g1", 2, gives_back_weekly=True, ends_at=ISO(KN + 3 * DAY)), gr("g2", 1, type="full", ends_at=ISO(KN + 5 * DAY)),
+            gr("g8", 0, type="weekly"), gr("g9", 1, type="session"), gr("g10", 1, clears=["five_hour"]), gr("g11", 1, clears=["weekly", "five_hour"]), gr("g12", 1, type="x"),
+            gr("g13", 1, type="full", usable_now=False), gr("g3", 4, type="full", paused=True)]}
+    kb = parse_cedar(kblk, KN)
+    assert kb["nextId"] == "g1" and [g["usable"] for g in kb["grants"]][:2] == [True, True] and "nextId" not in parse_cedar(dict(kblk, next_grant_id="BAD id"), KN)
+    assert parse_cedar(dict(kblk, grants=[gr("u1", 1, type="full", usable_now="yes")]), KN)["grants"][0]["usable"] is False        # only a real true is usable
+    ke = dict(kb, ts=KN)
+    assert [g["id"] for g in usable_grants(ke, "fable", KN)] == ["g1"] and [g["id"] for g in usable_grants(ke, "full", KN)] == ["g2", "g11"]   # soonest first, no expiry last
+    assert [g["id"] for g in usable_grants(ke, "session", KN)] == ["g9", "g10"] and usable_grants(ke, "weekly", KN) == []                  # g8 has no resets left
+    assert usable_grants(dict(ke, nextId="g3"), "full", KN) == [] and usable_grants({k: v for k, v in ke.items() if k != "nextId"}, "full", KN) == []   # T3's next-grant gate
+    assert usable_grants(dict(ke, eligible=False), "fable", KN) == [] and usable_grants({}, "fable", KN) == []
+    assert usable_grants(ke, "fable", KN + 3 * DAY) == []                                                                                 # expired by now
+    kh = [{"t": KN, "s": {"A": {"w": 0.1, "wr": KN + 9, "ts": KN}, "B": {"w": 0.1, "wr": KN + 9, "ts": KN}}}]
+    kx = {"credits": {"A": ke, "B": dict(ke, nextId=None)}, "claudeReset": True}
+    kp = build(kh, KN + 10, {}, False, kx)["providers"][0]
+    assert kp["canReset"] is True and kp["accounts"][0]["resets"] == [{"kind": "fable", "left": 2, "endsAt": KN + 3 * DAY}, {"kind": "full", "left": 2, "endsAt": KN + 5 * DAY},
+                                                                      {"kind": "session", "left": 2, "endsAt": None}], kp["accounts"][0]
+    assert "resets" not in kp["accounts"][1] and kp["accounts"][1]["banked"] == 7                       # counted, but no Apply without the next grant
+    assert "g1" not in json.dumps(kp)                                                                   # no grant id reaches the page
+    kp = build(kh, KN + 10, {}, False, dict(kx, claudeReset=False))["providers"][0]
+    assert "canReset" not in kp and "resets" not in kp["accounts"][0] and kp["accounts"][0]["banked"] == 7                # switched off: the count stays, the buttons go
+    keep = {k: globals()[k] for k in ("ROOT", "PCACHE", "APPLOG", "STATE", "credits_enabled")}
+    kd = tempfile.mkdtemp()
+    _ver[:] = [KN + DAY, "2.1.400"]                                                       # pinned: no real `claude --version`
+    try:
+        globals().update(ROOT=kd, PCACHE=os.path.join(kd, "p.json"), APPLOG=os.path.join(kd, "app.log"), STATE=kd)
+        ORG = "0f0e0d0c-0b0a-4908-8706-050403020100"
+        for lab_ in "AB":
+            os.makedirs(os.path.join(kd, lab_))
+            open(os.path.join(kd, lab_, "token.txt"), "w").write("secret-" + lab_)
+        open(os.path.join(kd, "A", "usage-cache.json"), "w").write(json.dumps({"ts": KN, "data": {"ok": True, "org": ORG}}))
+        open(os.path.join(kd, "B", "usage-cache.json"), "w").write(json.dumps({"ts": KN, "data": {"ok": True, "org": "not-a-uuid"}}))
+        assert claude_org("A") == ORG and claude_org("B") == "" and claude_org("Z") == ""
+        kc, post = [], [(200, {"result": "reset"})]
+
+        def kf(req):
+            kc.append((req.get_method(), req.full_url, req.data, req.get_header("Authorization"), req.get_header("Content-type"), req.get_header("Anthropic-beta"),
+                       req.get_header("User-agent")))
+            if req.get_method() == "GET":
+                return 200, {"cedar_ember": dict(kblk, grants=[x for x in kblk["grants"] if not (isinstance(x, dict) and x.get("id") == "g1")])}   # g1 spent
+            r_ = post.pop(0)
+            if isinstance(r_, Exception):
+                raise r_
+            return r_
+        ks = Store.__new__(Store)
+        ks.lock, ks.rebuild = threading.RLock(), lambda now: None
+        save_pcache({"credits": {"A": dict(ke), "B": dict(ke)}})
+        ids = iter("rid%d" % i for i in range(1, 99))
+        nid = lambda: next(ids)
+        r_ = ks.claude_reset("A", "fable", kf, nid)
+        assert r_ == {"outcome": "redeemed", "text": "Fable reset applied to seat A."}, r_
+        assert kc[0][:3] == ("POST", RESET_URL % ORG, b'{"program": "cedar_ember", "grant_id": "g1", "request_id": "rid1"}'), kc[0]
+        assert RESET_URL % ORG == "https://api.anthropic.com/api/organizations/%s/reset_rate_limits" % ORG
+        assert kc[0][3:6] == ("Bearer secret-A", "application/json", "oauth-2025-04-20") and kc[0][6].startswith("claude-cli/") and kc[0][6].endswith(" (external, cli)")
+        assert kc[1][:2] == ("GET", CREDITS_URL) and len(kc) == 2                                           # the seat is read again straight after
+        pc = load_pcache()
+        assert pc["credits_claims"] == {} and [g["id"] for g in pc["credits"]["A"]["grants"]][0] == "g2" and usable_grants(pc["credits"]["A"], "fable", KN) == []
+        assert "secret-" not in open(PCACHE).read() and "secret-" not in open(APPLOG).read() and "seat A fable -> redeemed" in open(APPLOG).read()
+        # an unconfirmed claim keeps its request id; the retry of the same grant reuses it; a settled answer drops it
+        save_pcache({"credits": {"A": dict(ke)}})
+        kc.clear(), post.extend([TimeoutError("t"), (200, {"result": "already_used"}), (200, {"result": "reset"})])
+        r_ = ks.claude_reset("A", "full", kf, nid)
+        cl = load_pcache()["credits_claims"]
+        assert r_["outcome"] == "error" and "unconfirmed (Claude could not be reached)" in r_["text"] and list(cl) == ["A:g2"] and cl["A:g2"]["id"] == "rid2"
+        save_pcache(dict(load_pcache(), credits={"A": dict(ke)}))                                            # the re-read dropped g1, the next grant: put the reading back
+        r_ = ks.claude_reset("A", "full", kf, nid)
+        assert r_ == {"outcome": "alreadyRedeemed", "text": "That reset was already applied; nothing more was used."} and b'"request_id": "rid2"' in kc[2][2]
+        assert load_pcache()["credits_claims"] == {}
+        save_pcache(dict(load_pcache(), credits={"A": dict(ke)}))
+        ks.claude_reset("A", "full", kf, nid)
+        assert b'"request_id": "rid3"' in kc[4][2]                                                          # a new claim, a new id
+        # every other outcome
+        for ans, oc, text, kept in [((200, {"result": "not_limited"}), "nothingToReset", "Seat A had nothing to reset right now.", False),
+                                    ((200, {"result": "ineligible"}), "noCredit", "Claude says seat A has no 5-hour reset to apply.", False),
+                                    ((200, {"result": "cooldown"}), "error", "Claude resets are cooling down. Try again later.", False),
+                                    ((429, None), "error", "Claude is rate limiting resets.", False),
+                                    ((401, None), "error", "Seat A needs to sign in to Claude again.", False),
+                                    ((403, None), "error", "Seat A needs to sign in to Claude again.", False),
+                                    ((200, {"result": "unavailable"}), "error", "unconfirmed (Claude did not confirm it)", True),
+                                    ((200, {"result": "who knows"}), "error", "unconfirmed (HTTP 200)", True),
+                                    ((200, ["x"]), "error", "unconfirmed (HTTP 200)", True),
+                                    ((502, None), "error", "unconfirmed (HTTP 502)", True),
+                                    ((0, "URLError"), "error", "unconfirmed (Claude could not be reached)", True)]:
+            save_pcache({"credits": {"A": dict(ke)}})
+            post.append(ans)
+            r_ = ks.claude_reset("A", "session" if oc == "noCredit" else "fable", kf, nid)
+            assert r_["outcome"] == oc and text in r_["text"], (ans, r_)
+            assert bool(load_pcache().get("credits_claims")) is kept, (ans, load_pcache().get("credits_claims"))
+        assert not post
+        # nothing to claim, or no organization: no call at all
+        n_ = len(kc)
+        save_pcache({"credits": {"A": dict(ke, nextId=None), "B": dict(ke)}})
+        assert ks.claude_reset("A", "fable", kf, nid) == {"outcome": "noCredit", "text": "Seat A has no fable reset to apply."} and len(kc) == n_
+        assert ks.claude_reset("A", "weekly", kf, nid)["outcome"] == "noCredit" and len(kc) == n_
+        r_ = ks.claude_reset("B", "fable", kf, nid)
+        assert r_["outcome"] == "error" and "organization is not known" in r_["text"] and [c[0] for c in kc[n_:]] == ["GET"]   # only the re-read
+        assert load_pcache()["credits_claims"] == {}
+        # the HTTP guards, on a spare loopback port with a fake store
+        hs = Store.__new__(Store)
+        hs.lock, hs.refreshing, hs.blob, hc = threading.RLock(), threading.Lock(), {}, []
+        hs.claude_reset = lambda seat, kind: (hc.append((seat, kind)), {"outcome": "redeemed", "text": "ok"})[1]
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), __import__("http.server").server.BaseHTTPRequestHandler)
+        port = srv.server_address[1]
+        srv.RequestHandlerClass = make_handler(hs, port)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def hp(body, host="127.0.0.1:%d" % port, app="1", path="/api/claude-reset"):
+            cn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+            cn.request("POST", path, raw, dict({"Host": host, "Content-Type": "application/json"}, **({"X-Quota-App": app} if app else {})))
+            rp = cn.getresponse()
+            out = (rp.status, rp.read())
+            cn.close()
+            return out
+        try:
+            ok_ = {"seat": "A", "kind": "fable"}
+            assert hp(ok_, host="evil.example:%d" % port)[0] == 403 and hp(ok_, app=None)[0] == 403 and hp(ok_, app="0")[0] == 403 and not hc
+            for bad in ({"seat": "Z", "kind": "fable"}, {"seat": "A/../B", "kind": "fable"}, {"seat": "a", "kind": "fable"}, {"seat": "A", "kind": "other"},
+                        {"seat": "A", "kind": ["fable"]}, {"seat": "A"}, {"seat": "A", "kind": "fable", "pad": "x" * 1100}, ["A"], b"not json", b""):
+                assert hp(bad)[0] == 400, bad
+            assert not hc
+            st_, body_ = hp(dict(ok_, grant_id="g9"))                                                       # a grant id from the page is ignored
+            assert st_ == 200 and json.loads(body_) == {"outcome": "redeemed", "text": "ok"} and hc == [("A", "fable")]
+            hs.refreshing.acquire()
+            assert hp(ok_)[0] == 409 and len(hc) == 1                                                       # single flight with refresh and the Codex reset
+            hs.refreshing.release()
+            globals()["credits_enabled"] = lambda cfg=None: False
+            assert hp(ok_)[0] == 404 and len(hc) == 1                                                       # the kill switch
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    finally:
+        globals().update(keep)
+        _ver[:] = [0, ""]
+        __import__("shutil").rmtree(kd, ignore_errors=True)
     # icons: a valid PNG signature and an ICO header
     assert png(16)[:8] == b"\x89PNG\r\n\x1a\n" and ico(png(16))[:6] == b"\0\0\1\0\1\0"
     say("usage-history selftest: ok")
