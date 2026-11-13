@@ -624,8 +624,10 @@ NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
 
 
 def app_login(label, run=subprocess.run):
-    """The seat's full desktop-app login, READ-ONLY, when the app saved one for the SAME account (its email matches the seat's email.txt):
-    ("ok", token) while unexpired, ("expired", None), or (None, None) when there is none. The setup-token in token.txt cannot read reset
+    """The seat's full desktop-app login, READ-ONLY, when the app saved one for the SAME account: its email matches the seat's email.txt, the
+    helper took it from a snapshot pinned to the app seat's owner-uuid.txt (and only that account's entries), and its organization is the one
+    the CLI seat's own probe recorded (usage-cache org). ("ok", token) while unexpired, ("expired", None), or (None, None) when there is none
+    or anything does not match. The setup-token in token.txt cannot read reset
     credits (scope user:profile); this login can. Decrypting it takes AES-GCM, which Python's stdlib lacks, so app-login-token.ps1 does it and
     prints the token on stdout; it never refreshes a token and never writes a file. The token is never logged or stored."""
     app = os.path.join(APP_SEATS, label)
@@ -642,7 +644,10 @@ def app_login(label, run=subprocess.run):
         j = json.loads(r.stdout.decode("utf-8", "replace"))
     except (OSError, subprocess.SubprocessError, ValueError):
         return None, None
+    owner, org = _read(os.path.join(app, "owner-uuid.txt")), claude_org(label)
     if isinstance(j, dict) and j.get("state") == "ok" and isinstance(j.get("token"), str) and j["token"]:
+        if not owner or j.get("accountUuid") != owner or not org or str(j.get("orgUuid") or "").lower() != org.lower():
+            return None, None           # another account's login, or one that cannot be tied to this seat: never used
         return "ok", j["token"]
     return ("expired", None) if isinstance(j, dict) and j.get("state") == "expired" else (None, None)
 
@@ -3407,6 +3412,10 @@ def selftest():
             open(os.path.join(APP_SEATS, "B", "email.txt"), "w").write("B@X.example")
             for lab_ in "ABC":
                 open(os.path.join(jd, lab_, "email.txt"), "w").write(lab_.lower() + "@x.example")
+                open(os.path.join(APP_SEATS, lab_, "owner-uuid.txt"), "w").write("acct-" + lab_)
+            ORG_ = "0f0e0d0c-0b0a-4908-8706-050403020100"
+            for lab_ in "AB":
+                open(os.path.join(jd, lab_, "usage-cache.json"), "w").write(json.dumps({"ts": 1, "data": {"ok": True, "org": ORG_}}))
             runs = []
 
             class R_:
@@ -3418,13 +3427,20 @@ def selftest():
                     runs.append((argv, kw))
                     return R_(out)
                 return r
-            okr = hp_(b'{"state":"ok","token":"tok-app","expiresAt":1}')
+            ok_ = lambda acct, org=ORG_: hp_(json.dumps({"state": "ok", "token": "tok-app", "expiresAt": 1, "accountUuid": acct, "orgUuid": org}).encode())
+            okr = ok_("acct-A")
             if os.name == "nt":
-                assert app_login("A", okr) == ("ok", "tok-app") and app_login("B", okr) == ("ok", "tok-app")         # email from meta.txt, or email.txt
+                assert app_login("A", okr) == ("ok", "tok-app") and app_login("B", ok_("acct-B")) == ("ok", "tok-app")     # email from meta.txt, or email.txt
                 assert runs[0][0][-2:] == ["-Seat", "A"] and runs[0][0][-3].endswith("app-login-token.ps1") and runs[0][1]["creationflags"] == CHILD_FLAGS
                 assert app_login("C", okr) == (None, None) and app_login("D", okr) == (None, None) and len(runs) == 2      # another account's login, or none: never asked
                 assert app_login("A", hp_(b'{"state":"expired","expiresAt":1}')) == ("expired", None)
                 assert app_login("A", hp_(b"junk")) == (None, None) and app_login("A", hp_(b'{"state":"ok","token":""}')) == (None, None)
+                assert app_login("A", ok_("acct-B")) == (None, None)                                  # the helper's account is not this seat's owner
+                assert app_login("A", ok_("acct-A", "11111111-2222-4333-8444-555555555555")) == (None, None)     # another organization than the seat's
+                assert app_login("A", hp_(b'{"state":"ok","token":"tok-app","expiresAt":1}')) == (None, None)    # no identity at all
+                os.remove(os.path.join(APP_SEATS, "A", "owner-uuid.txt"))
+                assert app_login("A", okr) == (None, None)                                            # an unpinned seat
+                open(os.path.join(APP_SEATS, "A", "owner-uuid.txt"), "w").write("acct-A")
                 assert seat_token("A", lambda l: (None, None)) == ("secret-A", None) and seat_token("A", lambda l: ("expired", None)) == (None, "expired")
                 r_ = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", os.path.join(HERE, "app-login-token.ps1"), "-SelfTest"], stdin=subprocess.DEVNULL,
                                     capture_output=True, timeout=120, creationflags=CHILD_FLAGS)

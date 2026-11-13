@@ -9,9 +9,13 @@ Where it reads (the same places claude-app-rotator.ps1 and claude-app-seat-keepa
   oauth:tokenCacheV2                        Electron safeStorage v10 = AES-256-GCM, key DPAPI-wrapped in
                                             %APPDATA%\Claude\Local State
 It never refreshes a token and never writes any file. Output, one line of JSON on stdout:
-  {"state":"ok","token":"...","expiresAt":<ms>}   the user:profile entry that expires last, unexpired
+  {"state":"ok","token":"...","expiresAt":<ms>,"accountUuid":"...","orgUuid":"..."}
+                                                  the seat's own account's user:profile entry that expires last, unexpired
   {"state":"expired","expiresAt":<ms>}            every user:profile entry has expired (opening the app on that seat refreshes it)
-  {"state":"none","why":"..."}                    no saved login, no user:profile entry, or unreadable
+  {"state":"none","why":"..."}                    no usable app login: none saved, no owner-uuid.txt, a snapshot of another
+                                                  account (its lastKnownAccountUuid is not the seat's owner: a poisoned snapshot,
+                                                  the rule claude-app-seat-keepalive.ps1 applies), no user:profile entry of that
+                                                  account, or unreadable
   app-login-token.ps1 -Seat A
   app-login-token.ps1 -SelfTest                   no real file is read: a throwaway key and login in a temp folder
 #>
@@ -38,24 +42,35 @@ function Unprotect-Blob([byte[]]$Key, [string]$B64) {
 
 function Get-AppLogin([string]$Seat, [string]$AppDir, [string]$SeatRoot, [long]$NowMs) {
   if ($Seat -notmatch '^[A-Za-z0-9_-]{1,32}$') { return @{ state = 'none'; why = 'not a seat name' } }
-  $snap = Join-Path (Join-Path $SeatRoot $Seat) 'config.json'
+  $dir = Join-Path $SeatRoot $Seat
+  $snap = Join-Path $dir 'config.json'
   if (-not (Test-Path -LiteralPath $snap)) { return @{ state = 'none'; why = 'no app login saved for this seat' } }
+  $ownerFile = Join-Path $dir 'owner-uuid.txt'       # which account this seat IS, written at --capture (claude-app-rotator.ps1)
+  $owner = if (Test-Path -LiteralPath $ownerFile) { (Get-Content -LiteralPath $ownerFile -Raw).Trim() } else { '' }
+  if (-not $owner) { return @{ state = 'none'; why = 'no usable app login: the seat has no owner-uuid.txt' } }
   try {
     $cfg = Get-Content -LiteralPath $snap -Raw | ConvertFrom-Json -AsHashtable
+    if ($cfg['lastKnownAccountUuid'] -and $cfg['lastKnownAccountUuid'] -ne $owner) { return @{ state = 'none'; why = 'no usable app login: the snapshot is another account' } }
     $live = Join-Path $AppDir 'config.json'
     if (Test-Path -LiteralPath $live) {
       $lc = Get-Content -LiteralPath $live -Raw | ConvertFrom-Json -AsHashtable
-      if ($lc['lastKnownAccountUuid'] -and $lc['lastKnownAccountUuid'] -eq $cfg['lastKnownAccountUuid']) { $cfg = $lc }
+      if ($lc['lastKnownAccountUuid'] -eq $owner) { $cfg = $lc }        # the live seat: the app's own, fresher copy
     }
     if (-not $cfg['oauth:tokenCacheV2']) { return @{ state = 'none'; why = 'no app login token in it' } }
     $cache = Unprotect-Blob (Get-AppKey $AppDir) $cfg['oauth:tokenCacheV2'] | ConvertFrom-Json -AsHashtable
   } catch { return @{ state = 'none'; why = 'app login unreadable' } }
   $now = if ($NowMs) { $NowMs } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
-  $prof = @($cache.Keys | Where-Object { $_ -match ':https://api\.anthropic\.com:' -and $_ -match '(:| )user:profile( |$)' -and $cache[$_].token } |
-            ForEach-Object { $cache[$_] } | Sort-Object { [double]$_.expiresAt } -Descending)
-  if (-not $prof) { return @{ state = 'none'; why = 'no user:profile login' } }
-  if ([double]$prof[0].expiresAt -le $now) { return @{ state = 'expired'; expiresAt = [long]$prof[0].expiresAt } }
-  return @{ state = 'ok'; token = [string]$prof[0].token; expiresAt = [long]$prof[0].expiresAt }
+  # entry keys: acct:<account>|<client>:<organization>:https://api.anthropic.com:<scopes>; only this seat's own account counts
+  $prof = @(foreach ($k in $cache.Keys) {
+      if ($k -notmatch '^acct:([^|]+)\|[^:]+:([^:]+):https://api\.anthropic\.com:(.+)$') { continue }
+      $acct, $org, $scopes = $Matches[1], $Matches[2], " $($Matches[3]) "
+      if ($acct -eq $owner -and $scopes.Contains(' user:profile ') -and $cache[$k].token) {
+        [pscustomobject]@{ token = [string]$cache[$k].token; expiresAt = [double]$cache[$k].expiresAt; org = $org }
+      }
+    }) | Sort-Object expiresAt -Descending
+  if (-not $prof) { return @{ state = 'none'; why = 'no user:profile login for this account' } }
+  if ($prof[0].expiresAt -le $now) { return @{ state = 'expired'; expiresAt = [long]$prof[0].expiresAt } }
+  return @{ state = 'ok'; token = $prof[0].token; expiresAt = [long]$prof[0].expiresAt; accountUuid = $owner; orgUuid = $prof[0].org }
 }
 
 if ($SelfTest) {
@@ -78,20 +93,29 @@ if ($SelfTest) {
     }
     $now = 1800000000000
     $mk = { param($uuid, $entries) @{ lastKnownAccountUuid = $uuid; 'oauth:tokenCacheV2' = (& $enc ($entries | ConvertTo-Json -Compress)) } | ConvertTo-Json -Compress }
-    $h = 'acct:x|c1:o1:https://api.anthropic.com:'
+    $h = 'acct:u-a|c1:o1:https://api.anthropic.com:'
     (& $mk 'u-a' @{ ($h + 'user:profile') = @{ token = 'tA-old'; expiresAt = $now + 1000 }; ($h + 'user:inference user:profile user:sessions:claude_code') = @{ token = 'tA-new'; expiresAt = $now + 9000 };
-                    ($h + 'user:inference') = @{ token = 'tA-noprofile'; expiresAt = $now + 99999 } }) | Set-Content -LiteralPath (Join-Path $seats 'A\config.json')
-    (& $mk 'u-b' @{ ($h + 'user:profile') = @{ token = 'tB'; expiresAt = $now - 5 } }) | Set-Content -LiteralPath (Join-Path $seats 'B\config.json')
-    (& $mk 'u-c' @{ ($h + 'user:profile') = @{ token = 'tC-snapshot'; expiresAt = $now - 5 } }) | Set-Content -LiteralPath (Join-Path $seats 'C\config.json')
-    (& $mk 'u-c' @{ ($h + 'user:profile') = @{ token = 'tC-live'; expiresAt = $now + 50 } }) | Set-Content -LiteralPath (Join-Path $app 'config.json')
+                    ($h + 'user:inference') = @{ token = 'tA-noprofile'; expiresAt = $now + 99999 };
+                    ('acct:u-other|c1:o1:https://api.anthropic.com:user:profile') = @{ token = 'tOTHER'; expiresAt = $now + 99999 } }) | Set-Content -LiteralPath (Join-Path $seats 'A\config.json')
+    (& $mk 'u-b' @{ ('acct:u-b|c1:o1:https://api.anthropic.com:user:profile') = @{ token = 'tB'; expiresAt = $now - 5 } }) | Set-Content -LiteralPath (Join-Path $seats 'B\config.json')
+    (& $mk 'u-c' @{ ('acct:u-c|c1:o1:https://api.anthropic.com:user:profile') = @{ token = 'tC-snapshot'; expiresAt = $now - 5 } }) | Set-Content -LiteralPath (Join-Path $seats 'C\config.json')
+    (& $mk 'u-c' @{ ('acct:u-c|c1:o9:https://api.anthropic.com:user:profile') = @{ token = 'tC-live'; expiresAt = $now + 50 } }) | Set-Content -LiteralPath (Join-Path $app 'config.json')
+    foreach ($o in @('A:u-a', 'B:u-b', 'C:u-c')) { $n, $u = $o -split ':'; Set-Content -LiteralPath (Join-Path $seats "$n\owner-uuid.txt") -Value $u -NoNewline }
+    New-Item -ItemType Directory -Force -Path (Join-Path $seats 'P'), (Join-Path $seats 'N') | Out-Null
+    (& $mk 'u-a' @{ ($h + 'user:profile') = @{ token = 'tA-in-P'; expiresAt = $now + 9000 }; ('acct:u-p|c1:o1:https://api.anthropic.com:user:profile') = @{ token = 'tP'; expiresAt = $now + 9000 } }) |
+      Set-Content -LiteralPath (Join-Path $seats 'P\config.json')
+    Set-Content -LiteralPath (Join-Path $seats 'P\owner-uuid.txt') -Value 'u-p' -NoNewline      # P's snapshot is A's account: poisoned
+    Copy-Item (Join-Path $seats 'A\config.json') (Join-Path $seats 'N\config.json')                 # N has no owner-uuid.txt
     $hashes = { Get-ChildItem $td -Recurse -File | ForEach-Object { (Get-FileHash $_.FullName).Hash } }
     $before = & $hashes
     $a = Get-AppLogin 'A' $app $seats $now
-    T 'the unexpired user:profile entry that expires last' ($a.state -eq 'ok' -and $a.token -eq 'tA-new' -and $a.expiresAt -eq $now + 9000)
+    T "the seat's own unexpired user:profile entry that expires last, never another account's" ($a.state -eq 'ok' -and $a.token -eq 'tA-new' -and $a.expiresAt -eq $now + 9000 -and $a.accountUuid -eq 'u-a' -and $a.orgUuid -eq 'o1')
+    T 'a snapshot of another account (poisoned) -> none' ((Get-AppLogin 'P' $app $seats $now).state -eq 'none')
+    T 'no owner-uuid.txt -> none' ((Get-AppLogin 'N' $app $seats $now).state -eq 'none')
     $b = Get-AppLogin 'B' $app $seats $now
     T 'every user:profile entry expired -> expired, no token' ($b.state -eq 'expired' -and -not $b.token)
     $c = Get-AppLogin 'C' $app $seats $now
-    T "the live seat reads the app's own, fresher config" ($c.state -eq 'ok' -and $c.token -eq 'tC-live')
+    T "the live seat reads the app's own, fresher config" ($c.state -eq 'ok' -and $c.token -eq 'tC-live' -and $c.orgUuid -eq 'o9')
     T 'no saved login -> none' ((Get-AppLogin 'Z' $app $seats $now).state -eq 'none')
     T 'a path in the seat name is refused' ((Get-AppLogin '..\A' $app $seats $now).state -eq 'none')
     Set-Content -LiteralPath (Join-Path $seats 'B\config.json') -Value '{"lastKnownAccountUuid":"u-b","oauth:tokenCacheV2":"djEwgarbage"}'
