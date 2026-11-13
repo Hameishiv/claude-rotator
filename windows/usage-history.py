@@ -266,16 +266,21 @@ def read_codex(cdir=None, sink=None):
     return seats, emails
 
 
+def _norm_iso(s):
+    """An ISO timestamp in the one shape every Python 3.10+ fromisoformat takes: a trailing Z as +00:00, and a fraction of exactly 6 digits (3.10 takes only
+    3 or 6, and 3.11+ would take any): short ones are padded, long ones (protobuf nanos) trimmed. Anything not a string is returned as it is."""
+    if not isinstance(s, str):
+        return s
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    return re.sub(r"\.(\d+)", lambda m: "." + m.group(1).ljust(6, "0")[:6], s)
+
+
 def _fromiso(s):
-    """datetime.fromisoformat, accepting a trailing Z and a fraction of more than 6 digits too (protobuf nanos): Python 3.10 (the README's floor)
-    rejects both, 3.11+ does not. Raises what fromisoformat raises."""
-    import re
+    """datetime.fromisoformat through _norm_iso, so a trailing Z and a fraction of any length parse on Python 3.10 (the README's floor) as on 3.11+.
+    Raises what fromisoformat raises."""
     from datetime import datetime
-    if isinstance(s, str):
-        if s.endswith(("Z", "z")):
-            s = s[:-1] + "+00:00"
-        s = re.sub(r"(\.\d{6})\d+", lambda m: m.group(1), s)
-    return datetime.fromisoformat(s)
+    return datetime.fromisoformat(_norm_iso(s))
 
 
 def parse_grok(j):
@@ -576,11 +581,10 @@ def claude_version(now, run=subprocess.run, which=shutil.which):
 
 def _iso(s):
     """A complete ISO 8601 timestamp -> epoch seconds; None for anything else."""
-    from datetime import datetime
     if not isinstance(s, str) or not COMPLETE_TS.fullmatch(s):
         return None
     try:
-        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+        return int(_fromiso(s).timestamp())
     except ValueError:
         return None
 
@@ -636,6 +640,8 @@ APP_SEATS = os.path.join(HOME, ".claude-app-seats")     # the desktop app's save
 SCOPE_HOLD = 7 * DAY        # a seat whose only token cannot read credits (a setup-token) is asked again after a week, not every 6 h
 NOTE_SCOPE = "Reset credits need a full Claude login (not a setup-token)"
 NOTE_APP_EXPIRED = "app login expired; open the app on this seat to refresh"
+NOTE_PENDING = "waiting for this seat's first usage probe"
+CREDITS_PENDING_RETRY = 15 * 60      # an app login whose organization is not recorded yet is asked again in 15 min, not after the 6 h read interval
 
 
 def app_login(label, run=subprocess.run):
@@ -733,14 +739,28 @@ def usable_grants(entry, kind, now):
     return sorted((g for g in gs if g["kind"] == kind), key=lambda g: (g["endsAt"] is None, g["endsAt"] or 0))
 
 
-def spend_grant(cache, seat, gid):
+def spend_grant(cache, seat, gid, now, claim_at=None):
     """Take one reset off grant `gid` in the provider cache's reading of `seat`, dropping the grant at 0: a confirmed claim spent it, and the next read (which
-    replaces the grants) may be refused by a hold. Without this the spent grant stays offered with its old count, and the next Apply would mint a new request id for it."""
+    replaces the grants) may be refused by a hold. Without this the spent grant stays offered with its old count, and the next Apply would mint a new request id for it.
+    `claim_at` is given for an `alreadyRedeemed` answer (the claim landed some time ago, possibly before the cached reading was taken): a reading taken after the
+    claim was made already shows the spend, so it is left as it is. A fresh `redeemed` passes none: the spend just happened, no reading can show it yet.
+    The reading's `nextId` (the grant its gate in usable_grants requires) goes with a grant that is dropped: left naming it, every other grant of the reading
+    would read as unusable until the next read. It moves to the grant the gate would pick next, the usable one that expires soonest (none last), and is
+    dropped when no usable grant is left."""
     e = (cache.get("credits") or {}).get(seat)
     if not isinstance(e, dict):
         return
+    if claim_at is not None and (e.get("ts") or 0) >= claim_at:
+        return
     e["grants"] = [dict(g, left=g["left"] - 1) if g.get("id") == gid else g for g in e.get("grants") or []]
     e["grants"] = [g for g in e["grants"] if g.get("id") != gid or g["left"] > 0]
+    if e.get("nextId") == gid and not any(g.get("id") == gid for g in e["grants"]):
+        live = sorted((g for g in e["grants"] if g.get("usable") and g["left"] > 0 and (g["endsAt"] is None or g["endsAt"] > now)),
+                      key=lambda g: (g["endsAt"] is None, g["endsAt"] or 0))
+        if live:
+            e["nextId"] = live[0]["id"]
+        else:
+            e.pop("nextId", None)
 
 
 def claude_org(label):
@@ -2094,7 +2114,7 @@ class Store:
     def credits_read(self, label, now, fetch=http_json, force=False, ver=None, login=app_login):
         """Read one Claude seat's reset credits into the provider cache (`credits`: {seat: {ts, eligible, grants, next, hold, note}}). `next` is claimed before the
         call, so a crash is not retried every sample; `hold` (429 and 401/403) is respected even by a forced read; "pending" (an app login whose organization is
-        not known yet) sets none. Returns the read's state, or None when it was skipped."""
+        not known yet) sets no hold but a short `next` (CREDITS_PENDING_RETRY) and a note. Returns the read's state, or None when it was skipped."""
         with self.lock, pcache_txn() as cache:
             e = cache.setdefault("credits", {}).setdefault(label, {})
             if now < (e.get("hold") or 0) or (not force and now < (e.get("next") or 0)):
@@ -2116,7 +2136,11 @@ class Store:
                 e["note"] = {"rl": "rate limited", "auth": "sign-in needed", "scope": NOTE_SCOPE}[state]
             elif state == "expired":
                 e["note"] = NOTE_APP_EXPIRED
-            # "pending": no hold and no note; the next read (the normal retry, or a Refresh) asks again, by when a probe has recorded the organization
+            elif state == "pending":
+                # No hold, but not the 6 h wait either: the organization is recorded by the seat's next usage probe (the rotator's own, or the dashboard's Refresh,
+                # which runs claude-cli-account.ps1 --status). Refresh does not read credits itself: the sampler's credits_tick does, once `next` is due.
+                e["next"] = int(now + CREDITS_PENDING_RETRY)
+                e["note"] = NOTE_PENDING
         return state
 
     def credits_tick(self, now, fetch=http_json, cfg=None, labels=None):
@@ -2261,7 +2285,8 @@ class Store:
         """Apply one banked Claude reset of `kind` on `seat` (the caller holds `refreshing`), then re-read that seat's credits. The grant is picked here, from
         the last reading, never taken from the page. The claim (grant id + request id) is saved per seat and kind before the call and kept while the outcome
         is unconfirmed; until it settles, every click resends that same claim, even when a later reading no longer lists its grant (a lost answer to a
-        claim that landed), so a retry can never spend a second grant. A confirmed reset also takes its grant off the cached reading at once (spend_grant). `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
+        claim that landed), so a retry can never spend a second grant. A confirmed reset also takes its grant off the cached reading at once (spend_grant; for an
+        `alreadyRedeemed` answer only when that reading is older than the claim). `resend_rid` (the page's "Resend pending" dialog) asks for that claim only:
         settled meanwhile (by another window), it is refused, never a new claim. Returns {"outcome", "text"}."""
         now = time.time()
         with self.lock, pcache_txn() as cache:
@@ -2278,7 +2303,7 @@ class Store:
                 resend = bool(old and old.get("id"))
                 claims[key] = {"id": old["id"] if old and old.get("id") else (new_id or (lambda: secrets.token_urlsafe(16)))(), "gid": gs[0]["id"], "at": int(now)}
             cache["credits_claims"] = claims
-            gid, rid = claims[key]["gid"], claims[key]["id"]
+            gid, rid, claim_at = claims[key]["gid"], claims[key]["id"], claims[key].get("at")
         res, settled = consume_reset(seat, kind, gid, rid, fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
         keep = settled is False or (settled is None and resend)    # a refusal of the resend proves nothing about the earlier claim
         applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], " (unconfirmed)" if settled is False else " (refused; the earlier claim is kept)" if keep else ""))
@@ -2286,19 +2311,24 @@ class Store:
             with self.lock, pcache_txn() as cache:
                 (cache.get("credits_claims") or {}).pop(key, None)
                 if settled and res["outcome"] in ("redeemed", "alreadyRedeemed"):
-                    spend_grant(cache, seat, gid)        # the follow-up read below is refused while the seat is held (429 / sign-in / scope): the page must not offer the spent grant again meanwhile
+                    spend_grant(cache, seat, gid, now, claim_at if res["outcome"] == "alreadyRedeemed" else None)        # the follow-up read below is refused while the seat is held (429 / sign-in / scope): the page must not offer the spent grant again meanwhile
         self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
         with self.lock:
             self.rebuild(time.time())
         return res
 
-    def claude_reset_clear(self, seat, kind):
+    def claude_reset_clear(self, seat, kind, rid):
         """Drop a pending Claude claim (seat + kind) by hand (the caller holds `refreshing`): a resend of it never got an answer Claude recognises, so it would stay
-        pending, and resent, forever. The user checked that the reset was not used. The next Apply then starts a new claim with a new request id."""
+        pending, and resent, forever. The user checked that the reset was not used. The next Apply then starts a new claim with a new request id. `rid` is the
+        claim the page showed: when the pending claim has changed meanwhile (settled, or replaced by a new one) it is refused and left alone, as `claude_reset` does."""
         key = seat + ":" + kind
         with self.lock:
             with pcache_txn() as c:
-                had = (c.get("credits_claims") or {}).pop(key, None) is not None
+                claims = c.get("credits_claims") or {}
+                cur = claims.get(key)
+                if isinstance(cur, dict) and cur.get("id") != rid:
+                    return {"outcome": "error", "text": "That pending reset changed; reload to see it."}
+                had = claims.pop(key, None) is not None
             if had:
                 applog("claude reset: seat %s %s pending claim cleared by hand" % (seat, kind))
                 self.rebuild(time.time())
@@ -2480,15 +2510,15 @@ def make_handler(store, port):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else {}
-                seat, kind = b.get("seat"), b.get("kind")
+                seat, kind, rid = b.get("seat"), b.get("kind"), b.get("requestId")
             except (ValueError, AttributeError):
-                seat = kind = None
-            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS:
+                seat = kind = rid = None
+            if not valid_seat(seat, token_seats()) or not isinstance(kind, str) or kind not in RESET_KINDS or not isinstance(rid, str):
                 return self.js(400, {"outcome": "error", "text": "Unknown Claude seat or reset kind."})
             if not store.refreshing.acquire(blocking=False):
                 return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
             try:
-                self.js(200, store.claude_reset_clear(seat, kind))
+                self.js(200, store.claude_reset_clear(seat, kind, rid))
             except Exception as e:   # shortcut: same broad catch as refresh
                 applog("claude reset clear error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"outcome": "error", "text": "Could not clear it: %s." % type(e).__name__})
@@ -2941,6 +2971,12 @@ def selftest():
         assert got_["w"] == 0.35 and got_["ts"] == T_ and got_["banked"] == 0 and got_["bankedList"] == [], got_
         # Z-suffixed timestamps parse on every Python 3.10+ (3.10's fromisoformat rejects the Z)
         assert _fromiso("2026-11-12T20:15:30Z") == _fromiso("2026-11-12T20:15:30+00:00") and _fromiso("2026-11-12T20:15:30.123z").microsecond == 123000 and _fromiso("2026-11-12T20:15:30.123456789Z").microsecond == 123456
+        # a fraction of any length reads the same on Python 3.10: short ones are padded, long ones trimmed; _iso (the cedar ends_at) goes through the same reader
+        assert [_norm_iso(x) for x in ("2026-11-12T20:15:30.5Z", "2026-11-12T20:15:30.12345Z", "2026-11-12T20:15:30.123456789Z", "2026-11-12T20:15:30Z", "2026-11-12T20:15:30.5-05:00")] == [
+            "2026-11-12T20:15:30.500000+00:00", "2026-11-12T20:15:30.123450+00:00", "2026-11-12T20:15:30.123456+00:00", "2026-11-12T20:15:30+00:00", "2026-11-12T20:15:30.500000-05:00"] and _norm_iso(7) == 7
+        assert _fromiso("2026-11-12T20:15:30.5Z").microsecond == 500000 and _fromiso("2026-11-12T20:15:30.12345Z").microsecond == 123450 and _fromiso("2026-11-12T20:15:30.5+02:00").microsecond == 500000
+        assert _iso("2026-11-12T20:15:30.5Z") == _iso("2026-11-12T20:15:30Z") == _iso("2026-11-12T20:15:30.12345Z") == _iso("2026-11-12T20:15:30.123456789Z") == int(_fromiso("2026-11-12T20:15:30Z").timestamp())
+        assert _iso("2026-11-12T20:15:30.5Z") is not None and _iso("nonsense") is None
         assert parse_grok({"config": {"currentPeriod": {"start": "2026-11-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}, "creditUsagePercent": 5}})["w"] == 0.05
         # no seats folder: read_claude gives no Claude data instead of raising, so the other providers are still sampled
         keep_root_ = ROOT
@@ -3680,15 +3716,18 @@ def selftest():
                 assert r_.returncode == 0 and b"app-login-token selftest: ok" in r_.stdout, r_.stdout[-400:]
         finally:
             globals()["APP_SEATS"] = keep_as
-        # a seat with an app login but no known organization: the credit read sends nothing (no setup-token fallback), sets no hold and no note, and
-        # asks again on the normal retry, which works once the organization is recorded
+        # a seat with an app login but no known organization: the credit read sends nothing (no setup-token fallback), sets no hold, a short retry and a
+        # note, and works once the organization is recorded (the next read after that clears the note)
         pend_ = lambda l: ("pending", None)
         assert seat_token("E", pend_) == (None, "pending") and read_credits("E", JN, lambda req: 1 / 0, None, pend_) == ("pending", None)
         n_ = len(calls)
         assert st.credits_read("E", JN + 60 * CREDITS_EVERY, fx, force=True, login=pend_) == "pending" and len(calls) == n_
         ee_ = load_pcache()["credits"]["E"]
-        assert "hold" not in ee_ and "note" not in ee_, ee_
+        assert "hold" not in ee_ and ee_["note"] == NOTE_PENDING and ee_["next"] == JN + 60 * CREDITS_EVERY + CREDITS_PENDING_RETRY < JN + 60 * CREDITS_EVERY + CREDITS_EVERY, ee_
+        assert st.credits_read("E", JN + 60 * CREDITS_EVERY + 1, fx, login=pend_) is None and len(calls) == n_                  # not asked again before the short retry
+        assert st.credits_read("E", JN + 60 * CREDITS_EVERY + CREDITS_PENDING_RETRY, fx, login=pend_) == "pending"                      # ... but due again after it
         assert st.credits_read("E", JN + 60 * CREDITS_EVERY + 1, fx, force=True, login=lambda l: ("ok", "secret-appE")) == "ok" and calls[-1][1] == "Bearer secret-appE"
+        assert "note" not in load_pcache()["credits"]["E"]                                                                     # a later ok read clears the note
         n_ = len(calls)
         off = os.path.join(jd, "off.json")
         open(off, "w").write('{"claudeResetCredits": false}')
@@ -3799,12 +3838,42 @@ def selftest():
         post.append(TimeoutError("t"))
         ks.claude_reset("A", "fable", kf, hid_)
         assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2]
+        # spend_grant, an `alreadyRedeemed` answer (claim_at given): a reading taken at or after the claim already shows the spend and is left alone, an older one is decremented
+        sgc_ = lambda **kw: {"credits": {"A": dict(ke, **kw)}}
+        for ts_, spent_ in ((KN - 10, True), (KN - 5, False), (KN, False)):
+            c_ = sgc_(ts=ts_)
+            spend_grant(c_, "A", "g2", KN, KN - 5)
+            assert (not any(g["id"] == "g2" for g in c_["credits"]["A"]["grants"])) is spent_, (ts_, c_)
+        c_ = sgc_(ts=KN - 10)
+        spend_grant(c_, "A", "g2", KN)                                                               # a fresh `redeemed` (no claim_at) always decrements, whatever the reading's age
+        assert not any(g["id"] == "g2" for g in c_["credits"]["A"]["grants"])
+        # spend_grant, the next-grant gate: spending the grant the reading names as `nextId` down to 0 must not make every other kind unusable until the next read
+        c_ = sgc_()
+        spend_grant(c_, "A", "g1", KN)
+        assert c_["credits"]["A"]["nextId"] == "g1" and [g["left"] for g in c_["credits"]["A"]["grants"] if g["id"] == "g1"] == [1]        # one left: still the next grant
+        spend_grant(c_, "A", "g1", KN)
+        assert not any(g["id"] == "g1" for g in c_["credits"]["A"]["grants"]) and c_["credits"]["A"]["nextId"] == "g2"                      # gone: the soonest usable one is next
+        assert [g["id"] for g in usable_grants(c_["credits"]["A"], "full", KN)] == ["g2", "g11"] and [g["id"] for g in usable_grants(c_["credits"]["A"], "session", KN)] == ["g9", "g10"]
+        c_ = sgc_(grants=[g for g in ke["grants"] if g["id"] == "g1"])
+        spend_grant(c_, "A", "g1", KN), spend_grant(c_, "A", "g1", KN)
+        assert c_["credits"]["A"]["grants"] == [] and "nextId" not in c_["credits"]["A"]                                                    # nothing left to be next
+        c_ = sgc_()
+        spend_grant(c_, "A", "g2", KN)
+        assert c_["credits"]["A"]["nextId"] == "g1"                                                  # another grant's spend leaves the next grant alone
+        # ... and through claude_reset (a hold keeps the follow-up read from replacing the grants): an alreadyRedeemed resend spends only an older reading
+        for ts_, left_ in ((KN - 200, []), (KN, [1])):
+            save_pcache({"credits": {"A": dict(ke, ts=ts_, hold=hold_)}, "credits_claims": {"A:full": {"id": "ridN", "gid": "g2", "at": KN - 100}}})
+            post.append((200, {"result": "already_used"}))
+            assert ks.claude_reset("A", "full", kf, hid_)["outcome"] == "alreadyRedeemed"
+            assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g2"] == left_, (ts_, load_pcache()["credits"]["A"]["grants"])
         # a pending claim that never settles is cleared by hand (and only that seat and kind)
         save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:full": {"id": "ridP", "gid": "g2", "at": 1}, "A:fable": {"id": "ridF", "gid": "g1", "at": 1}}})
-        assert ks.claude_reset_clear("A", "full") == {"outcome": "ok", "text": "Cleared the pending full reset on seat A."}
+        assert ks.claude_reset_clear("A", "full", "ridOld") == {"outcome": "error", "text": "That pending reset changed; reload to see it."}      # not the claim the page showed
+        assert sorted(load_pcache()["credits_claims"]) == ["A:fable", "A:full"] and load_pcache()["credits_claims"]["A:full"]["id"] == "ridP"       # ... so it is left alone
+        assert ks.claude_reset_clear("A", "full", "ridP") == {"outcome": "ok", "text": "Cleared the pending full reset on seat A."}
         assert list(load_pcache()["credits_claims"]) == ["A:fable"] and "pending claim cleared by hand" in open(APPLOG).read()
-        assert ks.claude_reset_clear("A", "full") == {"outcome": "error", "text": "Seat A has no pending full reset to clear."}
-        assert ks.claude_reset_clear("B", "fable")["outcome"] == "error" and list(load_pcache()["credits_claims"]) == ["A:fable"]
+        assert ks.claude_reset_clear("A", "full", "ridP") == {"outcome": "error", "text": "Seat A has no pending full reset to clear."}
+        assert ks.claude_reset_clear("B", "fable", "ridF")["outcome"] == "error" and list(load_pcache()["credits_claims"]) == ["A:fable"]
         save_pcache({"credits": {"A": dict(ke)}})
         # an unconfirmed claim keeps its request id; the retry of the same grant reuses it; a settled answer drops it
         save_pcache({"credits": {"A": dict(ke)}})
@@ -3971,21 +4040,22 @@ def selftest():
             finally:
                 globals()["codex_homes"] = keep_ch
             # the hand clear of a pending Claude claim: the same guards (origin header, loopback host, body size), a known seat and kind, single flight
-            hs.claude_reset_clear = lambda seat, kind: (hc.append(("cclear", seat, kind)), {"outcome": "ok", "text": "c"})[1]
+            hs.claude_reset_clear = lambda seat, kind, rid: (hc.append(("cclear", seat, kind, rid)), {"outcome": "ok", "text": "c"})[1]
             cc_, n_ = "/api/claude-reset-clear", len(hc)
-            assert hp(ok_, path=cc_, app=None)[0] == 403 and hp(ok_, host="evil.example:%d" % port, path=cc_)[0] == 403 and hp(ok_, path=cc_, app="0")[0] == 403
-            for bad in ({"seat": "Z", "kind": "fable"}, {"seat": "A/../B", "kind": "fable"}, {"seat": "A", "kind": "other"}, {"seat": "A", "kind": ["fable"]}, {"seat": "A"},
+            okc_ = dict(ok_, requestId="rid1")                       # a clear names the claim the page showed
+            assert hp(okc_, path=cc_, app=None)[0] == 403 and hp(okc_, host="evil.example:%d" % port, path=cc_)[0] == 403 and hp(okc_, path=cc_, app="0")[0] == 403
+            for bad in ({"seat": "Z", "kind": "fable"}, {"seat": "A/../B", "kind": "fable"}, {"seat": "A", "kind": "other"}, {"seat": "A", "kind": ["fable"]}, {"seat": "A"}, ok_, dict(okc_, requestId=5), dict(okc_, requestId=None),
                         {"seat": "A", "kind": "fable", "pad": "x" * 1100}, ["A"], b"not json", b""):
                 assert hp(bad, path=cc_)[0] == 400, bad
             hs.refreshing.acquire()
-            assert hp(ok_, path=cc_)[0] == 409
+            assert hp(okc_, path=cc_)[0] == 409
             hs.refreshing.release()
             assert len(hc) == n_
-            st_, body_ = hp(ok_, path=cc_)
+            st_, body_ = hp(okc_, path=cc_)
             end_ = time.time() + 5
             while hs.refreshing.locked() and time.time() < end_:
                 time.sleep(0.02)
-            assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("cclear", "A", "fable") and not hs.refreshing.locked()
+            assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("cclear", "A", "fable", "rid1") and not hs.refreshing.locked()
         finally:
             srv.shutdown()
             srv.server_close()

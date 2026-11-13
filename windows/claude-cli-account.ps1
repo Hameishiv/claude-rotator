@@ -273,20 +273,26 @@ function Resolve-ProbeCatalogModel {
 }
 
 # The installed CLI's version, read ONCE per script run (cached in $script:CliVersion) with a hard timeout: it used to be spawned on every probe with none, so a
-# hung `claude` froze every probe. Only the process started here is ever killed, and only by its pid. The fallback is for when `claude` is not runnable.
+# hung `claude` froze every probe. Only the process started here is ever killed (with the children it started), and only by its pid. The binary is the one the
+# `claude` wrapper runs, ~/.local/bin/claude.exe, when it exists, else whatever `claude` resolves to. The fallback is for when `claude` is not runnable.
 function Get-CliVersion {
+  param([string]$Preferred = (Join-Path $HOME '.local\bin\claude.exe'), [int]$TimeoutMs = 15000)      # both are test seams
   if ($script:CliVersion) { return $script:CliVersion }
   $v = ''
-  $exe = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($exe) {
+  $exePath = $Preferred
+  if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+    $found = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $exePath = if ($found) { $found.Source } else { '' }
+  }
+  if ($exePath) {
     $p = $null
     try {
-      $psi = [System.Diagnostics.ProcessStartInfo]::new($exe.Source, '--version')
+      $psi = [System.Diagnostics.ProcessStartInfo]::new($exePath, '--version')
       $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
       $p = [System.Diagnostics.Process]::Start($psi)
       $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()      # both drained, so a chatty stderr cannot fill its pipe and stall the wait
-      if ($p.WaitForExit(15000)) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
-      else { try { $p.Kill() } catch {} }                 # our own child, by handle: never by name
+      if ($p.WaitForExit($TimeoutMs)) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
+      else { try { $p.Kill($true) } catch { try { $p.Kill() } catch {} } }     # our own child and its tree, by handle: never by name (Kill($true) needs PowerShell 7; 5.1 kills the child only)
     } catch { $v = '' } finally { if ($p) { $p.Dispose() } }
   }
   if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = '2.1.322' }

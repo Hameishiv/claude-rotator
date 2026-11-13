@@ -281,12 +281,13 @@ assert.strictEqual(quotaShare(600, 600), 100);
     pair.openReset('claude', 'A', 'full'); await pair.doReset();
     pair.openReset('claude', 'A', 'fable'); await pair.doReset();
     assert.deepStrictEqual(sent, [['/api/claude-reset', { seat: 'A', kind: 'full', resend: true, requestId: 'r-1' }], ['/api/claude-reset', { seat: 'A', kind: 'fable' }]]);
-    // the hand clear of a pending Claude claim asks first (Cancel is the default), then names only the seat and kind: never a request id
+    // the hand clear of a pending Claude claim asks first (Cancel is the default), then names the claim the page showed (its request id), so a claim replaced meanwhile is refused
     pair.openClear('A', 'claude', 'full');
     assert.ok(dlg2.innerHTML.includes('Clear the pending full reset on seat A?') && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg2.innerHTML), dlg2.innerHTML);
     await pair.doReset();
     pair.openClear('A', 'claude', 'nonsense');                                    // an unknown kind opens nothing
-    assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full' }]);
+    pair.openClear('A', 'claude', 'fable');                                       // a kind with no pending claim in view opens nothing: there is no claim to name
+    assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full', requestId: 'r-1' }]);
     assert.strictEqual(sent.length, 3);
   })().catch(e => { console.error(e); process.exit(1); });
 }

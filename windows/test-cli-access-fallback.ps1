@@ -193,12 +193,25 @@ try {
   $env:PATH = $stubDir + [IO.Path]::PathSeparator + $env:PATH
   Set-Content -LiteralPath (Join-Path $stubDir 'claude.cmd') -Value "@echo off`r`necho 9.8.7 (Claude Code)" -Encoding ASCII
   $script:CliVersion = $null
-  Check 'the CLI version is the one `claude --version` prints' ((Get-CliVersion) -eq '9.8.7') (Get-CliVersion)
+  $noPref = Join-Path $stubDir 'no-such-claude.exe'      # the real ~/.local/bin/claude.exe, when this PC has one, must not decide the stub's test
+  Check 'the CLI version is the one `claude --version` prints' ((Get-CliVersion -Preferred $noPref) -eq '9.8.7') (Get-CliVersion -Preferred $noPref)
   Remove-Item (Join-Path $stubDir 'claude.cmd') -Force
   Check 'it is cached: a second call spawns nothing' ((Get-CliVersion) -eq '9.8.7')
   Set-Content -LiteralPath (Join-Path $stubDir 'claude.cmd') -Value "@echo off`r`necho not a version" -Encoding ASCII
   $script:CliVersion = $null
-  Check 'an unreadable version falls back to 2.1.322' ((Get-CliVersion) -eq '2.1.322') (Get-CliVersion)
+  Check 'an unreadable version falls back to 2.1.322' ((Get-CliVersion -Preferred $noPref) -eq '2.1.322') (Get-CliVersion -Preferred $noPref)
+  # ~/.local/bin/claude.exe (the `claude` wrapper's binary) is used in preference to the `claude` on PATH when it exists
+  $prefStub = Join-Path $stubDir 'claude-preferred.cmd'
+  Set-Content -LiteralPath $prefStub -Value "@echo off`r`necho 1.2.3 (Claude Code)" -Encoding ASCII
+  Set-Content -LiteralPath (Join-Path $stubDir 'claude.cmd') -Value "@echo off`r`necho 9.8.7 (Claude Code)" -Encoding ASCII
+  $script:CliVersion = $null
+  Check 'the preferred binary wins over the one on PATH' ((Get-CliVersion -Preferred $prefStub) -eq '1.2.3') (Get-CliVersion -Preferred $prefStub)
+  # a hung `claude --version` is killed at the timeout and the fallback used (a short timeout here; production waits 15 s)
+  Set-Content -LiteralPath $prefStub -Value "@echo off`r`nping -n 20 127.0.0.1 >nul`r`necho 1.2.3" -Encoding ASCII
+  $script:CliVersion = $null
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $hung = Get-CliVersion -Preferred $prefStub -TimeoutMs 1500
+  Check 'a hung claude --version times out to the fallback, quickly' ($hung -eq '2.1.322' -and $sw.Elapsed.TotalSeconds -lt 12) ('{0} after {1:n1}s' -f $hung, $sw.Elapsed.TotalSeconds)
 } finally { $env:PATH = $pathKeep; $script:CliVersion = '2.1.322' }      # the rest of the run never spawns the real CLI
 
 # --- active B is subscription-disabled; A is the best eligible seat and must be selected ---
