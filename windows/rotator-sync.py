@@ -166,20 +166,25 @@ def record(repo, live, ref, state, at=None):
 
 
 def roll_back(plan):
-    """Put back every file of a pull's plan [(dest, backup or None)]: a swapped one from its backup, an added one removed; its temp goes too.
-    A file not swapped yet has no backup and no new copy, so it is left as it is. -> the paths that could not be put back."""
-    bad = []
+    """Put back every file of a pull's plan [(dest, backup or None)] that was swapped (its .tmp-sync is gone): a replaced one from its backup,
+    which only exists once complete (written as .part, then renamed), an added one removed. A file not swapped is left as it is, so a backup
+    that died half-written never lands on an intact live file. Temps go too. -> (how many were put back, the paths that could not be)."""
+    done, bad = 0, []
     for dest, bak in reversed(plan):
+        swapped = not os.path.exists(dest + ".tmp-sync")
         try:
-            if bak and os.path.exists(bak):
+            if swapped and bak and os.path.exists(bak):
                 shutil.copy2(bak, dest)
-            elif not bak and os.path.exists(dest):
+                done += 1
+            elif swapped and not bak and os.path.exists(dest):
                 os.remove(dest)
+                done += 1
         except OSError:
             bad.append(dest)
-        with contextlib.suppress(OSError):
-            os.remove(dest + ".tmp-sync")
-    return bad
+        for junk in (dest + ".tmp-sync", "%s.part" % bak):
+            with contextlib.suppress(OSError):
+                os.remove(junk)
+    return done, bad
 
 
 def recover(state):
@@ -190,12 +195,11 @@ def recover(state):
         return
     try:
         with state_lock(jpath, wait=0):
-            plan = [tuple(e) for e in load_json(jpath).get("files") or []]
-            bad = roll_back(plan)
+            done, bad = roll_back([tuple(e) for e in load_json(jpath).get("files") or []])
             os.remove(jpath)
     except TimeoutError:
         return
-    sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (len(plan) - len(bad), "; restore by hand: " + ", ".join(bad) if bad else ""))
+    sys.stderr.write("rotator-sync: recovered an interrupted update: %d file(s) put back%s\n" % (done, "; restore by hand: " + ", ".join(bad) if bad else ""))
 
 
 def cmd_check(repo, live, ref, state, quiet):
@@ -247,11 +251,12 @@ def cmd_pull(repo, live, ref, state):
         try:
             for dest, bak in plan:
                 if bak:
-                    shutil.copy2(dest, bak)
+                    shutil.copy2(dest, bak + ".part")
+                    os.replace(bak + ".part", bak)      # a backup exists only once it is complete
                 os.replace(dest + ".tmp-sync", dest)
             err = None
         except OSError as e:
-            err, bad = e, roll_back(plan)
+            err, (_, bad) = e, roll_back(plan)
         with contextlib.suppress(OSError):
             os.remove(jpath)
     if err:
@@ -389,6 +394,19 @@ def selftest():
         finally:
             os.replace = real_replace
         check("a killed pull leaves its journal and a half-applied live", os.path.exists(state + ".pull-journal.json") and os.path.exists(os.path.join(live, "missing.txt")))
+        # a backup that died half-written never lands on an intact live file: only a swapped entry (no .tmp-sync left) is put back
+        rb = os.path.join(root, "rb")
+        os.makedirs(rb)
+        for name, part, final in (("p.py", True, False), ("q.py", False, True)):
+            write(os.path.join(rb, name), b"A" * 1000)
+            write(os.path.join(rb, name + ".tmp-sync"), b"new")                # not swapped yet
+            if part:
+                write(os.path.join(rb, name + ".bak-sync-X.part"), b"A" * 300)  # the backup copy died at 300 bytes
+            if final:
+                write(os.path.join(rb, name + ".bak-sync-X"), b"A" * 300)       # a truncated backup under its final name (the old copy)
+        got_ = roll_back([(os.path.join(rb, n), os.path.join(rb, n + ".bak-sync-X")) for n in ("p.py", "q.py")])
+        check("an unswapped entry is left intact, its temps removed, and not counted",
+              got_ == (0, []) and all(os.path.getsize(os.path.join(rb, n)) == 1000 for n in ("p.py", "q.py")) and sorted(os.listdir(rb)) == ["p.py", "q.py", "q.py.bak-sync-X"])
         import threading
         held_, go_ = threading.Event(), threading.Event()
 
