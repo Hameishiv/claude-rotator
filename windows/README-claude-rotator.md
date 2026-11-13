@@ -698,6 +698,13 @@ not shown. Gemini is readable only while the Antigravity app is open (the `agy` 
 A reading over 1 h old is shown in a muted warning colour in the `Read` column, over 3 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
 Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
 
+Seats are not all the same size (a Codex Pro seat holds several times a Plus seat's allowance), so each seat has a **weight**: how many regular seats it
+counts as. Set it in `rotator.local.json` (see `rotator.local.example.json`), per provider and seat letter, first match wins: `seatWeights`
+(`{"claude": {"A": 1}, "codex": {"B": 5}}`), then `planWeights` by the plan the provider reports for the seat (`{"codex": {"plus": 1, "pro": 5}}`; the plan name is
+matched without regard to case), then 1. There is no built-in plan table: the providers do not publish exact multipliers, so you state them. Only Codex
+reports a plan, as `plan_type` in its rollout logs (`~/.codex/**/sessions/**/rollout-*.jsonl`, read locally, nothing is sent anywhere; `auth.json` is never read);
+for the other providers set `seatWeights`. A seat with a weight other than 1 shows a small `×5` badge next to its letter in the account tables.
+
 ## Keeping the install in sync (`rotator-sync`)
 
 The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:

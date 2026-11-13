@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import statistics
 import struct
 import subprocess
 import sys
@@ -486,6 +487,47 @@ def sample(now, force=False):
     return rec
 
 
+# ---------------------------------------------------------------- seat weights
+
+WCFG = {}     # set by set_weights(): {"seat": {pid: {label: w}}, "plan": {pid: {plan: w}}, "plans": {pid: {label: plan as the provider reports it}}}
+
+
+def _wmap(x):
+    """{provider: {key: weight}} from a config value; only finite numbers >= 0 are kept."""
+    return {p: {str(k): float(v) for k, v in m.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < math.inf}
+            for p, m in (x.items() if isinstance(x, dict) else ()) if isinstance(m, dict)}
+
+
+def read_weights_cfg(cfg=None):
+    """seatWeights and planWeights from rotator.local.json (next to this script): {"seat": {...}, "plan": {...}}, empty when absent or unreadable."""
+    try:
+        with open(cfg or os.path.join(HERE, "rotator.local.json"), encoding="utf-8-sig") as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        j = None
+    j = j if isinstance(j, dict) else {}
+    return {"seat": _wmap(j.get("seatWeights")), "plan": _wmap(j.get("planWeights"))}
+
+
+def set_weights(w):
+    WCFG.clear()
+    WCFG.update(w or {})
+
+
+def wt(pid, label):
+    """(weight, source) of one seat, the weight counting it as that many regular seats: seatWeights, else planWeights for the seat's detected plan, else 1.
+    source is "seatWeights", "plan <name>" or None."""
+    v = ((WCFG.get("seat") or {}).get(pid) or {}).get(label)
+    if v is not None:
+        return v, "seatWeights"
+    plan = ((WCFG.get("plans") or {}).get(pid) or {}).get(label)
+    pw = (WCFG.get("plan") or {}).get(pid) or {}
+    v = pw.get(plan) if plan else None
+    if v is None and plan:
+        v = next((x for k, x in pw.items() if k.lower() == plan.lower()), None)
+    return (v, "plan " + plan) if v is not None else (1.0, None)
+
+
 # ---------------------------------------------------------------- history maths
 
 def util_at(seat, key, t):
@@ -695,6 +737,12 @@ def build_provider(hist, pid, emails, now, extra):
         a["ok"] = a["ok"] and bool(a["windows"])
         a["badges"] = [BADGE[k] for k, v in use.items() if v == label]
         bs = next((x for x in (seats_of(h, pid).get(label) or {} for h in reversed(hist)) if x.get("banked") is not None), {})   # imported log records carry no credits
+        w, wsrc = wt(pid, label)
+        if w != 1:
+            a["w"], a["wsrc"] = w, wsrc
+        plan = ((WCFG.get("plans") or {}).get(pid) or {}).get(label)
+        if plan:
+            a["plan"] = plan
         if bs:                              # a credit past its expiry is gone, even if the cache is older than that
             live = [x for x in bs.get("bankedList") or [] if x["expiresAt"] > now]
             a["banked"], a["bankedList"] = max(bs["banked"] - (len(bs.get("bankedList") or []) - len(live)), len(live)), live
@@ -715,6 +763,7 @@ def build_provider(hist, pid, emails, now, extra):
 
 def build(hist, now, emails=None, app=False, extra=None):
     extra = extra or {}
+    set_weights(extra.get("weights"))
     provs = [p for p in (build_provider(hist, pid, emails or {}, now, extra) for pid in PROVIDERS) if p]
     out = {"now": int(now), "app": app, "first": hist[0]["t"] if hist else None, "providers": provs}
     d = extra.get("drift")
@@ -810,13 +859,14 @@ def load_emails():
 
 def load_extra():
     """What build() takes besides history and emails: account/provider notes from the provider cache, the rotator drift file."""
-    c, drift = load_pcache(), None
+    c, drift, plans = load_pcache(), None, codex_measure()[0]
     try:
         with open(os.path.join(ROOT, ".rotator-drift.json"), encoding="utf-8-sig") as fh:
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use()}
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(),
+            "weights": dict(read_weights_cfg(), plans={"codex": plans})}
 
 
 def load():
@@ -981,6 +1031,103 @@ def import_rollouts(hist, now, rebuilt, since=0, cdir=None):
         n, first = per.get(seat, (0, t))
         per[seat] = (n + 1, min(first, t))
     return rollout_records(ev, {h["t"] // BUCKET5 for h in hist if "codex" in h}, rebuilt), per
+
+
+_ROLL = {}      # rollout path -> ((mtime, size), parsed events): a log is parsed again only when it changed
+
+
+def rollout_tokens(path):
+    """[(t, plan_type or None, weekly used %, weekly reset, tokens so far or None)] for each usable token_count line of one rollout log.
+    Tokens are input minus cached input plus output (total_token_usage is cumulative over the session), so cached input, which costs next to nothing, does not count."""
+    from datetime import datetime
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    j = json.loads(line)
+                    p = j["payload"]
+                    rl = p["rate_limits"] if p["type"] == "token_count" else None
+                    t = datetime.fromisoformat(j["timestamp"]).timestamp()
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
+                    continue
+                used = reset = tok = None
+                for part in ("primary", "secondary"):
+                    x = rl.get(part)
+                    if isinstance(x, dict) and int(_f(x.get("window_minutes")) or 0) == 10080:
+                        used, reset = _f(x.get("used_percent")), _f(x.get("resets_at"))
+                info = p.get("info")
+                u = info.get("total_token_usage") if isinstance(info, dict) else None
+                if isinstance(u, dict) and _f(u.get("input_tokens")) is not None and _f(u.get("output_tokens")) is not None:
+                    tok = _f(u["input_tokens"]) - (_f(u.get("cached_input_tokens")) or 0) + _f(u["output_tokens"])
+                out.append((int(t), rl["plan_type"] if isinstance(rl.get("plan_type"), str) else None, used, reset, tok))
+    except OSError:
+        pass
+    return out
+
+
+def rollout_cached(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = (st.st_mtime, st.st_size)
+    if path not in _ROLL or _ROLL[path][0] != key:
+        _ROLL[path] = (key, rollout_tokens(path))
+    return _ROLL[path][1]
+
+
+def token_pairs(events):
+    """[(t, tokens per 1 %)] from one log's events: from an anchor event to the next one whose weekly used % is at least 1 higher in the same window
+    (resets within SLOP s of each other); that event becomes the anchor. Whole-percent readings tick only now and then, so the tokens between two ticks,
+    not between two adjacent events, are what a percent costs. A new window or a token counter that went back starts over."""
+    out, a = [], None
+    for t, _, used, reset, tok in events:
+        if used is None or reset is None or tok is None:
+            continue
+        if a is None or abs(reset - a[3]) > SLOP or used < a[1] or tok < a[2]:
+            a = (t, used, tok, reset)
+        elif used - a[1] >= 1:
+            if tok > a[2]:
+                out.append((t, (tok - a[2]) / (used - a[1])))
+            a = (t, used, tok, reset)
+    return out
+
+
+def codex_measure(cdir=None, now=None):
+    """({seat: plan_type}, {seat: [(t, tokens per 1 % of weekly use)]}) from the rollout logs. A home's log belongs to that seat; an active-login event to the one
+    seat whose known weekly reset (the caches', and the homes' events') is within SLOP s of its own (none or several: skipped), as codex_events does.
+    The plan is the newest event's plan_type."""
+    cdir, now = cdir or os.path.join(HOME, ".codex"), now or time.time()
+    files, known, sink = rollout_files(cdir, now, 0), {}, []
+    read_codex(cdir, sink)
+    for label, c in sink:
+        seat, _ = parse_codex(c)
+        if seat and seat.get("wr"):
+            known.setdefault(int(seat["wr"]), set()).add(label)
+    chunks = [(seat, rollout_cached(f)) for f, seat in files if seat]
+    for seat, ev in chunks:
+        for e in ev:
+            if e[3]:
+                known.setdefault(int(e[3]), set()).add(seat)
+    for f, seat in files:
+        by = {}
+        for e in ([] if seat else rollout_cached(f)):
+            ss = {s for kr, x in known.items() if e[3] and abs(kr - e[3]) <= SLOP for s in x}
+            if len(ss) == 1:
+                by.setdefault(ss.pop(), []).append(e)
+        chunks += by.items()
+    plans, newest, pairs = {}, {}, {}
+    for seat, ev in chunks:
+        for t, plan, *_ in ev:
+            if plan and t >= newest.get(seat, 0):
+                plans[seat], newest[seat] = plan, t
+        pairs.setdefault(seat, []).extend(token_pairs(ev))
+    return plans, pairs
 
 
 # ---------------------------------------------------------------- backfill from .rotate-log.txt
@@ -1922,6 +2069,35 @@ def selftest():
         __import__("shutil").rmtree(rd, ignore_errors=True)
     assert stale["limits"][0]["burn"] == {"1": None, "3": None, "6": None, "24": None} and stale["limits"][0]["drain"]["1"] == []
     assert build([], L)["providers"] == [] and build([], L)["first"] is None
+    # F: seat weights (seatWeights, then planWeights by the detected plan, then 1) and Codex plan detection from the rollout logs
+    def tk(t, used, reset, inp, cached, out, plan="team"):
+        return json.dumps({"timestamp": iso(t), "type": "event_msg", "payload": {"type": "token_count",
+                           "info": {"total_token_usage": {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}},
+                           "rate_limits": {"limit_id": "codex", "plan_type": plan, "primary": {"used_percent": used, "window_minutes": 10080, "resets_at": reset}, "secondary": None}}})
+    WA, WB = N + 400_000, N + 500_000
+    with tempfile.TemporaryDirectory() as td:
+        for lab in "AB":
+            os.makedirs(os.path.join(td, "homes", lab))
+        roll(os.path.join(td, "homes", "A", "sessions", "rollout-a.jsonl"), [tk(N - 5000, 10, WA, 100, 0, 0, "team")], N - 100)
+        roll(os.path.join(td, "homes", "B", "sessions", "rollout-b.jsonl"), [tk(N - 4000, 40, WB, 100, 0, 0, "pro")], N - 100)
+        roll(os.path.join(td, "sessions", "rollout-act.jsonl"), [tk(N - 3000, 11, WA + 30, 1, 0, 0, "team"), tk(N - 2000, 3, N + 777, 1, 0, 0, "ghost")], N - 100)
+        plans = codex_measure(td, N)[0]
+        assert plans == {"A": "team", "B": "pro"}, plans       # the active-login event is A's by its reset; the one matching nobody is skipped
+        cfgp = os.path.join(td, "cfg.json")
+        json.dump({"seatWeights": {"codex": {"B": 5, "X": -1, "Y": "5", "Z": True}, "claude": {"A": 0.5}}, "planWeights": {"codex": {"Pro": 3, "team": 1}}, "junk": 1}, open(cfgp, "w"))
+        c = read_weights_cfg(cfgp)
+        assert c == {"seat": {"codex": {"B": 5.0}, "claude": {"A": 0.5}}, "plan": {"codex": {"Pro": 3.0, "team": 1.0}}}, c      # negative, string and bool weights are dropped
+        assert read_weights_cfg(os.path.join(td, "none.json")) == {"seat": {}, "plan": {}}
+        set_weights(dict(c, plans={"codex": plans}))
+        assert wt("codex", "B") == (5.0, "seatWeights") and wt("codex", "A") == (1.0, "plan team")      # a seat's own weight beats its plan's
+        assert wt("claude", "A") == (0.5, "seatWeights") and wt("claude", "Z") == (1.0, None) and wt("grok", "q") == (1.0, None)
+        assert wt("codex", "B") == (5.0, "seatWeights") and WCFG["plan"]["codex"]["Pro"] == 3.0
+        set_weights(dict(c, seat={}, plans={"codex": plans}))
+        assert wt("codex", "B") == (3.0, "plan pro")           # plan names match without regard to case
+        ch = [{"t": N, "codex": {s: {"w": .2, "wr": N + 9999, "wp": WEEK, "ts": N} for s in "AB"}}]
+        acc = build(ch, N, {}, False, {"weights": dict(c, seat={}, plans={"codex": plans})})["providers"][0]["accounts"]
+        assert "w" not in acc[0] and acc[0]["plan"] == "team" and acc[1]["w"] == 3.0 and acc[1]["wsrc"] == "plan pro" and acc[1]["plan"] == "pro", acc
+        assert "w" not in build(ch, N, {}, False, {})["providers"][0]["accounts"][1]       # no extra: weights reset to 1
     # the page keeps both placeholders from being re-scanned and escapes </
     assert "</" not in json.dumps({"x": "</script>"}, separators=(",", ":")).replace("</", "<\\/")
     # icons: a valid PNG signature and an ICO header

@@ -2,5 +2,9 @@
   "heartbeatRepo": "your-org/claude-config-backup",
   "hostId": "my-laptop",
   "repoClone": "C:\\path\\to\\your\\claude-rotator-clone",
-  "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py"
+  "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py",
+  "_seatWeights": "How many regular seats each seat counts as in the usage dashboard's pooled numbers (default 1; 0 leaves a seat out). Per provider (claude, codex, grok, gemini), by seat letter. Wins over planWeights.",
+  "seatWeights": { "claude": { "A": 1 }, "codex": { "B": 5 } },
+  "_planWeights": "Same, by the plan the provider reports for the seat (Codex only today: shown in the dashboard's Codex table). Providers do not publish exact multipliers, so you state them.",
+  "planWeights": { "codex": { "plus": 1, "pro": 5 } }
 }
