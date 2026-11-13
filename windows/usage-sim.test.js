@@ -302,6 +302,10 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const bad = /C:[\\/]+Dev[\\/]+Rotators|hameishiv-wiki|C:[\\/]+Dev[\\/]+hameishiv|skills[\\/]+merge-pr[\\/]+scripts[\\/]+codex_redeem/i;
   const hits = files.filter(f => !/test-rotate-projection\.ps1$|usage-sim\.test\.js$/.test(f) && bad.test(fs.readFileSync(f, 'utf8'))).map(f => path.relative(root, f));
   assert.deepStrictEqual(hits, []);
+  // the relaunch test lowers itself to Idle before it starts any child (owner rule: every run and test at Idle)
+  const rl = fs.readFileSync(path.join(__dirname, 'test-app-relaunch.ps1'), 'utf8'), body = rl.slice(rl.indexOf('#>'));
+  const idle = body.indexOf("(Get-Process -Id $PID).PriorityClass = 'Idle'");
+  assert.ok(idle > 0 && idle < body.search(/& pwsh|Start-Process|& \$script/));
   assert.ok(files.some(f => f.endsWith('check-rotate-hidden.vbs')) && /WScript\.ScriptFullName/.test(fs.readFileSync(path.join(__dirname, 'check-rotate-hidden.vbs'), 'utf8')));
 }
 console.log('usage-sim tests passed');

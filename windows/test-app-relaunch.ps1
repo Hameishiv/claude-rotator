@@ -8,6 +8,7 @@ the arg-parse cases run in a child pwsh that exits before any action.
   pwsh -NoProfile -File windows/test-app-relaunch.ps1
 #>
 $ErrorActionPreference = 'Stop'
+(Get-Process -Id $PID).PriorityClass = 'Idle'      # first: every child below (the arg-parse pwsh) inherits Idle
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
   if ($ok) { Write-Host "  PASS  $name" -ForegroundColor Green }

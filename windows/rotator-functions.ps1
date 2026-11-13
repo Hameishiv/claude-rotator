@@ -125,7 +125,12 @@ function claude-resume { pwsh -NoProfile -File (Join-Path $RotatorDir 'claude-re
 
 
 # rotator-sync: keep this folder identical to the repo (see README-claude-rotator.md, "Keeping the install in sync").
-function rotator-sync { py -3 (Join-Path $RotatorDir 'rotator-sync.py') @args }
+# It runs at Idle CPU priority from its first instruction: this shell drops to Idle while starting it (a child inherits an Idle
+# parent's class) and goes back to its own priority afterwards.
+function rotator-sync {
+    $me = Get-Process -Id $PID; $was = $me.PriorityClass
+    try { $me.PriorityClass = 'Idle'; py -3 (Join-Path $RotatorDir 'rotator-sync.py') @args } finally { $me.PriorityClass = $was }
+}
 
 # Machine-local functions (e.g. other tools' wrappers) live in a git-ignored file so this one can match the repo.
 $RotatorLocalFunctions = Join-Path $RotatorDir 'rotator-functions.local.ps1'

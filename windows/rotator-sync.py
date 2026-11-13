@@ -398,13 +398,43 @@ def selftest():
         th.join()
         st = load_json(state)
         check("an overlapping --check neither loses the other run's write nor its own result", st["fetched"] == 12345 and st["checked"] > 0 and st["ref"].startswith("HEAD "))
+        # Idle priority: from Normal, this script lowers itself; the profile's rotator-sync function starts it at Idle and its shell
+        # goes back to its own priority afterwards (a copy of the function runs a stand-in script that prints its own class)
+        if os.name == "nt":
+            probe = "import ctypes as c; k = c.WinDLL('kernel32'); k.GetCurrentProcess.restype = c.c_void_p; k.GetPriorityClass.argtypes = (c.c_void_p,); print(k.GetPriorityClass(k.GetCurrentProcess()))"
+            r = subprocess.run([sys.executable, "-c", "import importlib.util as u, sys; s = u.spec_from_file_location('rs', sys.argv[1]); m = u.module_from_spec(s); "
+                                "s.loader.exec_module(m); m.lower_priority(); " + probe.replace("import ctypes as c; ", "import ctypes as c; "), os.path.abspath(__file__)],
+                               capture_output=True, creationflags=0x20, timeout=60)           # NORMAL_PRIORITY_CLASS: Idle below is lower_priority's doing
+            check("rotator-sync lowers itself to Idle", r.stdout.split()[-1:] == [b"64"])
+            fdir = os.path.join(root, "fn")
+            os.makedirs(fdir)
+            shutil.copy2(os.path.join(HERE, "rotator-functions.ps1"), fdir)
+            write(os.path.join(fdir, "rotator-sync.py"), ("import sys\n" + probe.replace("; ", "\n") + "\nprint('|'.join(sys.argv[1:]))\n").encode())
+            ps = ("(Get-Process -Id $PID).PriorityClass = 'Normal'; . '%s'; rotator-sync --check 'a b'; "
+                  "'shell:' + (Get-Process -Id $PID).PriorityClass" % os.path.join(fdir, "rotator-functions.ps1"))
+            r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=120)
+            out = r.stdout.decode("utf-8", "replace").split()
+            check("the rotator-sync function starts it at Idle and keeps its arguments, and its shell goes back", out[:1] == ["64"]
+                  and "--check|a b" in r.stdout.decode("utf-8", "replace") and out[-1:] == ["shell:Normal"])
     finally:
         rmtree(root)
     print("rotator-sync selftest: all passed")
     return 0
 
 
+def lower_priority():
+    """This process at Idle CPU priority on Windows, before any work: git and every other child inherit it."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32")
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass(k.GetCurrentProcess(), 0x40)
+
+
 def main(argv=None):
+    lower_priority()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--check", action="store_true")
