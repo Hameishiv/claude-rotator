@@ -256,6 +256,8 @@ def cmd_pull(repo, live, ref, state):
 
 RESTART_FILES = ("usage-history.py", "usage-dashboard.template.html", "usage-sim.js")
 DASHBOARD_TASK = "Claude usage dashboard"           # the logon task usage-app-install.ps1 registers
+PROXY_FILES = ("claude-rotate-proxy.py", "rotator_access.py")   # the long-running proxy loads both at start
+PROXY_TASK = "Claude rotate proxy"
 
 
 def pull_locked(repo, live, ref, state, jpath):
@@ -311,6 +313,10 @@ def pull_locked(repo, live, ref, state, jpath):
         # the running dashboard server loaded the old script and template at start and keeps serving them
         print("rotator-sync: the usage dashboard's files changed; restart it so the running server picks them up "
               "(Task Scheduler task \"%s\", or: Stop-ScheduledTask / Start-ScheduledTask -TaskName '%s')" % (DASHBOARD_TASK, DASHBOARD_TASK))
+    if any(rel in PROXY_FILES for rel, _ in staged):
+        # the rotate proxy imported rotator_access.py at start; its task relaunches it within a minute once it is stopped
+        print("rotator-sync: the rotate proxy's files changed; stop the running proxy (Task Scheduler task \"%s\") and it is "
+              "relaunched with the new code within a minute" % PROXY_TASK)
     record(repo, live, ref, state, at)
     return 0
 

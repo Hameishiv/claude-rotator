@@ -16,7 +16,7 @@ the Codex CLI, the Grok CLI, the Antigravity app (Gemini).
 
 1. **Get the files.** Clone this repo. The folder you run from (the **rotator folder**) is the repo's `windows/` folder,
    or a copy of it anywhere you like. Run from the clone itself, updates come from `git pull`: `rotator-sync` is for a
-   separate copy and refuses to run inside the clone.
+   separate copy: inside the clone `--pull` is refused and `--check` reports no drift.
 2. **Load the shortcuts.** Add one line to your PowerShell profile (`notepad $PROFILE`), then open a new terminal:
    ```
    . "C:\path\to\rotator-folder\rotator-functions.ps1"
@@ -832,7 +832,8 @@ addresses removed; the action is also written to the app log, and the data is re
 
 The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:
 **edit on a repo branch, merge it, then run `rotator-sync --pull`.** A change made directly in the live
-folder shows as a difference until the repo has it; `--pull` replaces it (after a backup).
+folder shows as a difference until the repo has it; `--pull` replaces it (after a backup). Running straight from
+the clone's own `windows/` folder is the exception: there `git pull` updates the files and `--pull` is refused.
 
 Machine-specific values stay out of the scripts so the same file runs live and sits in the repo. Copy
 `rotator.local.example.json` to `rotator.local.json` (git-ignored) in the live folder and fill it in:

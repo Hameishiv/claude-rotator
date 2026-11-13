@@ -267,10 +267,14 @@ def read_codex(cdir=None, sink=None):
 
 
 def _fromiso(s):
-    """datetime.fromisoformat, accepting a trailing Z too: Python 3.10 (the README's floor) rejects it, 3.11+ does not. Raises what fromisoformat raises."""
+    """datetime.fromisoformat, accepting a trailing Z and a fraction of more than 6 digits too (protobuf nanos): Python 3.10 (the README's floor)
+    rejects both, 3.11+ does not. Raises what fromisoformat raises."""
+    import re
     from datetime import datetime
-    if isinstance(s, str) and s.endswith(("Z", "z")):
-        s = s[:-1] + "+00:00"
+    if isinstance(s, str):
+        if s.endswith(("Z", "z")):
+            s = s[:-1] + "+00:00"
+        s = re.sub(r"(\.\d{6})\d+", lambda m: m.group(1), s)
     return datetime.fromisoformat(s)
 
 
@@ -1546,7 +1550,6 @@ _ROLL = {}      # rollout path -> ((mtime, size), parsed events): a log is parse
 def rollout_tokens(path):
     """[(t, plan_type or None, weekly used %, weekly reset, tokens so far or None)] for each usable token_count line of one rollout log.
     Tokens are input minus cached input plus output (total_token_usage is cumulative over the session), so cached input, which costs next to nothing, does not count."""
-    from datetime import datetime
     out = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -2299,7 +2302,7 @@ class Store:
             if had:
                 applog("claude reset: seat %s %s pending claim cleared by hand" % (seat, kind))
                 self.rebuild(time.time())
-        return {"outcome": "ok", "text": "Cleared. Apply %s is back on seat %s." % (CREDIT_KINDS[kind].lower(), seat)} if had else \
+        return {"outcome": "ok", "text": "Cleared the pending %s on seat %s." % (CREDIT_KINDS[kind].lower(), seat)} if had else \
             {"outcome": "error", "text": "Seat %s has no pending %s to clear." % (seat, CREDIT_KINDS[kind].lower())}
 
 
@@ -2937,7 +2940,7 @@ def selftest():
         got_ = newest_codex({"t": N, "codex": {"A": {"ts": F_, "w": 0.32, "wr": N + WK_, "wp": WK_, "banked": 0, "bankedList": []}}}, hb_, nb_)["codex"]["A"]
         assert got_["w"] == 0.35 and got_["ts"] == T_ and got_["banked"] == 0 and got_["bankedList"] == [], got_
         # Z-suffixed timestamps parse on every Python 3.10+ (3.10's fromisoformat rejects the Z)
-        assert _fromiso("2026-11-12T20:15:30Z") == _fromiso("2026-11-12T20:15:30+00:00") and _fromiso("2026-11-12T20:15:30.123z").microsecond == 123000
+        assert _fromiso("2026-11-12T20:15:30Z") == _fromiso("2026-11-12T20:15:30+00:00") and _fromiso("2026-11-12T20:15:30.123z").microsecond == 123000 and _fromiso("2026-11-12T20:15:30.123456789Z").microsecond == 123456
         assert parse_grok({"config": {"currentPeriod": {"start": "2026-11-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}, "creditUsagePercent": 5}})["w"] == 0.05
         # no seats folder: read_claude gives no Claude data instead of raising, so the other providers are still sampled
         keep_root_ = ROOT
@@ -3798,7 +3801,7 @@ def selftest():
         assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2]
         # a pending claim that never settles is cleared by hand (and only that seat and kind)
         save_pcache({"credits": {"A": dict(ke)}, "credits_claims": {"A:full": {"id": "ridP", "gid": "g2", "at": 1}, "A:fable": {"id": "ridF", "gid": "g1", "at": 1}}})
-        assert ks.claude_reset_clear("A", "full") == {"outcome": "ok", "text": "Cleared. Apply full reset is back on seat A."}
+        assert ks.claude_reset_clear("A", "full") == {"outcome": "ok", "text": "Cleared the pending full reset on seat A."}
         assert list(load_pcache()["credits_claims"]) == ["A:fable"] and "pending claim cleared by hand" in open(APPLOG).read()
         assert ks.claude_reset_clear("A", "full") == {"outcome": "error", "text": "Seat A has no pending full reset to clear."}
         assert ks.claude_reset_clear("B", "fable")["outcome"] == "error" and list(load_pcache()["credits_claims"]) == ["A:fable"]
