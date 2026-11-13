@@ -415,14 +415,18 @@ function Prefetch-Usage {
   $fnText = ('Profile-TokenFile','ConvertTo-SanitizedNote','Test-SubscriptionDisabled','Get-AccessCode','Get-ErrorMessage','Get-AccessMarkerPath','Read-AccessDisabled','Write-AccessDisabled','Clear-AccessDisabled','New-AccessDisabledResult','New-ProbeUnknownResult','Resolve-ProbeCatalogModel','Probe-Usage','Get-UsageCached' |
     ForEach-Object { "function $_ {" + (Get-Command $_ -CommandType Function).Definition + "}" }) -join "`n"
   $work = @(foreach ($l in $Labels) { foreach ($mm in $models) { @{ l=$l; m=$mm.m; s=$mm.s } } })
-  $work | ForEach-Object -ThrottleLimit 12 -Parallel {
+  $memo = $work | ForEach-Object -ThrottleLimit 12 -Parallel {
     # Re-create what the probe needs inside the runspace: -Parallel starts a clean session,
     # so script-scope functions and variables are NOT inherited.
     $Root = $using:Root; $UsageTTL = $using:UsageTTL; $FableTTL = $using:FableTTL; $AccessCooldownSec = $using:AccessCooldownSec
     $script:UnknownProbeMemo = @{}
     . ([scriptblock]::Create($using:fnText))
     $null = Get-UsageCached $_.l $using:Refresh $_.m $_.s $false $using:HonorAccessCooldown
-  } | Out-Null
+    # A failed probe is memoized in this runspace only: hand it back, so the ranking below does not probe it again.
+    foreach ($k in @($script:UnknownProbeMemo.Keys)) { [pscustomobject]@{ k = $k; v = $script:UnknownProbeMemo[$k] } }
+  }
+  if (-not $script:UnknownProbeMemo) { $script:UnknownProbeMemo = @{} }
+  foreach ($m in @($memo)) { if ($m.k) { $script:UnknownProbeMemo[$m.k] = $m.v } }
 }
 
 function UsageBar { param([double]$frac, [int]$width=10)

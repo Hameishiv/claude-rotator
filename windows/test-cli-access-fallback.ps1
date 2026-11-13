@@ -232,6 +232,18 @@ Check 'network failure wrote no disabled markers' ($marked.Count -eq 0) ("count=
 $health = Get-Content (Join-Path $Root '.seat-health.json') -Raw | ConvertFrom-Json
 Check 'network failure is not reported as an access refusal' ($health.ok -eq $true -and $health.reason -eq 'probe_transient') "$($health.ok) $($health.reason)"
 
+# --- the real parallel prefetch: failures in the workers reach this process's memo, so they are not probed again ---
+# Probe-Usage itself is replaced (the workers copy its definition), so nothing can reach the network.
+Reset-Case
+$origProbe = ${function:Probe-Usage}
+function Probe-Usage { param([string]$Label, [string]$Model) <# MOCK-NO-NETWORK #> [pscustomobject]@{ label=$Label; ok=$false; access='unknown'; http=$null; code=$null; note='probe failed: network (mock)' } }
+if ((Get-Command Probe-Usage -CommandType Function).Definition -notmatch 'MOCK-NO-NETWORK') { Write-Host 'ABORT: Probe-Usage is not the mock' -ForegroundColor Red; exit 2 }
+$env:CLAUDE_ROTATOR_SELFTEST = '0'
+try { Prefetch-Usage @('A','B') $true $true $true } finally { $env:CLAUDE_ROTATOR_SELFTEST = '1'; ${function:Probe-Usage} = $origProbe }
+$memoKeys = @($script:UnknownProbeMemo.Keys | Sort-Object)
+Check 'parallel probe failures land in the caller memo' (($memoKeys -join ',') -eq 'A|,A|-fable,B|,B|-fable') ($memoKeys -join ',')
+Check 'Probe-Usage is the real one again' ((Get-Command Probe-Usage -CommandType Function).Definition -notmatch 'MOCK-NO-NETWORK')
+
 # --- disabled active, everyone else unreachable: one fallback, no extra markers ---
 Reset-Case
 Clear-AppIdentity
