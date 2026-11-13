@@ -100,7 +100,7 @@ const now = 1000000, far = now + 30 * 86400, W = 7 * 86400;
   assert.ok(line({ ratio: { x: 1, n: 8 } }).includes('×1 (8 samples)'));
   // under the seat name: email, then plan (underscores read as spaces), then the measured line
   assert.strictEqual(quotaSeat({ label: 'B', email: 'b@x.org', plan: 'self_serve_business_prolite', ratio: { n: 0 } }, true, esc),
-    'B<small>b@x.org</small><small>Plan: self serve business prolite</small>' + quotaMeasure({ ratio: { n: 0 } }, esc));
+    'B<small>b@x.org</small><small class="pl">Plan: self serve business prolite</small>' + quotaMeasure({ ratio: { n: 0 } }, esc));
 }
 // seat name: the letter always, the email under it only when shown and known
 {

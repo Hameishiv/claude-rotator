@@ -49,7 +49,7 @@ function quotaMeasure(a, esc) {
 }
 function quotaSeat(a, emails, esc) {
   return esc(a.label) + quotaWeight(a, esc) + (a.badges || []).map(b => quotaBadge(b, '', esc)).join('') + (emails && a.email ? '<small>' + esc(a.email) + '</small>' : '') +
-    (a.plan ? '<small>Plan: ' + esc(a.plan.replace(/_/g, ' ')) + '</small>' : '') + quotaMeasure(a, esc);
+    (a.plan ? '<small class="pl">Plan: ' + esc(a.plan.replace(/_/g, ' ')) + '</small>' : '') + quotaMeasure(a, esc);
 }
 // A provider header's badges with their seat letter ("CLI D", "App B") as HTML, or '' when no seat is known to be in use.
 function quotaInUse(p, esc) {
