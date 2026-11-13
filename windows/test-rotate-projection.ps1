@@ -702,6 +702,10 @@ Check 'Test-MergePrParked default -TimeoutSec is 30 s (10 s raced the launcher a
 $resSrc = Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'claude-resume-sessions.ps1') -Raw
 Check 'resume script emits the line Ping-ActiveSessions counts' ($resSrc -match 'Skipped parked review \$\(\$mp\.Repo\)#') 'wording drifted between the two scripts'
 Check 'Ping-ActiveSessions counts skipped separately' (($src -match 'Skipped parked review') -and ($src -match 'skipped \$\(\$skipLines\.Count\) parked')) 'summary does not report skipped'
+# 11b. on Linux the resume script stops after discovery, before any Windows-only delivery. A source check: $IsLinux
+#      is a constant, so this Windows suite cannot run the Linux branch itself.
+$lx = $resSrc.IndexOf('if ($IsLinux -or $IsMacOS) { Write-Host "`nsession resume is not supported on Linux yet; sessions left as they are')
+Check 'resume script stops before delivery on Linux' (($lx -gt $resSrc.IndexOf('if ($DryRun)')) -and ($lx -lt $resSrc.IndexOf('if (-not $OwnWindowOnly) {')) -and ($lx -lt $resSrc.IndexOf("Join-Path `$here 'Inject-ConsoleInput.ps1'"))) "guard at $lx"
 
 # 12. the access-refusal fallback (usage unknown) goes through Select-RotationTarget and keeps its exclusions,
 #     the cached Fable rejection included. The real function, loaded from the script, over stub readers.

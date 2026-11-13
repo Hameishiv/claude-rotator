@@ -250,6 +250,10 @@ $vscode = @(Select-Blocked $vscode); $own = @(Select-Blocked $own)
 
 if ($DryRun) { Write-Host "`n-DryRun: would act on $($vscode.Count) VS Code + $($own.Count) own-window session(s); nothing was killed, relaunched, or typed." -ForegroundColor Yellow; return }
 
+# LINUX-PORT: discovery above works on Linux, delivery below does not (VS Code keystrokes and the
+# WriteConsoleInput injector are kernel32-only), so stop here rather than call the Windows injector.
+if ($IsLinux -or $IsMacOS) { Write-Host "`nsession resume is not supported on Linux yet; sessions left as they are ($($vscode.Count + $own.Count) found)." -ForegroundColor Yellow; return }
+
 # ---- VS Code: exit + resume ----
 if (-not $OwnWindowOnly) {
   foreach ($r in $vscode) {
