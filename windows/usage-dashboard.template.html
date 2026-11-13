@@ -82,11 +82,24 @@ li small{color:var(--muted);font-size:12px;margin-left:6px}
 td.w{color:var(--warn)}
 td.nt{color:var(--warn);white-space:normal;min-width:220px}
 ul.nl{margin:12px 0 0;padding-left:20px;color:var(--muted)}
+.rs{display:block;margin-top:6px;padding:4px 10px;font-size:13px;color:var(--ink)}
+dialog{background:var(--panel);color:var(--ink);border:1px solid var(--grid);border-radius:16px;padding:20px;width:min(460px,calc(100vw - 32px));font:inherit}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog h2{font-size:19px;margin:0 0 14px;line-height:1.25}
+dialog dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+dialog dt{color:var(--muted)}dialog dd{margin:0;font-variant-numeric:tabular-nums}
+dialog .warn{color:var(--warn);margin:14px 0 0}
+dialog .dact{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);max-width:min(560px,calc(100vw - 32px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;z-index:5;box-shadow:0 2px 12px rgba(0,0,0,.35)}
+.toast[hidden]{display:none}
 @media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}}
 </style>
 </head>
 <body>
 <main id="app"></main>
+<dialog id="rsdlg" aria-labelledby="rsT"></dialog>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <script id="data" type="application/json">__DATA__</script>
 <script>__SIM__</script>
 <script>
@@ -228,6 +241,8 @@ function chart(p, lim, W) {
   return `<div class="chart" data-p="${esc(p.id)}"><svg class="c" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}"><defs><linearGradient id="g-${esc(p.id)}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--acc)" stop-opacity=".32"/><stop offset="1" stop-color="var(--acc)" stop-opacity=".02"/></linearGradient></defs>${s.join('')}</svg><div class="tip"></div></div><p class="note">${notes.join(' · ')}</p>${young}`;
 }
 
+const resetBtn = (p, a) => D.app && p.canReset && a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
+
 function accounts(p) {
   const wl = {}, ids = [];
   for (const a of p.accounts) for (const w of a.windows) if (!wl[w.id]) { wl[w.id] = w.label; ids.push(w.id); }
@@ -239,7 +254,7 @@ function accounts(p) {
       if (!w) return '<td>–</td>';
       return `<td>${w.used == null ? '–' : Math.round(w.used * 100) + '%'}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtWT(w.reset))}</small>` : ''}</td>`;
     }).join('');
-    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}</td>` : ''}<td${a.readAt && D.now - a.readAt > 86400 ? ' class="w"' : ''}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk">${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${a.readAt && D.now - a.readAt > 86400 ? ' class="w"' : ''}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
   }).join('');
   return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
 }
@@ -334,7 +349,49 @@ async function refreshAll() {
   busy = false; render();
 }
 
+let rs = null;   // the reset dialog's seat: {label, busy}
+function openReset(pid, label) {
+  const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label);
+  if (!a || rs) return;
+  const w = a.windows.find(x => x.id === 'w'), s = a.windows.find(x => x.id === 's'), cr = (a.bankedList || [])[0];
+  const used = x => x ? Math.round(x.used * 100) + '%' : '–';
+  const soon = w && w.reset && w.reset - D.now <= 86400;
+  rs = { label, busy: false };
+  const d = $('rsdlg');
+  d.innerHTML = `<h2 id="rsT">Apply a banked reset to seat ${esc(label)}?</h2><dl>` +
+    `<dt>Seat</dt><dd>${esc(label)}${a.email ? ' · ' + esc(a.email) : ''}</dd>` +
+    `<dt>Used now</dt><dd>Weekly ${used(w)}${s ? ' · 5 h ' + used(s) : ''}</dd>` +
+    (w && w.reset ? `<dt>Weekly renews</dt><dd>${esc(fmtDT(w.reset))} (in ${quotaIn(w.reset - D.now)})</dd>` : '') +
+    `<dt>Credit used</dt><dd>${cr ? esc(cr.title) + ' · expires ' + esc(fmtDT(cr.expiresAt)) + ' (in ' + quotaIn(cr.expiresAt - D.now) + ')' : 'One banked reset (its expiry was not supplied)'}</dd></dl>` +
+    `<p class="warn">This uses up the reset and can't be undone.</p>` +
+    (soon ? `<p class="warn">The weekly limit renews on its own in ${Math.max(1, Math.round((w.reset - D.now) / 3600))} h, so this would buy little.</p>` : '') +
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Apply reset</button></div>`;
+  d.showModal();
+}
+function toast(text, outcome) {
+  const t = $('toast'); t.textContent = text; t.dataset.outcome = outcome; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, 9000);
+}
+async function doReset() {
+  if (!rs || rs.busy) return;
+  rs.busy = true;
+  const d = $('rsdlg'), go = d.querySelector('[data-a="rsgo"]');
+  for (const b of d.querySelectorAll('button')) b.disabled = true;
+  go.textContent = 'Applying…';
+  let text = 'Reset failed: could not reach the app.', outcome = 'error';
+  try {
+    const r = await fetch('/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ seat: rs.label }) });
+    const j = await r.json().catch(() => ({}));
+    text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
+  } catch (e) {}
+  rs = null; d.close();
+  toast(text, outcome); loadData();
+}
+
 function act(a, v, el) {
+  if (a === 'reset') return openReset(el.dataset.p, v);
+  if (a === 'rscancel') return $('rsdlg').close();
+  if (a === 'rsgo') return doReset();
   if (a === 'reload') return loadData();
   if (a === 'refresh') return refreshAll();
   if (a === 'theme') { ui.theme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme]; store.set('theme', ui.theme); }
@@ -351,6 +408,9 @@ function act(a, v, el) {
 }
 
 document.addEventListener('click', e => { const b = e.target.closest('button[data-a]'); if (b) act(b.dataset.a, b.dataset.v, b); });
+$('rsdlg').addEventListener('cancel', e => { if (rs && rs.busy) e.preventDefault(); });          // Esc must not hide a reset that is in flight
+$('rsdlg').addEventListener('close', () => { if (rs && !rs.busy) rs = null; });
+$('rsdlg').addEventListener('click', e => { if (e.target === e.currentTarget && rs && !rs.busy) e.currentTarget.close(); });     // a click on the backdrop
 document.addEventListener('change', e => { if (e.target.dataset && e.target.dataset.a === 'mult') act('mult', e.target.value, e.target); });
 document.addEventListener('toggle', e => { const d = e.target; if (d.tagName === 'DETAILS' && d.dataset.p) closed[d.dataset.p] = !d.open; }, true);
 let rt, lastW = innerWidth;

@@ -1,5 +1,6 @@
 {
   "heartbeatRepo": "your-org/claude-config-backup",
   "hostId": "my-laptop",
-  "repoClone": "C:\\path\\to\\your\\claude-rotator-clone"
+  "repoClone": "C:\\path\\to\\your\\claude-rotator-clone",
+  "codexRedeemScript": "~/.claude/skills/merge-pr/scripts/codex_redeem_reset.py"
 }

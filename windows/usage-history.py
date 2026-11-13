@@ -415,6 +415,9 @@ def sample(now, force=False):
     rec = {"t": int(now), "s": read_claude()}
     cache = load_pcache()
     codex, cemails = read_codex()
+    for label, fresh in (cache.get("codex_fresh") or {}).items():     # a reading taken after an applied reset, until the cache catches up
+        if label in codex and (fresh.get("ts") or 0) > (codex[label].get("ts") or 0):
+            codex[label] = fresh
     if codex:
         rec["codex"] = codex
         cache.setdefault("emails", {})["codex"] = cemails
@@ -651,6 +654,8 @@ def build_provider(hist, pid, emails, now, extra):
     limits = [x for x in (build_limit(hist, latest, pid, wid, lbl, now, dflt) for wid, lbl in lims) if x]
     out = {"id": pid, "name": name, "total": len(accounts), "loaded": sum(a["ok"] for a in accounts),
            "accounts": accounts, "limits": limits}
+    if pid == "codex":
+        out["canReset"] = bool(extra.get("canReset"))      # the redeem script exists: the page may offer Apply reset
     note = PROVIDER_NOTE.get(pid) or (extra.get("pnote") or {}).get(pid)
     if note:
         out["note"] = note
@@ -760,7 +765,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None}
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None}
 
 
 def load():
@@ -1068,6 +1073,89 @@ def manifest():
                       {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]}
 
 
+REDEEM_DEFAULT = os.path.join(HOME, ".claude", "skills", "merge-pr", "scripts", "codex_redeem_reset.py")
+RESET_TIMEOUT = 90
+
+
+def redeem_script(cfg=None):
+    """The Codex redeem script's path: `codexRedeemScript` in rotator.local.json (next to this script), else the merge-pr skill's; None when the file is missing."""
+    try:
+        with open(cfg or os.path.join(HERE, "rotator.local.json"), encoding="utf-8-sig") as fh:
+            p = json.load(fh).get("codexRedeemScript")
+    except (OSError, ValueError, AttributeError):
+        p = None
+    p = os.path.expanduser(p) if isinstance(p, str) and p else REDEEM_DEFAULT
+    return p if os.path.isfile(p) else None
+
+
+def codex_homes(cdir=None):
+    """The Codex seat labels: the folder names under ~/.codex/homes."""
+    return sorted(os.path.basename(d) for d in glob.glob(os.path.join(cdir or os.path.join(HOME, ".codex"), "homes", "*")) if os.path.isdir(d))
+
+
+def valid_seat(seat, homes):
+    """A seat the reset may be applied to: letters only, and one of the Codex homes (exact match)."""
+    return isinstance(seat, str) and re.fullmatch(r"[A-Za-z]+", seat) is not None and seat in homes
+
+
+def codex_seat_from_read(rl, now):
+    """The redeem script's read-only `rate_limits_before` -> a codex seat dict, or None. Like the Codex rotator, with no window durations the
+    secondary slot is the weekly window and the primary the 5-hour one; a lone primary is the weekly."""
+    def slot(k):
+        w = rl.get(k) if isinstance(rl, dict) else None
+        return w if isinstance(w, dict) and _f(w.get("used_percent")) is not None else None
+    p, s = slot("primary"), slot("secondary")
+    weekly, session = (s, p) if s else (p, None)
+    seat = {"ts": int(now)}
+    for wid, w, per in (("w", weekly, WEEK), ("s", session, 18000)):
+        if w:
+            seat[wid], seat[wid + "r"], seat[wid + "p"] = _f(w["used_percent"]) / 100, _f(w.get("resets_at")), per
+    if len(seat) == 1:
+        return None
+    n = _f(rl.get("banked_reset_credits"))
+    if n is not None and n >= 0:
+        seat["banked"] = int(n)
+        seat["bankedList"] = sorted(({"title": str(x.get("title") or "Reset"), "expiresAt": int(e)} for x in rl.get("banked_reset_details") or []
+                                     if isinstance(x, dict) and (e := _f(x.get("expires_at"))) is not None), key=lambda x: x["expiresAt"])
+    return seat
+
+
+def reset_result(seat, rep):
+    """The redeem script's JSON report -> {"outcome": redeemed|alreadyRedeemed|nothingToReset|noCredit|error, "text"}; nothing from the report but its status, outcome and a trimmed error."""
+    rep = rep if isinstance(rep, dict) else {}
+    st, oc = rep.get("status"), rep.get("outcome")
+    if st == "no_credit":
+        return {"outcome": "noCredit", "text": "Seat %s has no banked reset to apply." % seat}
+    if st == "redeemed":
+        key = re.sub(r"[^a-z]", "", oc.lower()) if isinstance(oc, str) else ""
+        o = {"alreadyredeemed": "alreadyRedeemed", "nothingtoreset": "nothingToReset"}.get(key, "redeemed")
+        return {"outcome": o, "text": {"redeemed": "Reset applied to seat %s." % seat, "alreadyRedeemed": "That reset was already applied; nothing more was used.",
+                                       "nothingToReset": "Seat %s had nothing to reset right now." % seat}[o]}
+    err = re.sub(r"[A-Za-z0-9_\-.]{40,}", "[redacted]", re.sub(r"\s+", " ", str(rep.get("error") or "")))[:160]
+    return {"outcome": "error", "text": "The reset did not go through" + (": " + err if err else ".")}
+
+
+def run_reset(seat, script, now, run=subprocess.run):
+    """Apply one banked reset on `seat` (the script's --confirm), then read the seat again (its read-only mode): (result for the page, new seat reading or None).
+    Both calls have no window and RESET_TIMEOUT s; neither the script's stderr nor any token is kept."""
+    def call(*extra):
+        r = run(PY + [script, "--account", seat] + list(extra), stdin=subprocess.DEVNULL, capture_output=True, timeout=RESET_TIMEOUT,
+                creationflags=0x08000000 if os.name == "nt" else 0)
+        try:
+            return json.loads(r.stdout.decode("utf-8", "replace"))
+        except ValueError:
+            return {"status": "error", "error": "unreadable output (exit %s)" % r.returncode}
+    try:
+        res = reset_result(seat, call("--confirm"))
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__}, None
+    try:
+        rep = call()
+    except (OSError, subprocess.SubprocessError):
+        return res, None
+    return res, (codex_seat_from_read(rep.get("rate_limits_before"), now) if rep.get("status") == "checked" else None)
+
+
 class Store:
     """The in-memory history and the last built blob, shared by the sampler thread and the request threads."""
 
@@ -1109,14 +1197,33 @@ class Store:
             pass
         return True
 
+    def rebuild(self, now):
+        self.blob = build(self.hist, now, load_emails(), True, load_extra())
+        render(dict(self.blob, app=False))
+        return self.blob
+
     def take(self, force=False):
         with self.lock:
             now = time.time()
             self.hist = save(self.hist, sample(now, force), now)
             self.import_codex(now)
-            self.blob = build(self.hist, now, load_emails(), True, load_extra())
-            render(dict(self.blob, app=False))
-            return self.blob
+            return self.rebuild(now)
+
+    def codex_reset(self, seat, script, run=subprocess.run):
+        """Apply one banked reset on a Codex seat and record the reading taken after it (the caller holds `refreshing`). Returns {"outcome", "text"}."""
+        res, new = run_reset(seat, script, time.time(), run)
+        applog("codex reset: seat %s -> %s" % (seat, res["outcome"]))
+        if new:
+            with self.lock:
+                now = time.time()
+                cache = load_pcache()
+                cache.setdefault("codex_fresh", {})[seat] = new       # sample() prefers it until the seat's own cache is newer
+                save_pcache(cache)
+                last = next((dict(h["codex"]) for h in reversed(self.hist) if h.get("codex")), {})
+                last[seat] = new
+                self.hist = save(self.hist, {"t": int(now), "codex": last}, now)
+                self.rebuild(now)
+        return res
 
 
 def probe_claude():
@@ -1171,10 +1278,13 @@ def serve(port):
         def do_POST(self):
             if not host_ok(self.headers.get("Host"), port):
                 return self.send(403, "forbidden")
-            if self.path.split("?")[0] != "/api/refresh":
+            path = self.path.split("?")[0]
+            if path not in ("/api/refresh", "/api/codex-reset"):
                 return self.send(404, "not found")
             if self.headers.get("X-Quota-App") != "1":
                 return self.send(403, "forbidden")
+            if path == "/api/codex-reset":
+                return self.codex_reset()
             if not store.refreshing.acquire(blocking=False):
                 return self.send(409, "a refresh is already running")
             try:
@@ -1188,6 +1298,27 @@ def serve(port):
             except Exception as e:   # shortcut: broad catch so one bad request never kills the server thread
                 applog("refresh error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"error": type(e).__name__})
+            finally:
+                store.refreshing.release()
+
+        def codex_reset(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                seat = json.loads(self.rfile.read(n)).get("seat") if 0 < n <= 1024 else None
+            except (ValueError, AttributeError):
+                seat = None
+            script = redeem_script()
+            if not script:
+                return self.js(404, {"outcome": "error", "text": "The reset script was not found on this PC."})
+            if not valid_seat(seat, codex_homes()):
+                return self.js(400, {"outcome": "error", "text": "Unknown Codex seat."})
+            if not store.refreshing.acquire(blocking=False):
+                return self.js(409, {"outcome": "error", "text": "A refresh is running; try again in a minute."})
+            try:
+                self.js(200, store.codex_reset(seat, script))
+            except Exception as e:   # shortcut: same broad catch as refresh
+                applog("codex reset error: %s: %s" % (type(e).__name__, e))
+                self.js(500, {"outcome": "error", "text": "The reset did not go through: %s." % type(e).__name__})
             finally:
                 store.refreshing.release()
 
@@ -1529,6 +1660,63 @@ def selftest():
             assert st.drift_check(1000 * DRIFT_EVERY + DRIFT_EVERY, td, [sys.executable]) and open(mark).read().count("--check") == 2
         finally:
             PCACHE = keep
+
+    # 4: Codex Apply reset - seat validation, the script lookup (a missing script hides the action), outcome mapping, the two script calls
+    homes = ["A", "B", "Cc"]
+    cb = [{"t": 1794500000, "codex": {"A": {"w": 0.3, "wr": 1794700000, "wp": WEEK, "ts": 1794500000, "banked": 1, "bankedList": []}}}]
+    assert valid_seat("A", homes) and valid_seat("Cc", homes)
+    assert not any(valid_seat(x, homes) for x in ("a", "AB", "", "A ", "A/../B", "D", None, 5, ["A"], "A\n", "..", "A;B"))
+    with tempfile.TemporaryDirectory() as td:
+        cfg, scr = os.path.join(td, "rotator.local.json"), os.path.join(td, "redeem.py")
+        open(scr, "w").write("")
+        assert redeem_script(os.path.join(td, "none.json")) in (None, REDEEM_DEFAULT)                               # no config: the default, if it exists
+        open(cfg, "w").write(json.dumps({"codexRedeemScript": scr}))
+        assert redeem_script(cfg) == scr
+        open(cfg, "w").write(json.dumps({"codexRedeemScript": os.path.join(td, "missing.py")}))
+        assert redeem_script(cfg) is None                                                                            # configured but missing: no action
+        assert build(cb, 1794500100, {}, False, {"canReset": redeem_script(cfg) is not None})["providers"][0]["canReset"] is False       # ... so the blob hides the button
+        open(cfg, "w").write("not json")
+        assert redeem_script(cfg) in (None, REDEEM_DEFAULT)
+        os.makedirs(os.path.join(td, "homes", "A")), os.makedirs(os.path.join(td, "homes", "B")), open(os.path.join(td, "homes", "x.txt"), "w").close()
+        assert codex_homes(td) == ["A", "B"]
+    assert build(cb, 1794500100, {}, False, {"canReset": True})["providers"][0]["canReset"] is True
+    assert "canReset" not in build([{"t": 1, "s": {"A": {"w": 0.1, "wr": 9}}}], 5, {}, False, {"canReset": True})["providers"][0]
+    r = reset_result
+    assert r("A", {"status": "no_credit"}) == {"outcome": "noCredit", "text": "Seat A has no banked reset to apply."}
+    assert r("A", {"status": "redeemed", "outcome": "redeemed"})["outcome"] == "redeemed" and r("A", {"status": "redeemed", "outcome": {"x": 1}})["outcome"] == "redeemed"
+    assert r("A", {"status": "redeemed", "outcome": "already_redeemed"})["outcome"] == "alreadyRedeemed" and r("A", {"status": "redeemed", "outcome": "NothingToReset"})["outcome"] == "nothingToReset"
+    e = r("A", {"status": "error", "error": "consume failed: " + "x" * 80 + " " + "ab" * 400})
+    assert e["outcome"] == "error" and len(e["text"]) < 220 and "x" * 40 not in e["text"] and r("A", None)["outcome"] == "error" and r("A", {"status": "checked"})["outcome"] == "error"
+    rd = {"status": "checked", "rate_limits_before": {"banked_reset_credits": 2, "banked_reset_details": [{"title": "Full reset", "expires_at": 1796166737}, {"title": "n"}],
+                                                   "primary": {"used_percent": 40, "resets_at": 1794510000}, "secondary": {"used_percent": 7, "resets_at": 1795000000}}}
+    cs = codex_seat_from_read(rd["rate_limits_before"], 1794500000)
+    assert cs == {"ts": 1794500000, "w": 0.07, "wr": 1795000000, "wp": WEEK, "s": 0.4, "sr": 1794510000, "sp": 18000, "banked": 2, "bankedList": [{"title": "Full reset", "expiresAt": 1796166737}]}, cs
+    assert codex_seat_from_read({"primary": {"used_percent": 5, "resets_at": 9}, "secondary": {}}, 1)["w"] == 0.05 and codex_seat_from_read({}, 1) is None and codex_seat_from_read(None, 1) is None
+    calls = []
+    class Out:
+        def __init__(self, o, rc=0):
+            self.stdout, self.returncode = json.dumps(o).encode(), rc
+    def fake(argv, **kw):
+        calls.append((argv, kw))
+        return Out({"status": "redeemed", "outcome": "redeemed", "token": "SECRET"} if "--confirm" in argv else rd)
+    res, new = run_reset("A", "/x/redeem.py", 1794500000, fake)
+    assert res == {"outcome": "redeemed", "text": "Reset applied to seat A."} and new == cs and "SECRET" not in json.dumps(res)
+    assert calls[0][0] == PY + ["/x/redeem.py", "--account", "A", "--confirm"] and calls[1][0] == PY + ["/x/redeem.py", "--account", "A"]
+    assert all(k["timeout"] == 90 and k["stdin"] == subprocess.DEVNULL and k["capture_output"] for _, k in calls) and all(k["creationflags"] == (0x08000000 if os.name == "nt" else 0) for _, k in calls)
+    def boom(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 90)
+    assert run_reset("A", "/x", 1, boom) == ({"outcome": "error", "text": "The reset did not go through: TimeoutExpired."}, None)
+    def junk(argv, **kw):
+        o = Out({})
+        o.stdout = b"<html>"
+        return o
+    assert run_reset("A", "/x", 1, junk)[0]["outcome"] == "error"
+    calls.clear()
+    def once(argv, **kw):
+        if "--confirm" in argv:
+            return fake(argv, **kw)
+        raise OSError("gone")
+    assert run_reset("A", "/x", 1, once) == ({"outcome": "redeemed", "text": "Reset applied to seat A."}, None)         # the follow-up read failing keeps the result
 
     # Host guard
     assert host_ok("127.0.0.1:8787", 8787) and host_ok("localhost:8787", 8787)
