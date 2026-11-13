@@ -1051,6 +1051,7 @@ function Select-RotationTarget {
   $ordered = if ($roomy) { @($roomy | Sort-Object { [int64]$_.w7reset }) } else { @($viable | Sort-Object s5) }
   foreach ($c in $ordered) {
     $fu = Get-UsageCached $c.label $true 'fable' '-fable'
+    if ($fu.access -eq 'disabled') { continue }                       # the Fable probe was an explicit access refusal: never a target
     if ($fu.ok -and $fu.oi7_stat -eq 'rejected') { continue }         # Gate C needs Fable
     $c | Add-Member -NotePropertyName fable -NotePropertyValue $(if ($fu.ok -and $null -ne $fu.oi7_util) { [double]$fu.oi7_util } else { $null }) -Force
     return $c

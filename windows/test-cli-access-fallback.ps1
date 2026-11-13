@@ -36,6 +36,9 @@ $global:ClaudeRotatorProbeOverride = {
   $plan = $script:plan[$Label]
   if (-not $plan) { $plan = 'ok' }
   if ($Model -eq 'fable') {
+    if ($plan -eq 'fable-disabled') {
+      return [pscustomobject]@{ label=$Label; ok=$false; access='disabled'; http=403; code='oauth_org_not_allowed'; note='subscription disabled (403 oauth_org_not_allowed)' }
+    }
     return [pscustomobject]@{ label=$Label; ok=$true; access='ok'; http=200; oi7_util=0.1; oi7_stat='allowed'; note='' }
   }
   if ($plan -eq 'disabled') {
@@ -186,6 +189,18 @@ $script:head['C'] = 0.20
 $rc = Invoke-CheckRotate 0 $false $true 'test'
 Check 'app-identity A is not the automatic target' ((Get-ActiveLabel) -eq 'C') (Get-ActiveLabel)
 Check 'that exclusion is the identity rule' ((Get-AppSeatLabel) -eq 'A')
+
+# --- the best seat's Fable probe is an explicit 403: that seat is rejected, the next one is the target ---
+Reset-Case
+Clear-AppIdentity
+Set-Active 'B'
+$script:plan['B'] = 'disabled'
+$script:plan['A'] = 'fable-disabled'
+$script:head['A'] = 0.05
+$script:head['C'] = 0.40
+$rc = Invoke-CheckRotate 0 $false $true 'test'
+Check 'a Fable access refusal disqualifies A; C is the target' (($rc -eq 0) -and ((Get-ActiveLabel) -eq 'C')) "rc=$rc active=$(Get-ActiveLabel)"
+Check 'A got the access marker' (Test-Path (Join-Path (Join-Path $Root 'A') 'access-disabled.json'))
 
 # --- ensure leaves a cooled-down seat and does not touch a healthy one ---
 Reset-Case
