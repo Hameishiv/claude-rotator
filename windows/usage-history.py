@@ -1012,8 +1012,11 @@ def build_provider(hist, pid, emails, now, extra):
         if acts:                            # the switch buttons: roles whose rotator can use this seat, minus the one it already holds
             a["switch"] = acts
         rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
-        if any(gs for _, gs in rk):         # what the Apply buttons and their dialog need: no grant ids, the server picks the grant again on the click
-            a["resets"] = [{"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} for k, gs in rk if gs]
+        pend = {k for k, _ in rk if "%s:%s" % (label, k) in (extra.get("claims") or ())}
+        if any(gs for _, gs in rk) or pend:  # what the Apply buttons and their dialog need: no grant ids, the server picks the grant again on the click
+            # a kind with an unsettled claim stays offered (as a resend of that claim) even when no credit of it is listed any more
+            a["resets"] = [dict({"kind": k, "left": sum(g["left"] for g in gs), "endsAt": gs[0]["endsAt"]} if gs else {"kind": k}, **({"pending": True} if k in pend else {}))
+                           for k, gs in rk if gs or k in pend]
         accounts.append(a)
     if pid == "codex":                      # measured weight check: tokens per 1 % against the weight-1 seats, over the sampled seats
         meas = measured_ratios((extra.get("codex") or {}).get("pairs") or {}, now)
@@ -1141,6 +1144,11 @@ def load_emails():
 
 # ---------------------------------------------------------------- storage and rendering
 
+def pending_claims(c):
+    """The provider cache's unsettled Claude claims as "seat:kind" keys (a claim under the older per-grant key is left out: it is re-keyed on its next click)."""
+    return sorted(k for k, v in (c.get("credits_claims") or {}).items() if isinstance(v, dict) and v.get("gid") and k.split(":", 1)[-1] in RESET_KINDS)
+
+
 def load_extra():
     """What build() takes besides history and emails: account/provider notes from the provider cache, the rotator drift file."""
     c, drift = load_pcache(), None
@@ -1150,7 +1158,7 @@ def load_extra():
             drift = json.load(fh)
     except (OSError, ValueError):
         pass
-    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
+    return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claims": pending_claims(c), "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs},
             "codexPending": sorted(c.get("codex_pending") or {})}
 
@@ -3206,6 +3214,11 @@ def selftest():
                                                                       {"kind": "session", "left": 2, "endsAt": None}], kp["accounts"][0]
     assert "resets" not in kp["accounts"][1] and kp["accounts"][1]["banked"] == 7                       # counted, but no Apply without the next grant
     assert "g1" not in json.dumps(kp)                                                                   # no grant id reaches the page
+    # a kind with an unsettled claim is offered as a resend even when its credit is no longer listed
+    assert pending_claims({"credits_claims": {"A:full": {"id": "r", "gid": "g2"}, "A:g9": {"id": "o"}, "B:fable": {"id": "x"}, "C:weekly": "junk"}}) == ["A:full"]
+    kq = build(kh, KN + 10, {}, False, dict(kx, claims=["A:full", "B:session"]))["providers"][0]
+    assert kq["accounts"][0]["resets"][1] == {"kind": "full", "left": 2, "endsAt": KN + 5 * DAY, "pending": True}, kq["accounts"][0]["resets"]
+    assert kq["accounts"][1]["resets"] == [{"kind": "session", "pending": True}] and "pending" not in kq["accounts"][0]["resets"][0]
     kp = build(kh, KN + 10, {}, False, dict(kx, claudeReset=False))["providers"][0]
     assert "canReset" not in kp and "resets" not in kp["accounts"][0] and kp["accounts"][0]["banked"] == 7                # switched off: the count stays, the buttons go
     keep = {k: globals()[k] for k in ("ROOT", "PCACHE", "APPLOG", "STATE", "credits_enabled")}

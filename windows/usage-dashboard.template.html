@@ -274,7 +274,7 @@ const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
 const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a.bankedNote || ''].filter(Boolean).join(' · '); return t ? ` title="${esc(t)}"` : ''; };
 // Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
 const resetBtn = (p, a) => !D.app || !p.canReset ? '' : p.id === 'claude'
-  ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">Apply ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>`).join('')
+  ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">${r.pending ? 'Resend pending' : 'Apply'} ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>`).join('')
   : a.resetPending ? '<small class="muted">Last reset unconfirmed — checking</small>'
   : a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
 
@@ -393,13 +393,14 @@ function openReset(pid, label, kind) {
   const win = id => a.windows.find(x => x.id === id), w = win('w'), s = win('s');
   const used = x => x ? Math.round(x.used * 100) + '%' : '–';
   const k = pid === 'claude' ? QUOTA_RESET_KINDS[kind] : null, r = k && (a.resets || []).find(x => x.kind === kind);
-  if (pid === 'claude' && !r) return;
+  if (pid === 'claude' && !r) return;      // a listed credit, or a pending claim of that kind (r.pending: resent as it was, never a new credit)
+  const resend = !!(r && r.pending);
   const rw = k ? win(k.win) || w : w;      // the window this reset refills (Fable falls back to the weekly when the seat has no Fable reading)
   const soon = rw && rw.id !== 's' && rw.reset && rw.reset - D.now <= 86400;
   const exp = t => esc(fmtDT(t)) + ' (in ' + quotaIn(t - D.now) + ')', cr = (a.bankedList || [])[0];
   rs = { pid, label, kind, busy: false };
   const d = $('rsdlg');
-  d.innerHTML = `<h2 id="rsT">Apply a ${k ? esc(k.noun) : 'banked reset'} to seat ${esc(label)}?</h2><dl>` +
+  d.innerHTML = `<h2 id="rsT">${resend ? 'Resend the pending ' + esc(k.noun) + ' to' : 'Apply a ' + (k ? esc(k.noun) : 'banked reset') + ' to'} seat ${esc(label)}?</h2><dl>` +
     `<dt>Seat</dt><dd>${esc(label)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd>` +
     (k ? `<dt>Used now</dt><dd>${[s && '5 h ' + used(s), w && 'Weekly ' + used(w), win('f') && 'Fable ' + used(win('f'))].filter(Boolean).join(' · ') || '–'}</dd>` +
          `<dt>Refills</dt><dd>${esc(k.refills)}</dd>`
@@ -407,9 +408,9 @@ function openReset(pid, label, kind) {
     (rw && rw.reset ? `<dt>${esc(rw.label)} renews</dt><dd>${exp(rw.reset)}</dd>` : '') +
     (k ? `<dt>Reset used</dt><dd>${esc(k.noun[0].toUpperCase() + k.noun.slice(1))}${r.endsAt ? ' · expires ' + exp(r.endsAt) : ' · no expiry given'}${r.left > 1 ? ` · 1 of ${r.left} banked` : ''}</dd></dl>`
        : `<dt>Credit used</dt><dd>${cr ? esc(cr.title) + ' · expires ' + exp(cr.expiresAt) : 'One banked reset (its expiry was not supplied)'}</dd></dl>`) +
-    `<p class="warn">This uses up the reset and can't be undone.</p>` +
+    (resend ? `<p class="warn">This sends the earlier unconfirmed request again. It cannot use a second reset.</p>` : `<p class="warn">This uses up the reset and can't be undone.</p>`) +
     (soon ? `<p class="warn">The ${esc(rw.label.replace('Weekly', 'weekly'))} limit renews on its own in ${Math.max(1, Math.round((rw.reset - D.now) / 3600))} h, so this would buy little.</p>` : '') +
-    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Apply ${k ? esc(k.noun) : 'reset'}</button></div>`;
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">${resend ? 'Resend' : 'Apply'} ${k ? esc(k.noun) : 'reset'}</button></div>`;
   d.showModal();
 }
 function toast(text, outcome) {

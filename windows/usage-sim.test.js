@@ -218,4 +218,22 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(resetBtn(cx, { label: 'A', banked: 2 }).includes('>Apply reset</button>'));
   assert.strictEqual(resetBtn(cx, { label: 'A', banked: 2, resetPending: true }), '<small class="muted">Last reset unconfirmed — checking</small>');
 }
+// a Claude seat+kind with a pending (unsettled) claim is offered as a resend, even with no credit of that kind listed, and its dialog says so
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const btnSrc = tpl.slice(tpl.indexOf('const resetBtn = '), tpl.indexOf('\nfunction accounts('));
+  const resetBtn = new Function('D', 'esc', 'QUOTA_RESET_KINDS', btnSrc + '\nreturn resetBtn;')({ app: true }, s => String(s), QUOTA_RESET_KINDS);
+  const cl = { id: 'claude', canReset: true };
+  assert.strictEqual(resetBtn(cl, { label: 'A', resets: [{ kind: 'full', pending: true }] }),
+    '<button class="rs" data-a="reset" data-p="claude" data-v="A" data-k="full">Resend pending full reset</button>');
+  assert.ok(resetBtn(cl, { label: 'A', resets: [{ kind: 'full', left: 1, endsAt: null }] }).includes('>Apply full reset<'));
+  const dlgSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
+  const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
+  const D = { now: 1000, providers: [{ id: 'claude', accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true }] }] }] };
+  const openReset = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', dlgSrc + '\nreturn openReset;')(
+    D, () => dlg, s => String(s), { emails: false }, String, String, QUOTA_RESET_KINDS);
+  openReset('claude', 'A', 'full');
+  assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Resend the pending full reset to seat A?') && dlg.innerHTML.includes('>Resend full reset</button>')
+    && dlg.innerHTML.includes('cannot use a second reset') && !dlg.innerHTML.includes("can't be undone"), dlg.innerHTML);
+}
 console.log('usage-sim tests passed');
