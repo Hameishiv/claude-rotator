@@ -671,11 +671,13 @@ def claude_org(label):
 
 
 def consume_reset(label, kind, gid, rid, fetch, ver=None):
-    """One claim of grant `gid` with idempotency key `rid` -> ({"outcome", "text"}, settled). Not settled (no answer, a 5xx, `unavailable`) means the claim may
-    or may not have landed: the caller keeps `rid` so a retry addresses the same claim. The token stays in this function: never logged, stored or returned."""
+    """One claim of grant `gid` with idempotency key `rid` -> ({"outcome", "text"}, settled). Not settled (False: no answer, a 5xx, `unavailable`) means the
+    claim may or may not have landed: the caller keeps `rid` so a retry addresses the same claim. None (429, 401/403, no token or organization) means this
+    call was turned away before it reached the claim: it settles a new claim, but says nothing about an earlier unconfirmed one with the same `rid`. The
+    token stays in this function: never logged, stored or returned."""
     tok, org, name = _read(os.path.join(ROOT, label, "token.txt")), claude_org(label), CREDIT_KINDS[kind]
     if not tok or not org:
-        return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh all credentials, then try again." % label}, True
+        return {"outcome": "error", "text": "Seat %s is not signed in, or its organization is not known yet. Use Refresh all credentials, then try again." % label}, None
     req = urllib.request.Request(RESET_URL % org, method="POST", data=json.dumps({"program": "cedar_ember", "grant_id": gid, "request_id": rid}).encode("utf-8"),
                                  headers={"authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20", "content-type": "application/json",
                                           "user-agent": "claude-cli/%s (external, cli)" % (ver or CLI_FALLBACK)})
@@ -684,9 +686,9 @@ def consume_reset(label, kind, gid, rid, fetch, ver=None):
     except Exception as e:   # shortcut: whatever a fetch raises is an unanswered claim; only its type is kept
         code, j = 0, type(e).__name__
     if code == 429:
-        return {"outcome": "error", "text": "Claude is rate limiting resets. Try again later."}, True
+        return {"outcome": "error", "text": "Claude is rate limiting resets. Try again later."}, None
     if code in (401, 403):
-        return {"outcome": "error", "text": "Seat %s needs to sign in to Claude again." % label}, True
+        return {"outcome": "error", "text": "Seat %s needs to sign in to Claude again." % label}, None
     res = j.get("result") if code == 200 and isinstance(j, dict) else None
     done = {"reset": ("redeemed", "%s applied to seat %s." % (name, label)),
             "already_used": ("alreadyRedeemed", "That reset was already applied; nothing more was used."),
@@ -2059,17 +2061,20 @@ class Store:
         with self.lock, pcache_txn() as cache:
             key = seat + ":" + kind
             claims = {k: v for k, v in (cache.get("credits_claims") or {}).items() if isinstance(v, dict)}     # kept, whatever their age, until a resend settles them
-            if not (claims.get(key) or {}).get("gid"):          # nothing pending for this seat and kind: a grant from the last reading
+            resend = bool((claims.get(key) or {}).get("gid"))     # an earlier, unconfirmed claim is sent again
+            if not resend:                                      # nothing pending for this seat and kind: a grant from the last reading
                 gs = usable_grants((cache.get("credits") or {}).get(seat) or {}, kind, now)
                 if not gs:
                     return {"outcome": "noCredit", "text": "Seat %s has no %s to apply." % (seat, CREDIT_KINDS[kind].lower())}
                 old = claims.pop(seat + ":" + gs[0]["id"], None)    # a claim saved under the older per-grant key keeps its request id
+                resend = bool(old and old.get("id"))
                 claims[key] = {"id": old["id"] if old and old.get("id") else (new_id or (lambda: secrets.token_urlsafe(16)))(), "gid": gs[0]["id"], "at": int(now)}
             cache["credits_claims"] = claims
             gid, rid = claims[key]["gid"], claims[key]["id"]
         res, settled = consume_reset(seat, kind, gid, rid, fetch or (lambda r: http_json(r, CONSUME_TIMEOUT)), claude_version(now))
-        applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], "" if settled else " (unconfirmed)"))
-        if settled:
+        keep = settled is False or (settled is None and resend)    # a refusal of the resend proves nothing about the earlier claim
+        applog("claude reset: seat %s %s -> %s%s" % (seat, kind, res["outcome"], " (unconfirmed)" if settled is False else " (refused; the earlier claim is kept)" if keep else ""))
+        if not keep:
             with self.lock, pcache_txn() as cache:
                 (cache.get("credits_claims") or {}).pop(key, None)
         self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
@@ -3268,6 +3273,19 @@ def selftest():
         ks.claude_reset("A", "full", kf, nid)
         cl = load_pcache()["credits_claims"]
         assert b'"grant_id": "g2", "request_id": "ridL"' in kc[-2][2] and list(cl) == ["A:full"] and cl["A:full"]["id"] == "ridL" and cl["A:full"]["gid"] == "g2"
+        # a resend turned away (429, 401/403, no credentials) keeps the earlier unconfirmed claim and its request id; a definite answer clears it
+        for ans in ((429, None), (401, None), (403, None)):
+            post.append(ans)
+            ks.claude_reset("A", "full", kf, nid)
+            cl = load_pcache()["credits_claims"]
+            assert cl.get("A:full", {}).get("id") == "ridL" and b'"request_id": "ridL"' in kc[-2][2], (ans, cl)
+        sv_ = load_pcache()
+        save_pcache(dict(sv_, credits_claims={"B:full": {"id": "ridB", "gid": "g2", "at": 1}}))
+        assert "organization is not known" in ks.claude_reset("B", "full", kf, nid)["text"] and load_pcache()["credits_claims"]["B:full"]["id"] == "ridB"
+        save_pcache(sv_)
+        post.append((200, {"result": "already_used"}))
+        ks.claude_reset("A", "full", kf, nid)
+        assert load_pcache()["credits_claims"] == {} and "(refused; the earlier claim is kept)" in open(APPLOG).read()
         # every other outcome
         for ans, oc, text, kept in [((200, {"result": "not_limited"}), "nothingToReset", "Seat A had nothing to reset right now.", False),
                                     ((200, {"result": "ineligible"}), "noCredit", "Claude says seat A has no 5-hour reset to apply.", False),
