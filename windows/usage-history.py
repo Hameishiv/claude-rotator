@@ -2061,14 +2061,15 @@ def codex_usage_argv(cfg=None):
 
 def run_codex_usage(argv, popen=subprocess.Popen):
     """Start the Codex usage command with no window at Idle and wait up to SWITCH_TIMEOUT s -> (error text or None, the process if still running).
+    A non-zero exit is an error too: the command did not update the caches, so Refresh must not report Codex as updated.
     It is never killed: one still running is handed back, and the caller waits for it."""
     try:
         p = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CHILD_FLAGS)
     except (OSError, subprocess.SubprocessError) as e:
         return "The Codex usage command could not run: %s." % type(e).__name__, None
     try:
-        p.wait(timeout=SWITCH_TIMEOUT)
-        return None, None
+        rc = p.wait(timeout=SWITCH_TIMEOUT)
+        return (None if rc == 0 else "The Codex usage command failed (exit %s); Codex was not updated." % rc), None
     except subprocess.TimeoutExpired:
         return None, p
 
@@ -2552,6 +2553,8 @@ class Store:
             with self.lock, pcache_txn() as cache:
                 (cache.get("credits_claims") or {}).pop(key, None)
                 if settled and res["outcome"] in ("redeemed", "alreadyRedeemed"):
+                    ce = cache.setdefault("credits", {}).setdefault(seat, {})
+                    ce["gen"] = (ce.get("gen") or 0) + 1        # with the spend, atomically: a read already in flight was asked before it, and its answer would restore the spent grant
                     spend_grant(cache, seat, gid, now, prev_send if res["outcome"] == "alreadyRedeemed" else None)        # the follow-up read below is refused while the seat is held (429 / sign-in / scope): the page must not offer the spent grant again meanwhile
         self.credits_read(seat, time.time(), fetch or http_json, force=True)      # still honours a 429 / sign-in hold
         with self.lock:
@@ -2673,7 +2676,7 @@ def make_handler(store, port):
                                                                                   len(blob["providers"])))
                 if handed:
                     return self.js(202, dict(blob, refreshNote=CODEX_STILL))
-                self.js(200, blob)
+                self.js(200, dict(blob, refreshNote=err) if err else blob)     # a Codex command that could not run or failed is shown, not only logged
             except Exception as e:   # shortcut: broad catch so one bad request never kills the server thread
                 applog("refresh error: %s: %s" % (type(e).__name__, e))
                 self.js(500, {"error": type(e).__name__})
@@ -3512,6 +3515,8 @@ def selftest():
         err_, p_ = run_codex_usage(["c"], pp(True))
         assert err_ is None and isinstance(p_, P_) and p_.returncode is None                     # still running: handed back, never killed
         assert "could not run: OSError" in run_codex_usage(["c"], lambda argv, **kw: (_ for _ in ()).throw(OSError()))[0]
+        fail_ = type("F_", (), {"wait": lambda self, timeout=None: 3})
+        assert "failed (exit 3)" in run_codex_usage(["c"], lambda argv, **kw: fail_())[0] and run_codex_usage(["c"], lambda argv, **kw: fail_())[1] is None   # a failed exit is reported, not "updated"
         wst = Store.__new__(Store)
         wst.refreshing, took = threading.Lock(), []
         wst.take = lambda force=False: took.append(force)
@@ -4338,8 +4343,10 @@ def selftest():
         save_pcache({"credits": {"A": dict(ke, hold=hold_)}})
         n_ = len(kc)
         post.append((200, {"result": "reset"}))
+        g0_ = load_pcache()["credits"]["A"].get("gen") or 0
         assert ks.claude_reset("A", "fable", kf, hid_)["outcome"] == "redeemed" and len(kc) == n_ + 1 and kc[-1][0] == "POST"      # no GET: the hold refused it
         e_ = load_pcache()["credits"]["A"]
+        assert e_.get("gen") == g0_ + 1, e_            # the confirmed spend makes a credit read already in flight stale (the held forced read bumps nothing)
         assert e_["hold"] == hold_ and [g["left"] for g in e_["grants"] if g["id"] == "g1"] == [1], e_
         assert build(kh, KN + 10, {}, False, dict(kx, credits={"A": e_}))["providers"][0]["accounts"][0]["resets"][0] == {"kind": "fable", "left": 1, "endsAt": KN + 3 * DAY}
         post.append((200, {"result": "reset"}))
@@ -4352,7 +4359,7 @@ def selftest():
         save_pcache({"credits": {"A": dict(ke, hold=hold_)}})
         post.append(TimeoutError("t"))
         ks.claude_reset("A", "fable", kf, hid_)
-        assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2]
+        assert [g["left"] for g in load_pcache()["credits"]["A"]["grants"] if g["id"] == "g1"] == [2] and (load_pcache()["credits"]["A"].get("gen") or 0) == (ke.get("gen") or 0)
         # spend_grant, an `alreadyRedeemed` answer (prev_send given): a reading taken more than SEND_SETTLE s after the claim's previous send is trusted
         # and left alone; one at (a tie) or before that, in particular one taken while that send was in flight, is decremented
         sgc_ = lambda **kw: {"credits": {"A": dict(ke, **kw)}}

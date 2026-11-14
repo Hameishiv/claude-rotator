@@ -290,7 +290,8 @@ function Get-CliVersion {
       $psi = [System.Diagnostics.ProcessStartInfo]::new($exePath, '--version')
       $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
       $sw = [System.Diagnostics.Stopwatch]::StartNew()
-      $p = [System.Diagnostics.Process]::Start($psi)
+      $me = Get-Process -Id $PID; $was = $me.PriorityClass      # the child starts at Idle (it inherits this shell's class at start), then this shell goes back
+      try { $me.PriorityClass = 'Idle'; $p = [System.Diagnostics.Process]::Start($psi) } finally { try { $me.PriorityClass = $was } catch {} }
       $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()      # both drained, so a chatty stderr cannot fill its pipe and stall the wait
       # One budget for the exit AND the read: a child that exits but leaves a grandchild holding the stdout pipe open would otherwise block `.Result` forever.
       $done = $p.WaitForExit($TimeoutMs) -and $out.Wait([int][Math]::Max(0, $TimeoutMs - $sw.ElapsedMilliseconds))
