@@ -420,6 +420,8 @@ Set-Content -LiteralPath (Join-Path $ga 'B\token.txt') -Value 'sk-ant-oat01-SEAT
 # (the wrapper's paths come from USERPROFILE at dot-source time; the py shim then needs the real one back to find Python)
 $gate = { param($a) & pwsh -NoProfile -NonInteractive -Command "Set-Location '$gd'; `$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; `$env:CLAUDE_CODE_OAUTH_TOKEN = 'inherited'; . '$gd\rotator-functions.ps1'; `$env:USERPROFILE = '$($envKeep['USERPROFILE'])'; claude $a" 2>&1 | Out-String }
 Check 'a refused seat still stops a normal start' ((& $gate '--version') -match 'Not starting Claude Code')
+$gateRc = { param($a) & pwsh -NoProfile -NonInteractive -Command "Set-Location '$gd'; `$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; . '$gd\rotator-functions.ps1'; `$env:USERPROFILE = '$($envKeep['USERPROFILE'])'; `$global:LASTEXITCODE = 0; claude $a; 'LEC=' + `$LASTEXITCODE" 2>&1 | Out-String }
+Check 'a refused seat leaves LASTEXITCODE at 1 (not the 0 of the seat probe)' ((& $gateRc '--version') -match 'LEC=1')
 Check 'a credential word that is not the first argument is still gated' ((& $gate '-p login') -match 'Not starting Claude Code')
 Check '/login is never gated' ((& $gate '/login') -notmatch 'Not starting Claude Code')
 $st_ = & $gate 'setup-token'

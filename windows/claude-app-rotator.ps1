@@ -164,7 +164,13 @@ function Start-ClaudeApp {
   $l = Find-AppLauncher
   if (-not $l) { Write-Host "Could not find the installed Claude app to reopen; open it from the Start menu." -ForegroundColor DarkYellow; return $false }
   try {
-    if ($l.args.Count) { Start-Process -FilePath $l.file -ArgumentList $l.args } else { Start-Process -FilePath $l.file }
+    # The app is a user-facing program: it must not inherit this shell's class. The dashboard server runs this script at Idle (or BelowNormal), and a
+    # child starts at its parent's class, so the shell goes to Normal for the launch and back after: the reverse of Get-CliVersion (claude-cli-account.ps1).
+    $me = Get-Process -Id $PID; $was = $me.PriorityClass
+    try {
+      if ("$was" -eq 'Idle' -or "$was" -eq 'BelowNormal') { try { $me.PriorityClass = 'Normal' } catch {} }
+      if ($l.args.Count) { Start-Process -FilePath $l.file -ArgumentList $l.args } else { Start-Process -FilePath $l.file }
+    } finally { try { $me.PriorityClass = $was } catch {} }
     return $true
   } catch { Write-Host "Could not reopen the Claude app: $($_.Exception.Message)" -ForegroundColor DarkYellow; return $false }
 }

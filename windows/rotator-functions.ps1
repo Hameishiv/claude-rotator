@@ -45,6 +45,7 @@ function claude {
             $__label = if (Test-Path $__act) { (Get-Content $__act -Raw).Trim() } else { '' }
             if ($__label -and (Test-AccessCooldownActive $__label)) {
                 Write-Host "Active seat '$__label' is subscription-disabled and no other eligible seat is available. Not starting Claude Code." -ForegroundColor Red
+                $global:LASTEXITCODE = 1      # a refusal is a failed start: callers that test $LASTEXITCODE must not see the 0 of the --ensure-cli-seat probe above
                 return
             }
         }

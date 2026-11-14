@@ -108,6 +108,24 @@ Invoke-SwitchRelaunch B
   Check 'Squirrel stub preferred' ($l.file -eq (Join-Path $sq 'claude.exe') -and $l.args.Count -eq 0)
   $script:started = @()
   Check 'Start-ClaudeApp launches the stub' ((Start-ClaudeApp) -and $script:started.Count -eq 1 -and $script:started[0][0] -eq (Join-Path $sq 'claude.exe'))
+
+  # the app must not be started at this shell's Idle class: Normal while Start-Process runs, the old class restored after (even when it throws)
+  function Start-Process { param($FilePath, $ArgumentList) $script:classAtStart = "$((Get-Process -Id $PID).PriorityClass)" }
+  Check 'test shell is Idle' ("$((Get-Process -Id $PID).PriorityClass)" -eq 'Idle')
+  $script:classAtStart = $null
+  Check 'Start-ClaudeApp from an Idle shell: Start-Process runs at Normal' ((Start-ClaudeApp) -and $script:classAtStart -eq 'Normal') "class=$($script:classAtStart)"
+  Check 'Start-ClaudeApp restores Idle afterwards' ("$((Get-Process -Id $PID).PriorityClass)" -eq 'Idle')
+  function Start-Process { param($FilePath, $ArgumentList) throw 'no such launcher' }
+  Check 'a failed launch returns $false and still restores Idle' ((-not (Start-ClaudeApp 6>$null)) -and "$((Get-Process -Id $PID).PriorityClass)" -eq 'Idle')
+  # and the process really started is not Idle: a real child (pwsh) writes its own class to a file
+  Remove-Item function:Start-Process
+  $pf = Join-Path $root 'child-class.txt'
+  function Find-AppLauncher { @{ file = (Get-Process -Id $PID).Path; args = @('-NoProfile', '-Command', "(Get-Process -Id `$PID).PriorityClass.ToString() | Set-Content -LiteralPath '$pf'") } }
+  Check 'Start-ClaudeApp with a real launcher' (Start-ClaudeApp)
+  $dl = (Get-Date).AddSeconds(30); while (-not (Test-Path -LiteralPath $pf) -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 200 }
+  Start-Sleep -Milliseconds 300
+  $cc = if (Test-Path -LiteralPath $pf) { (Get-Content -LiteralPath $pf -Raw).Trim() } else { '' }
+  Check 'the launched app process is not Idle' ($cc -eq 'Normal') "class=$cc"
 } finally {
   foreach ($k in $keep.Keys) { Set-Item "env:$k" $keep[$k] }
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

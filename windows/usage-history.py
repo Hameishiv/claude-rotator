@@ -24,6 +24,7 @@ steps hide real burn.
 import bisect
 import contextlib
 import glob
+import http.client
 import json
 import math
 import os
@@ -374,7 +375,7 @@ def http_json(req, timeout=10):
             return e.code, json.loads(e.read().decode("utf-8"))     # an error body says why (a 403 scope refusal, say)
         except (OSError, ValueError):
             return e.code, None
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:      # HTTPException: a malformed reply (BadStatusLine) is not an OSError
         return 0, str(type(e).__name__)
 
 
@@ -388,7 +389,7 @@ def fetch_grok(now):
         with open(os.path.join(HOME, ".grok", "auth.json"), encoding="utf-8-sig") as fh:
             a = next(iter(json.load(fh).values()))
         key, email = a["key"], a.get("email")
-    except (OSError, ValueError, KeyError, StopIteration, AttributeError):
+    except (OSError, ValueError, KeyError, StopIteration, AttributeError, TypeError):      # TypeError: the first value in auth.json is not an object
         return {"ok": False, "note": "not signed in to Grok: run grok to sign in"}, None
     req = urllib.request.Request("https://cli-chat-proxy.grok.com/v1/billing?format=credits",
                                  headers={"Authorization": "Bearer " + key})
@@ -466,7 +467,7 @@ def query_ls(port, csrf):
             with opener.open(req, timeout=5) as r:
                 if r.status == 200:
                     return json.loads(r.read().decode("utf-8"))
-        except (urllib.error.URLError, OSError, ValueError):
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
             pass
     return None
 
@@ -956,10 +957,18 @@ def sample(now, force=False):
     if codex:
         rec["codex"] = codex
         cache.setdefault("emails", {})["codex"] = cemails
-    seat = read_live("grok", "grok", fetch_grok, GROK_EVERY, now, force, cache)
+    try:
+        seat = read_live("grok", "grok", fetch_grok, GROK_EVERY, now, force, cache)
+    except Exception as e:              # one provider's surprise must not cost the whole sample: it becomes that provider's note (not cached, so the next sample retries)
+        applog("sample: grok read failed: %s: %s" % (type(e).__name__, e))
+        seat = {"ok": False, "note": "Grok usage unavailable (%s)" % type(e).__name__}
     if seat:
         rec["grok"] = {"grok": seat}
-    seat, why = read_gemini(now)        # local call: read on every sample
+    try:
+        seat, why = read_gemini(now)        # local call: read on every sample
+    except Exception as e:
+        applog("sample: gemini read failed: %s: %s" % (type(e).__name__, e))
+        seat, why = None, "Antigravity usage unavailable (%s)" % type(e).__name__
     if seat:
         cache["gemini_last"], cache.setdefault("notes", {})["gemini"] = int(now), {}
         rec["gemini"] = {"antigravity": seat}
@@ -969,7 +978,11 @@ def sample(now, force=False):
         cache.setdefault("notes", {})["gemini"] = {"antigravity": why}
         if not cache.get("gemini_last"):
             rec["gemini"] = {"antigravity": {"ok": False, "note": why}}
-    email = gemini_email()
+    try:
+        email = gemini_email()
+    except Exception as e:
+        applog("sample: gemini email read failed: %s: %s" % (type(e).__name__, e))
+        email = None
     if email:
         cache.setdefault("emails", {}).setdefault("gemini", {})["antigravity"] = email
     try:
@@ -1576,8 +1589,13 @@ def page_html(data):
             return ""
     blob = json.dumps(finite(data), separators=(",", ":")).replace("</", "<\\/")
     sim = read("usage-sim.js")
+    tpl = read("usage-dashboard.template.html")
+    if data.get("app"):
+        # the desktop app window must not hard-reload itself: the browser schedules a meta refresh as the page loads, and removing the tag later
+        # (the template script does that too) does not cancel it, so the tag is left out of the text the app is served
+        tpl = re.sub(r'<meta http-equiv="refresh"[^>]*>\r?\n?', "", tpl)
     # one pass, so neither inserted text can be re-scanned for the other placeholder
-    return re.sub(r"__DATA__|__SIM__", lambda m: blob if m.group() == "__DATA__" else sim, read("usage-dashboard.template.html"))
+    return re.sub(r"__DATA__|__SIM__", lambda m: blob if m.group() == "__DATA__" else sim, tpl)
 
 
 def render(data):
@@ -1710,12 +1728,20 @@ def one_shot(now):
 def newest_codex(rec, hist, new=()):
     """Each Codex seat in sample `rec` keeps the newest measurement (by its own ts) among this sample's cache reading, the rollout points just read
     (`new`) and every earlier record holding that seat: a cache value older than what the logs or an earlier sample already saw never wins,
-    so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note) is left as it is.
+    so it cannot mask a newer reading or fake a drop in burn. A seat whose sample carries no measurement (a note, no ts) takes the newest reading
+    among `new` alone, never an earlier record's (a seat with no usage cached would otherwise show the last sample's old figures as current):
+    its note and ok are dropped then, since a measurement is not a failed read (latest_of would swap a failed seat for an older good reading).
+    With nothing in `new` for it, it is left as it is.
     A newer record supplies only the usage-window fields (CODEX_WINDOW_KEYS): its banked / bankedList were copied forward from older
     records by rollout_records, and would overwrite the cache's fresher count of banked resets."""
     cur = rec.get("codex")
     if not isinstance(cur, dict):
         return rec
+    for h in new:
+        for seat, v in (h.get("codex") or {}).items():
+            c = cur.get(seat)
+            if isinstance(c, dict) and isinstance(v, dict) and not c.get("ts") and v.get("ts"):
+                cur[seat] = dict({k: x for k, x in c.items() if k not in CODEX_WINDOW_KEYS + ("ok", "note")}, **{k: x for k, x in v.items() if k in CODEX_WINDOW_KEYS})
     for h in list(new) + list(hist):        # every record, not the first one met: an older record can hold a newer measurement
         for seat, v in (h.get("codex") or {}).items():
             c = cur.get(seat)
@@ -2264,8 +2290,14 @@ class Store:
         """The rollout points since the last import, as records; `rec` (this tick's sample, not saved yet) holds its bucket, so none lands on it.
         With mark=False the watermark is left for the caller to move (mark_import) once the points and the sample are saved: a save that fails
         then re-reads the same logs next tick instead of skipping them. -> None when the import itself failed (the watermark is not moved), unless it
-        has failed IMPORT_RETRIES times in a row: then -> [] and the watermark moves past those logs, so one that always fails cannot pin it."""
-        since = load_pcache().get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
+        has failed IMPORT_RETRIES times in a row: then -> [] and the watermark moves past those logs, so one that always fails cannot pin it.
+        Also None when the provider cache cannot be read, since the watermark in it is unknown: a plain read would give {} there, which is a first run
+        (since = now), and the mark_import that follows would then skip every log written since the real watermark. That is not counted as a failed import."""
+        try:
+            since = load_pcache(strict=True).get("codex_import") or now        # the first run has nothing to catch up on: --backfill covers the past
+        except PcacheError as e:
+            applog("codex import: provider cache unreadable, import skipped this tick: %s" % e)
+            return None
         try:
             new, _ = import_rollouts(self.hist + ([rec] if rec else []), now, False, since, cdir, carry=True)
         except Exception as e:   # shortcut: a log we cannot read must not stop the sample
@@ -3109,6 +3141,21 @@ def selftest():
         return gj if port == 4001 else None
     assert read_gemini(7, lambda: parse_ls_procs(procs), fq)[0]["ts"] == 7 and tried == [(4000, "tok1"), (4001, "tok1")]
     assert read_gemini(7, lambda: [], fq) == (None, LS_OFF) and read_gemini(7, lambda: [("t", [1])], lambda p, c: None) == (None, LS_OFF)     # not running / no port answers
+    # a malformed reply (BadStatusLine is an HTTPException, not an OSError) is that call's failure, not an exception out of it
+    class BadOpener_:
+        def open(self, *a_, **k_):
+            raise sys.modules["http.client"].BadStatusLine("junk")      # `http` is a local name in selftest
+    keep_bo_, keep_hm_ = urllib.request.build_opener, globals()["HOME"]
+    try:
+        urllib.request.build_opener = lambda *a_, **k_: BadOpener_()
+        assert http_json(urllib.request.Request("http://127.0.0.1:9/")) == (0, "BadStatusLine") and query_ls(9, "t") is None
+        with tempfile.TemporaryDirectory() as gh_:                                   # auth.json whose first value is not an object: not signed in, not a TypeError
+            os.makedirs(os.path.join(gh_, ".grok"))
+            open(os.path.join(gh_, ".grok", "auth.json"), "w").write('{"x": 1}')
+            globals()["HOME"] = gh_
+            assert fetch_grok(7) == ({"ok": False, "note": "not signed in to Grok: run grok to sign in"}, None)
+    finally:
+        urllib.request.build_opener, globals()["HOME"] = keep_bo_, keep_hm_
     # 4: a process (the IDE server or agy.exe) whose command line is empty/unreadable means it runs as administrator; nothing else is tried to read its token
     adm = '[{"ProcessId":9,"CommandLine":null,"Ports":[3]},{"ProcessId":10,"CommandLine":"","Ports":[]}]'
     assert parse_ls_procs(adm) == [(None, [])] and parse_ls_procs('{"ProcessId":9,"CommandLine":"  ","Ports":[3]}') == [(None, [])]
@@ -3220,6 +3267,16 @@ def selftest():
         got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, new_)["codex"]
         assert got_["A"] == {"ts": N - 30, "w": 0.7} and got_["B"] == {"ts": N - 10, "w": 0.5} and got_["C"] == rec_["codex"]["C"], got_
         assert newest_codex({"t": 1}, hist_, new_) == {"t": 1}
+        # a note-only seat takes the newest reading among `new` (the carry record included) and drops its note/ok; an earlier record never fills it
+        rec_ = {"t": N + 9, "codex": {"C": {"ok": False, "note": "no usage cached yet"}, "D": {"ok": False, "note": "no saved login on this PC"}}}
+        nn_ = [{"t": N - 30, "codex": {"C": {"ts": N - 30, "w": 0.7, "wr": N + 99, "wp": WEEK}}}, {"t": N - 20, "codex": {"C": {"ts": N - 20, "w": 0.8, "wr": N + 99, "wp": WEEK}}}]
+        got_ = newest_codex(json.loads(json.dumps(rec_)), hist_, nn_)["codex"]
+        assert got_["C"] == {"ts": N - 20, "w": 0.8, "wr": N + 99, "wp": WEEK} and got_["D"] == rec_["codex"]["D"], got_      # D: nothing in `new` for it, hist ignored
+        assert newest_codex(json.loads(json.dumps(rec_)), hist_, [])["codex"] == rec_["codex"]       # C has a newer hist record, yet stays a note
+        cn_ = build([dict(rec_, codex={"C": got_["C"]})], N + 9, {}, False, {})["providers"][0]["accounts"]
+        assert cn_[0]["ok"] and cn_[0]["note"] == "" and cn_[0]["windows"], cn_       # the reading shows on the page
+        # the desktop app's page does not carry the meta refresh (removing the tag in script does not cancel the reload the browser already scheduled)
+        assert '<meta http-equiv="refresh"' not in page_html({"app": True}) and '<meta http-equiv="refresh" content="300">' in page_html({"app": False}) and '<meta http-equiv="refresh"' in page_html({})
         calls_, keep_ = [], (sample, load, save)                                        # the one-shot run (no --serve): sample first, then load, then reconcile
         try:
             globals()["sample"] = lambda now, force=False: calls_.append("sample") or {"t": N + 9, "codex": {"A": {"ts": N - 100, "w": 0.1}}}
@@ -3358,6 +3415,17 @@ def selftest():
             finally:
                 globals()["sample"], globals()["import_rollouts"], time.time = keep_s, keep_ir, real_time
             assert st.hist[-1]["t"] == K_ + 3 * BUCKET5 and load_pcache()["codex_import"] == wm_, "a failed import moved the watermark"
+            keep_lp, fails_ = load_pcache, st._import_fails                 # a provider cache that cannot be read now: the watermark is unknown, so nothing is imported or marked
+            def lp_(strict=False):
+                if strict:
+                    raise PcacheError("busy")
+                return {}
+            try:
+                globals()["load_pcache"] = lp_
+                assert st.read_rollouts(K_ + 4 * BUCKET5) is None and st._import_fails == fails_      # not counted as a failed import
+            finally:
+                globals()["load_pcache"] = keep_lp
+            assert load_pcache()["codex_import"] == wm_, "an unreadable cache moved the watermark"
             try:                                                    # an import that keeps failing stops pinning the watermark after IMPORT_RETRIES
                 globals()["import_rollouts"] = lambda *a, **k: (_ for _ in ()).throw(OverflowError("x"))
                 got_ = [st.read_rollouts(K_ + 3 * BUCKET5, mark=False) for _ in range(IMPORT_RETRIES - 1)]
@@ -3676,6 +3744,16 @@ def selftest():
             finally:
                 globals().update(stub)
             assert "A" in load_pcache()["codex_pending"] and "reconciled" not in open(APPLOG).read()
+            # an unexpected exception in the Grok or Gemini read becomes that provider's note: the Claude and Codex parts of the sample are still returned
+            def boom_(*a_, **k_):
+                raise RuntimeError("boom")
+            try:
+                globals().update(read_claude=lambda: {"X": {"ts": 1, "w": 0.1}}, read_codex=lambda *a_, **k_: ({}, {}), fetch_grok=boom_, read_gemini=boom_, gemini_email=boom_)
+                rs_ = sample(time.time(), True)
+            finally:
+                globals().update(stub)
+            assert rs_["s"] == {"X": {"ts": 1, "w": 0.1}} and rs_["grok"]["grok"] == {"ok": False, "note": "Grok usage unavailable (RuntimeError)"}, rs_
+            assert rs_["gemini"]["antigravity"] == {"ok": False, "note": "Antigravity usage unavailable (RuntimeError)"} and "gemini read failed: RuntimeError" in open(APPLOG).read(), rs_
             assert cst.codex_reset_clear("A")["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
             assert cst.codex_reset_clear("A")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
             r_ = cst.codex_reset("A", "/x", fake)                                                                   # a clear answer: no mark left
@@ -4583,7 +4661,7 @@ def selftest():
             assert open(PCACHE, "rb").read() == bad_
             st.hist = []                                            # this Store was built bare (no history loaded)
             rr_ = st.read_rollouts(JN, rd_)
-            assert rr_ == [] and open(PCACHE, "rb").read() == bad_      # the sampler's import logs it and carries on
+            assert rr_ is None and open(PCACHE, "rb").read() == bad_      # the watermark is unknown: the import is skipped this tick (logged), not run as a first one
             copies_ = glob.glob(PCACHE + ".bad-*")
             assert len(copies_) == 1 and open(copies_[0], "rb").read() == bad_, copies_            # the same bad file is copied once
             os.remove(copies_[0])
