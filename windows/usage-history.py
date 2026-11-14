@@ -1637,8 +1637,10 @@ def rollout_files(cdir, now, since):
 IMPORT_RETRIES = 3        # consecutive failed imports before the watermark moves past them anyway
 
 
-def rollout_events(path):
-    """(t, {window id: (used fraction, reset, period)}) for each usable token_count line, read streaming; bad lines are skipped."""
+def rollout_events(path, strict=False):
+    """(t, {window id: (used fraction, reset, period)}) for each usable token_count line, read streaming; bad lines are skipped.
+    A file that cannot be opened or read is skipped too, unless `strict`: then an OSError other than FileNotFoundError (a file deleted since it was
+    listed is gone for good) is raised, so an import cannot count a momentarily unreadable log as read and move its watermark past it."""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -1662,7 +1664,9 @@ def rollout_events(path):
                     continue            # one bad line (a non-finite number, deep nesting) is skipped, never the whole import
                 if wins:
                     yield int(t), wins
-    except OSError:
+    except OSError as e:
+        if strict and not isinstance(e, FileNotFoundError):
+            raise
         return
 
 
@@ -1671,7 +1675,7 @@ def codex_events(cdir, now, since, known):
     and an active-login event goes to the one seat whose known reset for that window is within SLOP s (no match, or several seats: skipped)."""
     own, act = [], []
     for f, seat in rollout_files(cdir, now, since):
-        (own if seat else act).extend((t, seat, w) for t, w in rollout_events(f))
+        (own if seat else act).extend((t, seat, w) for t, w in rollout_events(f, strict=True))
     for _, seat, wins in own:
         for w, (_, r, _) in wins.items():
             known.setdefault(w, {}).setdefault(r, set()).add(seat)
@@ -1698,6 +1702,7 @@ def rollout_records(events, taken, rebuilt, hist=(), carry=False):
                     state[s] = dict(v, ts=v.get("ts") or prior[i]["t"])
             i += 1
         st = state.setdefault(seat, {})
+        st.pop("ok", None); st.pop("note", None)      # an event is a real measurement: a note this seat inherited from an earlier record (ok False) is not carried onto it
         for w, (used, reset, period) in wins.items():
             st[w], st[w + "r"], st[w + "p"] = used, reset, period
         st["ts"] = t
@@ -3313,6 +3318,13 @@ def selftest():
         assert nb_[0]["codex"]["A"]["banked"] == 1, nb_                                       # the premise: the log record is built on the old sample
         got_ = newest_codex({"t": N, "codex": {"A": {"ts": F_, "w": 0.32, "wr": N + WK_, "wp": WK_, "banked": 0, "bankedList": []}}}, hb_, nb_)["codex"]["A"]
         assert got_["w"] == 0.35 and got_["ts"] == T_ and got_["banked"] == 0 and got_["bankedList"] == [], got_
+        # a seat's state seeded from a note-only record (ok False + note, stamped with a ts) loses both when an event measures it: the record holds the
+        # reading, and newest_codex (which ignores a failed read) seeds the sample from it
+        hn_ = [{"t": N - 700, "codex": {"C": {"ok": False, "note": "no usage cached", "ts": N - 700}}}]
+        nn_ = rollout_records([(N - 300, "C", {"w": (0.4, N + WK_, WK_)})], set(), False, hn_)
+        assert nn_ and nn_[0]["codex"]["C"]["w"] == 0.4 and "ok" not in nn_[0]["codex"]["C"] and "note" not in nn_[0]["codex"]["C"], nn_
+        got_ = newest_codex({"t": N, "codex": {"C": {"ok": False, "note": "no usage cached"}}}, hn_, nn_)["codex"]["C"]
+        assert got_["w"] == 0.4 and got_["ts"] == N - 300 and "ok" not in got_ and "note" not in got_, got_
         # Z-suffixed timestamps parse on every Python 3.10+ (3.10's fromisoformat rejects the Z)
         assert _fromiso("2026-11-12T20:15:30Z") == _fromiso("2026-11-12T20:15:30+00:00") and _fromiso("2026-11-12T20:15:30.123z").microsecond == 123000 and _fromiso("2026-11-12T20:15:30.123456789Z").microsecond == 123456
         # a fraction of any length reads the same on Python 3.10: short ones are padded, long ones trimmed; _iso (the cedar ends_at) goes through the same reader
@@ -3466,6 +3478,32 @@ def selftest():
                          + ln_(1800000000).replace('"window_minutes": 300', '"window_minutes": NaN') + chr(10))
             ev_ = list(rollout_events(bl_))
             assert len(ev_) == 1 and list(ev_[0][1].values())[0][1] == 1800000000, ev_
+            import builtins                                         # a log that cannot be opened: skipped by default, but an import must see the failure (retried, watermark kept)
+            cd_ = tempfile.mkdtemp(); os.makedirs(os.path.join(cd_, "sessions"))
+            sh_ = shutil.copy(bl_, os.path.join(cd_, "sessions", "rollout-p.jsonl"))
+            real_open_ = builtins.open
+            def deny_(exc):
+                def op_(f, *a, **k):
+                    if str(f) == sh_:
+                        raise exc
+                    return real_open_(f, *a, **k)
+                return op_
+            try:
+                builtins.open = deny_(PermissionError(13, "locked"))
+                assert list(rollout_events(sh_)) == []
+                try:
+                    list(rollout_events(sh_, strict=True)); raise SystemExit("strict rollout_events swallowed a PermissionError")
+                except PermissionError:
+                    pass
+                try:
+                    codex_events(cd_, time.time(), 0, {}); raise SystemExit("codex_events swallowed a PermissionError")
+                except PermissionError:
+                    pass
+                builtins.open = deny_(FileNotFoundError(2, "gone"))
+                assert list(rollout_events(sh_, strict=True)) == [] and codex_events(cd_, time.time(), 0, {}) == []      # deleted since listed: genuinely gone
+            finally:
+                builtins.open = real_open_
+            assert len(list(rollout_events(sh_, strict=True))) == 1
             wk_ = lambda u, r, i: json.dumps({"timestamp": "2026-11-13T10:00:00Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": i, "output_tokens": 5}},
                                                 "rate_limits": {"primary": {"window_minutes": 10080, "used_percent": u, "resets_at": r}}}})
             with open(bl_, "a", encoding="utf-8") as fh:

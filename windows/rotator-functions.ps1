@@ -34,9 +34,9 @@ function claude {
     # move off it before this process's first request. A healthy seat, including A, is used as-is.
     $__root = Join-Path $ProfileHome '.claude-cli-accounts'
     $__act = Join-Path $__root '.active'; $__prev = $env:CLAUDE_CODE_OAUTH_TOKEN
-    # A credential command (claude setup-token / login / /login, as the FIRST argument) must run even when every seat is refused: no gate,
-    # and no seat token handed to it (it makes its own credential), not even an inherited one.
-    $__cred = @($args).Count -gt 0 -and "$(@($args)[0])" -in 'setup-token', 'login', '/login'
+    # A credential command (claude setup-token / login / /login / auth login, as the FIRST argument, or `auth` then `login`) must run even when every seat is refused: no gate,
+    # and no seat token handed to it (it makes its own credential), not even an inherited one. `auth status` and other `auth` subcommands stay gated.
+    $__cred = @($args).Count -gt 0 -and ("$(@($args)[0])" -in 'setup-token', 'login', '/login' -or (@($args).Count -gt 1 -and "$(@($args)[0])" -eq 'auth' -and "$(@($args)[1])" -eq 'login'))
     if ($__cred) { Remove-Item Env:\CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue }
     if (Test-Path $__act) {
         $__label = (Get-Content $__act -Raw).Trim()

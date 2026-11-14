@@ -439,7 +439,7 @@ Set-Content -LiteralPath (Join-Path $ga '.active') -Value 'B' -NoNewline
 $gb = Join-Path $gh '.local\bin'; New-Item -ItemType Directory -Force -Path $gb | Out-Null
 $pyl = (Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if ($pyl) { Copy-Item $pyl (Join-Path $gb 'claude.exe') }
-foreach ($n in 'setup-token', 'run') { Set-Content -LiteralPath (Join-Path $gd $n) -Value 'import os; print("TOKEN=" + os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "-"))' }
+foreach ($n in 'setup-token', 'auth', 'run') { Set-Content -LiteralPath (Join-Path $gd $n) -Value 'import os; print("TOKEN=" + os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "-"))' }
 Set-Content -LiteralPath (Join-Path $ga 'B\token.txt') -Value 'sk-ant-oat01-SEATB-TOKENVALUE' -NoNewline
 # (the wrapper's paths come from USERPROFILE at dot-source time; the py shim then needs the real one back to find Python)
 $gate = { param($a) & pwsh -NoProfile -NonInteractive -Command "Set-Location '$gd'; `$env:USERPROFILE = '$gh'; `$env:CLAUDE_ROTATOR_PROXY = '0'; `$env:CLAUDE_CODE_OAUTH_TOKEN = 'inherited'; . '$gd\rotator-functions.ps1'; `$env:USERPROFILE = '$($envKeep['USERPROFILE'])'; claude $a" 2>&1 | Out-String }
@@ -450,6 +450,9 @@ Check 'a credential word that is not the first argument is still gated' ((& $gat
 Check '/login is never gated' ((& $gate '/login') -notmatch 'Not starting Claude Code')
 $st_ = & $gate 'setup-token'
 Check 'setup-token is never gated, and is handed no token at all' ($st_ -notmatch 'Not starting Claude Code' -and (-not $pyl -or $st_ -match 'TOKEN=-')) $st_
+$al_ = & $gate 'auth login'
+Check 'auth login is never gated, and is handed no token at all' ($al_ -notmatch 'Not starting Claude Code' -and (-not $pyl -or $al_ -match 'TOKEN=-')) $al_
+Check 'auth status is still gated' ((& $gate 'auth status') -match 'Not starting Claude Code')
 Remove-Item -LiteralPath (Join-Path $ga 'B\access-disabled.json')
 Check 'a normal start on a healthy seat gets that seat token' (-not $pyl -or (& $gate 'run') -match 'TOKEN=sk-ant-oat01-SEATB-TOKENVALUE')
 

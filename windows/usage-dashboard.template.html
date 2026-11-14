@@ -163,7 +163,7 @@ const sh = (v, lim) => quotaShare(v, lim.cap);
 const seatsTxt = lim => seatsOf(lim) + ' seat' + (seatsOf(lim) === 1 ? '' : 's');
 // The rate the headline number and the projection use. 'typ' is the limit's typical-day profile (24 hourly %/h); a young limit has none and falls back to 3h.
 function rateFor(lim) {
-  const w = ui.win;
+  const w = winKey();                  // not ui.win: in the drain view Typical shows the 3h segment, so the headline must use 3h too
   if (w === 'typ' && lim.profile) return { rate: lim.profile, avg: lim.typical, why: 'Typical week, average of all hours', proj: 'typical-day profile' };
   const k = w === 'typ' ? '3' : w, b = lim.burn ? lim.burn[k] : null;
   return { rate: b, avg: b, why: w === 'typ' ? 'Last 3h (not enough history for a typical week)' : 'Last ' + k + 'h', proj: k + 'h burn' };

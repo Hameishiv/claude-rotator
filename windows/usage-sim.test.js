@@ -400,4 +400,17 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(idle > 0 && idle < body.search(/& pwsh|Start-Process|& \$script/));
   assert.ok(files.some(f => f.endsWith('check-rotate-hidden.vbs')) && /WScript\.ScriptFullName/.test(fs.readFileSync(path.join(__dirname, 'check-rotate-hidden.vbs'), 'utf8')));
 }
+// the headline rate follows the window the chart shows: in the drain view Typical is drawn as the 3h segment (winKey), so rateFor must use 3h too, profile or not
+{
+  const tpl = require('fs').readFileSync(require('path').join(__dirname, 'usage-dashboard.template.html'), 'utf8');
+  const src = tpl.slice(tpl.indexOf('function rateFor(lim) {'), tpl.indexOf('const ICON'));
+  const mk = ui => new Function('ui', src + '\nreturn rateFor;')(ui);
+  const lim = { profile: Array(24).fill(5), typical: 5, burn: { '1': 9, '3': 7, '6': 6, '24': 4 } };
+  const drain = mk({ view: 'drain', win: 'typ' })(lim);
+  assert.ok(drain.rate === 7 && drain.avg === 7 && drain.why === 'Last 3h' && drain.proj === '3h burn', JSON.stringify(drain));
+  const other = mk({ view: 'rem', win: 'typ' })(lim);                                    // any other view: Typical is still the profile
+  assert.ok(other.rate === lim.profile && other.avg === 5 && other.why.startsWith('Typical week'), JSON.stringify(other));
+  assert.strictEqual(mk({ view: 'drain', win: '6' })(lim).why, 'Last 6h');
+  assert.ok(mk({ view: 'drain', win: 'typ' })({ burn: { '3': 2 } }).why === 'Last 3h' && mk({ view: 'rem', win: 'typ' })({ burn: { '3': 2 } }).why.startsWith('Last 3h (not enough'));
+}
 console.log('usage-sim tests passed');
