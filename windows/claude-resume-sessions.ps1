@@ -30,7 +30,8 @@ ONLY SESSIONS A LIMIT ACTUALLY STOPPED (owner, 2026-10-30). A session that finis
 is waiting on a question, or is still working gets nothing: a nudge there costs a whole turn of
 tokens for no reason. Stopped-by-a-limit is read from the session itself: Claude Code's
 ~/.claude/sessions/<pid>.json gives the session id and its status, and the newest real exchange
-in its transcript must be the CLI's own rate_limit / billing_error stop. A busy or waiting session
+in its transcript must be the CLI's own rate_limit / billing_error stop, or a subscription-disabled
+403 (oauth_org_not_allowed). A busy or waiting session
 is never touched. When the session file or transcript can't be read, it is pinged anyway
 (fail-open, same as the parked-review check), and the log says so.
 #>
@@ -89,7 +90,19 @@ public static class ProcCwd {
 '@
 
 # ---- discover running interactive Claude TUI sessions ----
-$procs = Get-CimInstance Win32_Process
+# LINUX-PORT: no CIM on Linux. Build the same shape (Name/ProcessId/ParentProcessId/CommandLine) from
+# /proc; Name = basename of argv[0], so the native claude binary reads as 'claude'.
+$procs = if ($IsLinux) {
+  foreach ($d in (Get-ChildItem /proc -Directory -EA SilentlyContinue | Where-Object Name -match '^\d+$')) {
+    try {
+      $argv = ([IO.File]::ReadAllText("/proc/$($d.Name)/cmdline")).TrimEnd([char]0).Split([char]0)
+      $st = [IO.File]::ReadAllText("/proc/$($d.Name)/stat")
+      [pscustomobject]@{ ProcessId = [int]$d.Name; Name = [IO.Path]::GetFileName($argv[0])
+                         ParentProcessId = [int](($st.Substring($st.LastIndexOf(')') + 2)) -split ' ')[1]
+                         CommandLine = ($argv -join ' ') }
+    } catch {}
+  }
+} else { Get-CimInstance Win32_Process }
 $byId  = @{}; foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }
 
 function Ancestors([int]$pid_) {
@@ -130,7 +143,7 @@ function VSCodeWindowHwnd([int]$pid_) {
 
 # interactive TUI = claude.exe, NOT the Electron desktop app, NOT a headless/bridge invocation
 $targets = $procs | Where-Object {
-  $_.Name -eq 'claude.exe' -and $_.CommandLine -and
+  ($_.Name -eq 'claude.exe' -or ($IsLinux -and $_.Name -eq 'claude')) -and $_.CommandLine -and   # LINUX-PORT: binary has no .exe
   $_.CommandLine -notlike '*--type=*' -and
   $_.CommandLine -notlike '*--output-format*' -and
   $_.CommandLine -notlike '*--print*' -and
@@ -151,8 +164,10 @@ function Get-SessionId($cmd) {
 }
 
 # ---- was this session actually stopped by a usage limit? ----
-$SessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
-$ProjectsDir = Join-Path $env:USERPROFILE '.claude\projects'
+# LINUX-PORT: $env:USERPROFILE is unset on Linux (Join-Path on $null throws) and '\' is not a separator.
+$UserHome    = if ($IsLinux) { $HOME } else { $env:USERPROFILE }
+$SessionsDir = Join-Path (Join-Path $UserHome '.claude') 'sessions'
+$ProjectsDir = Join-Path (Join-Path $UserHome '.claude') 'projects'
 $LimitErrors = @('rate_limit', 'billing_error')   # billing_error is the CLI's "usage limit reached"
 function Get-SessionFile([int]$pid_) {
   $f = Join-Path $SessionsDir "$pid_.json"
@@ -189,7 +204,13 @@ function Test-StoppedByLimit([int]$pid_) {
   if ($s.status -in @('busy', 'waiting', 'shell')) { return @('no', "status $($s.status)$(if ($s.waitingFor) { " ($($s.waitingFor))" })") }
   $e = Get-LastExchange $s.sessionId
   if (-not $e) { return @('unknown', 'transcript unreadable') }
-  if ($e.type -eq 'assistant' -and $e.isApiErrorMessage -and ([string]$e.error) -in $LimitErrors) { return @('yes', [string]$e.error) }
+  $err = [string]$e.error
+  $blob = $err
+  try { $blob += ' ' + [string]$e.message.content[0].text } catch {}
+  $accessStop = ($blob -match 'oauth_org_not_allowed') -or ($blob -match 'disabled Claude subscription access') -or ($blob -match 'OAuth authentication is currently not allowed')
+  # Subscription-disabled is a hard stop, same as a quota stop: the session cannot continue on that seat.
+  # Only an assistant API-error turn matches. A normal answer that quotes the phrase does not.
+  if ($e.type -eq 'assistant' -and $e.isApiErrorMessage -and (($err -in $LimitErrors) -or $accessStop)) { return @('yes', $(if ($err) { $err } else { 'subscription_disabled' })) }
   if ($e.type -eq 'assistant') { return @('no', 'its last turn ended normally (finished, or waiting on a question)') }
   return @('no', 'last entry is a user message (already answered or still working)')
 }
@@ -201,7 +222,7 @@ foreach ($t in $targets) {
   $rec = [pscustomobject]@{
     Pid = [int]$t.ProcessId; Cmd = $t.CommandLine
     SessionId = $sid
-    Cwd = [ProcCwd]::Get([int]$t.ProcessId)
+    Cwd = $(if ($IsLinux) { (Get-Item "/proc/$($t.ProcessId)/cwd" -EA SilentlyContinue).Target } else { [ProcCwd]::Get([int]$t.ProcessId) })   # LINUX-PORT: /proc cwd instead of PEB
     InVSCode = (Is-InVSCode ([int]$t.ProcessId))
   }
   if ($rec.InVSCode) { $vscode += $rec } else { $own += $rec }
@@ -228,6 +249,10 @@ function Select-Blocked($list) {
 $vscode = @(Select-Blocked $vscode); $own = @(Select-Blocked $own)
 
 if ($DryRun) { Write-Host "`n-DryRun: would act on $($vscode.Count) VS Code + $($own.Count) own-window session(s); nothing was killed, relaunched, or typed." -ForegroundColor Yellow; return }
+
+# LINUX-PORT: discovery above works on Linux, delivery below does not (VS Code keystrokes and the
+# WriteConsoleInput injector are kernel32-only), so stop here rather than call the Windows injector.
+if ($IsLinux -or $IsMacOS) { Write-Host "`nsession resume is not supported on Linux yet; sessions left as they are ($($vscode.Count + $own.Count) found)." -ForegroundColor Yellow; return }
 
 # ---- VS Code: exit + resume ----
 if (-not $OwnWindowOnly) {

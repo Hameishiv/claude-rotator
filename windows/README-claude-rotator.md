@@ -5,22 +5,47 @@ your Anthropic accounts by swapping a **long-lived setup-token**. All accounts s
 **one** `~/.claude` config — same skills, MCP connectors, and session history — and only
 the auth token changes.
 
-- **Script:** `C:\Dev\Rotators\claude-cli-account.ps1`
+- **Script:** `claude-cli-account.ps1` in your rotator folder (wherever you put this repo's `windows/` files).
 - **Invoke via** the `claude-rotator` (or `claude-cli-account`) PowerShell profile function.
 
-> **Where the scripts live** (corrected 2026-08-09 — this file used to point at
-> `~\.grok\bin\` for the two rotators, where they do not exist):
->
-> | Script | Real path |
-> |---|---|
-> | `claude-cli-account.ps1` (CLI rotator) | `C:\Dev\Rotators\` |
-> | `claude-app-rotator.ps1` (app rotator) | `C:\Dev\Rotators\` |
-> | `rotator-functions.ps1` (the profile functions) | `C:\Dev\Rotators\` |
-> | `sync-app-history.ps1` | `C:\Users\User\.grok\bin\` |
-> | `reset-seat-webview.ps1` | `C:\Users\User\.grok\bin\` |
->
-> The profile does not define the functions itself — both shells dot-source
-> `C:\Dev\Rotators\rotator-functions.ps1`, so **edit the functions there**.
+## Quick start
+
+**You need:** Windows 10 or 11; [PowerShell 7](https://aka.ms/powershell) (`pwsh`); Python 3.10+ with the `py` launcher;
+the Claude Code CLI (`claude`); Git, only for updates. Optional, each for its own tab or feature: the Claude desktop app,
+the Codex CLI, the Grok CLI, the Antigravity app (Gemini).
+
+1. **Get the files.** Clone this repo. The folder you run from (the **rotator folder**) is the repo's `windows/` folder,
+   or a copy of it anywhere you like. Run from the clone itself, updates come from `git pull`: `rotator-sync` is for a
+   separate copy: inside the clone `--pull` is refused and `--check` reports no drift.
+2. **Load the shortcuts.** Add one line to your PowerShell profile (`notepad $PROFILE`), then open a new terminal:
+   ```
+   . "C:\path\to\rotator-folder\rotator-functions.ps1"
+   ```
+   That defines `claude-rotator`, `claude-account`, `claude-resume` and the `claude` wrapper.
+3. **Settings (optional).** Copy `rotator.local.example.json` to `rotator.local.json` in the rotator folder. Every key is
+   optional and is explained in the example file; `repoClone` (your clone) is what `rotator-sync` needs for updates.
+4. **Add your accounts.** For each Claude account, sign in to it in a browser, run `claude setup-token`, and store the token
+   under a label of your choice (`A`, `B`, ...): `claude-rotator --capture A`. Put the account's address in
+   `%USERPROFILE%\.claude-cli-accounts\A\email.txt`. Details: *Add a new account / seat* below.
+5. **First run.** `claude-rotator --status` probes every seat and shows its usage; `claude-rotator --switch best` switches to the
+   seat with the most headroom (`--best` only ranks them).
+6. **Automatic rotation (optional).** Register the 5-minute watcher (run once; adjust the path):
+   ```
+   $a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"C:\path\to\rotator-folder\check-rotate-hidden.vbs"'
+   $t = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+   Register-ScheduledTask -TaskName 'Claude usage auto-rotate' -Action $a -Trigger $t
+   ```
+7. **The Agent Dashboard (optional).** `pwsh -File usage-app-install.ps1` in the rotator folder installs it: a local page on
+   `http://127.0.0.1:8787/` and a Start-menu entry, **Agent Dashboard**. `-Uninstall` removes it.
+
+**What each dashboard tab needs** (a tab you have not set up shows a note instead of numbers):
+
+| Tab | Needs | Optional extras |
+|---|---|---|
+| Claude | accounts added with `claude-rotator` (step 4); readings appear once the rotator has probed a seat (`--status`, or the watcher) | Banked reset credits need a full Claude login for that account, which the desktop app keeps: sign in to the account in the app and capture it with `claude-account --capture <label>` (a setup-token cannot read them). Switch buttons need the desktop app for the App role. |
+| Codex | the Codex CLI; one saved login per seat in `%USERPROFILE%\.codex\homes\<label>\`; readings come from each seat's usage cache there and from the Codex session logs | `codexUsageScript` lets Refresh update Codex; `codexRedeemScript` adds Apply reset; a `codex-app-rotator.ps1` next to the dashboard adds switch buttons. All are off until set. |
+| xAI | the Grok CLI, signed in (`grok`) | none |
+| Gemini | the Antigravity app running (not as administrator) | none |
 
 > Supersedes the old seat-based design. There are **no** separate `CLAUDE_CONFIG_DIR`
 > seat directories anymore (`~/.claude-seat2`, `~/.claude-seat3`). An empty/missing seat
@@ -202,6 +227,7 @@ Gate C simply waits.
 Why this is cheap: a **capped** account 429s instantly and spends nothing, so the only state that
 costs anything is "high but not yet capped". A quiet day costs **zero** Fable tokens; a seat parked
 at 90% costs 48 probes/day (~1.5k tokens), and at the 15-min floor at most 96/day (~3k).
+An armed Fable probe that is refused outright (a 403 subscription refusal) rotates the active seat at once, through the same access trigger as a refused Haiku probe.
 
 ⚠ **No safety net, by explicit choice.** While disarmed nothing re-reads Fable, so a seat that
 climbs past the arming line with no rotation and no manual `--usage`/`--status`/`--best` in between
@@ -228,7 +254,11 @@ and takes the app down together with the CLI. Detected from the app's live accou
 same ground truth `claude-app-rotator.ps1` uses, and for its reason: that script's `.active`
 pointer drifts whenever you log in or out inside the app by hand, so it is only the fallback.
 The exclusion lives in `Rank-Accounts`, so `--best` honours it too; an explicit
-`--switch <label>` still overrides, deliberately.
+`--switch <label>` still overrides, deliberately. No label is reserved by letter. Profiles kept
+under `~/.claude-cli-accounts/.inactive` are old identities, not candidates, because that
+directory is hidden. A subscription-disabled 403 (`oauth_org_not_allowed`) is a different event:
+the active seat is refused and the watcher rotates. A timeout is not that refusal and does not
+mark every seat disabled.
 
 **After a CAP rotation only, running sessions are pinged** that their quota is back
 (`claude-resume-sessions.ps1 -OwnWindowOnly`, which injects with `WriteConsoleInput` and steals no
@@ -312,7 +342,7 @@ live; the cache is the answer.
 
 ## Local rotate proxy (2026-10-30)
 
-`C:\Dev\Rotators\claude-rotate-proxy.py` is a small stdlib-only pass-through proxy on
+`claude-rotate-proxy.py` (in the rotator folder) is a small stdlib-only pass-through proxy on
 `127.0.0.1:18484`. It takes two ideas from doxaras/claude-rotate (MIT) and nothing else:
 
 1. **It reads usage off every real response.** The `anthropic-ratelimit-unified-*` headers,
@@ -320,9 +350,12 @@ live; the cache is the answer.
    `<label>\usage-cache[-fable].json` files a probe writes, tagged `src=proxy`. The watcher uses a
    proxy reading younger than 2 min instead of probing, and the Fable ladder picks it up as a free
    baseline. This closes the blind spells behind the 09-20/09-22/09-23 caps.
-2. **A quota 429 retries on the next seat.** When a window is `rejected`, the proxy runs
-   `--check-rotate --now --source proxy` and retries the request once on whatever seat that picked.
-   A per-minute burst 429 is passed through untouched; Claude Code retries those itself.
+2. **A quota 429, or an explicit subscription-disabled 403, retries on the next seat.** When a
+   window is `rejected`, or the body is an `oauth_org_not_allowed` / "subscription access disabled"
+   403, the proxy runs `--check-rotate --now --source proxy` and retries the request once on
+   whatever seat that picked. A per-minute burst 429 is passed through untouched. A timeout or any
+   other status is not an access refusal and does not mark seats disabled. No seat letter is
+   reserved; the only seat kept out of automatic targets is the desktop app's current identity.
 
 The proxy never picks an account. It always sends the **active** seat's token, re-read on every
 request, so a running session follows a rotation without restarting. Only requests carrying one of
@@ -345,7 +378,7 @@ So close/rotate/reopen stays for the app.
 | | |
 |---|---|
 | Task | `Claude rotate proxy`: at logon, re-launched every minute. A running instance makes the relaunch a no-op, so a dead proxy is back within a minute. |
-| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` |
+| Health | `Invoke-RestMethod http://127.0.0.1:18484/__proxy/health` — `ok` is false while the active seat's subscription-disabled cooldown is in force (or for 30 minutes after the watcher found every seat exhausted). A live process with a refused seat is not healthy. |
 | Log | `~\.claude-cli-accounts\.proxy-log.txt` (rolls at 1 MB) |
 | Opt out | `$env:CLAUDE_ROTATOR_PROXY = "0"` for the `claude` function; `MERGE_PR_ROTATE_PROXY=0` for review windows |
 | Tests | `claude-rotate-proxy.py --self-test`; `claude-rotate-proxy-test.py` (fake upstream, sandbox seats: quota 429 → rotate → retry, a running session follows, foreign token untouched, no-target returns the original 429) |
@@ -362,10 +395,18 @@ errors, so this usually shows up as a pause, not a failure.
   2 min apart. Checks are serialised by a mutex
   (`Global\claude-rotator-check`), so the task, the hook and the proxy cannot rotate twice off one
   reading.
-- **StopFailure hook.** `C:\Dev\Rotators\stopfailure-rotate.py` is registered in
-  `~\.claude\settings.json`. When any session stops on `rate_limit` / `billing_error`, it launches
-  `--check-rotate --now` hidden and returns at once. This is the backstop for sessions that don't
-  go through the proxy.
+- **StopFailure hook.** `stopfailure-rotate.py` (next to `claude-cli-account.ps1`) is registered in
+  `~\.claude\settings.json`. When any session stops on `rate_limit` / `billing_error`, or on a
+  subscription-disabled 403 (`oauth_org_not_allowed`), it launches `--check-rotate --now` and
+  returns at once. If the hook event has no `error` field, it reads only the transcript's newest
+  API-error token. A normal stop does not fire. This is the backstop for sessions that don't go
+  through the proxy. On a 403 refusal it first writes the refusal marker (`<seat>\access-disabled.json`,
+  as the proxy does) for the seat the stopping session ran on, found by matching its
+  `CLAUDE_CODE_OAUTH_TOKEN` against the seats' `token.txt` (never `.active`, which another session may
+  have moved), so the `--now` check takes its refusal path, fallback included. A session without that
+  variable (an app-spawned one) marks nothing, and neither does one going through the rotate proxy
+  (`ANTHROPIC_BASE_URL` at its loopback port): the proxy swaps in the active seat's token, so it records
+  refusals itself (`session_seat`, `via_proxy`, `mark_refused`; `test-stopfailure-rotate.py`).
 - **Rate cap.** The watcher refuses a 4th rotation inside 10 min (`$RotateCapCount`/
   `$RotateCapWindow`), logs `RATE CAP`, and returns 3. Three rotations that fast mean every seat is
   failing.
@@ -433,7 +474,7 @@ tools label the seat with the same address.
 ## Desktop app account switcher (`claude-account`)
 
 Separate from the CLI rotator above — this swaps the **desktop app's own login**
-(`C:\Dev\Rotators\claude-app-rotator.ps1`), stored under `%APPDATA%\Claude`. Keeping the app
+(`claude-app-rotator.ps1`), stored under `%APPDATA%\Claude`. Keeping the app
 on one seat and the CLI on another is fine; they're independent systems.
 
 **Run from a plain terminal with the app fully quit** — capture/switch/rotate need it closed,
@@ -444,6 +485,7 @@ a Claude session.
 |---|---|
 | `claude-account --status` | App state, live account + account UUID, captured profiles |
 | `claude-account --switch <label>` | Back up the current login, load profile `<label>` |
+| `claude-account --switch <label> --relaunch` | Close the running app first (asks its windows to close, waits up to 30 s, and aborts without force-closing if it is still running, telling you to quit it from the system tray if that is where it lives), switch, then reopen the installed app (the Squirrel `claude.exe` the Start-menu shortcut runs, else `Update.exe --processStart claude.exe`, else the MSIX package). A refused switch reopens the app on its old login. Tests: `test-app-relaunch.ps1` |
 | `claude-account --rotate [label]` | Cycle to the next profile (or switch straight to `<label>`) |
 | `claude-account --capture <label>` | Save the CURRENT app login as profile `<label>` |
 | `claude-account --list` / `--help` | List profiles / print help |
@@ -473,8 +515,8 @@ every 6 h, hidden). Refreshes the OAuth tokens inside every IDLE seat snapshot e
 live seat), and logs `DEAD` for a seat whose refresh chain has already expired, i.e. the seat that will
 say "Sign in again" on its next switch-in. `-Status` / `-DryRun` / `-SelfTest`; log
 `~\.claude-app-seats\.keepalive-log.txt`. It shares `.seat-write.lock` with `claude-account`, so a
-switch/capture waits for it (up to 90 s). Why it exists, and what it does NOT fix:
-`C:\Dev\hameishiv-wiki\wiki\handoffs\app-seat-relogin-20260922.md`.
+switch/capture waits for it (up to 90 s). Why it exists, and what it does NOT fix: the header of
+`claude-app-seat-keepalive.ps1`.
 
 ## Desktop app session history (`claude-sync-history`)
 
@@ -523,11 +565,31 @@ points at the transcript's last assistant turn and copies its session state (`la
 turn. Originals are copied to `~/.claude-app-seats\.reconcile-backups\<timestamp>\`. Records
 whose uuid isn't in the transcript, and sessions touched in the last 10 minutes, are left alone.
 
+**Archives, pins and groups follow you across seats (2026-11-03).** Each seat keeps its own record
+per session, with its own `isArchived` and `isStarred` (a sidebar pin). Every sync compares each
+record's flags with what it saw last run (`~/.claude-app-seats\.flag-state.json`): a changed flag
+(archive/un-archive, pin/unpin) is copied to every seat's record of that session, and "on" wins if two
+seats changed opposite ways. The first run, and any session never seen before, use "on for any seat →
+on for all". Originals backed up under `~/.claude-app-seats\.flag-sync-backups\<timestamp>\`.
+
+The shared pin list and each seat's sidebar groups live in `%APPDATA%\Claude\claude_desktop_config.json`
+(`preferences.epitaxyPrefs`: `starred-local-code-sessions`, `dframe-group-scopes`,
+`dframe-code-sections`), keyed by each seat's own record ids. The sync rebuilds the pin list from the
+records' `isStarred` and copies every group, its sidebar section and its sessions to every seat
+(sessions matched across seats by `cliSessionId`). A group created, renamed or deleted, or a session
+moved in or out of one, on any seat since the last run (`.sidebar-state.json`) is applied to all.
+**This step runs only while the app is closed** (the live app rewrites that file from memory), so in
+practice at a `claude-account --switch`/`--rotate`; the 30-minute task skips it and says so. The file
+is backed up to `~/.claude-app-seats\.sidebar-sync-backups\<timestamp>\` before each write. A seat
+shows only the group members it has a record for, so sessions pruned from a seat's history (older
+than `-MaxAgeDays`) don't appear in its groups. This uses the app's undocumented internal format: an
+app update that renames these keys makes the step silently do nothing until it is updated.
+
 **The app reads its index at launch** — after a sync, new records appear when the app is
 restarted (or the workspace reopened), not in an already-open window.
 
 ```
-claude-sync-history                      # sync + prune C:\Dev\hameishiv (default: recent 7d + substantive)
+claude-sync-history                      # sync + prune the default project (default: recent 7d + substantive)
 claude-sync-history -DryRun              # preview what would add/prune, change nothing
 claude-sync-history -MaxAgeDays 14       # widen/narrow the recency window (0 = keep all ages)
 claude-sync-history -KeepResumable       # also keep interrupted / died-pre-merge runs
@@ -556,8 +618,7 @@ terminal, `pwsh -File C:\Users\User\.grok\bin\reset-seat-webview.ps1` — quits 
 MOVES that seat's web-view storage to a timestamped backup under `~/.claude-app-seats\`,
 keeps login cookies, relaunches. Confirmed working 2026-07-20 (seat B). Do NOT chase the
 `[watch-record] i.on is not a function` warning (fires on every seat, harmless) and do NOT
-assume data loss. Full record:
-`C:\Dev\hameishiv-wiki\wiki\lessons\app-seat-sidebar-empty-reset-webview.md`.
+assume data loss.
 
 ## Desktop-app install flavour (MSIX vs Squirrel) — why path matching is doubled
 
@@ -592,7 +653,6 @@ Consequently these four now match **both** paths, so they keep working on either
 - `claude-resume-sessions.ps1` — *excludes* the app from the interactive sessions it resumes.
   The app's main process carries no `--type=` switch, so with only the `WindowsApps` test it
   passed every other filter and would have been killed and "resumed" as if it were a CLI TUI.
-
 
 ## Notes
 
@@ -645,3 +705,153 @@ A Claude Code mod at `mods/seats/ (installed via --plugin-dir or a plugin folder
 adds `/seats` (runs `claude-cli-account.ps1 --status`). A `command.run` hook answers the command itself, so it costs
 no model turn; the status run itself is the usual live read (~5s, tiny probes). Built 2026-11-01,
 tested headless with `claude -p --plugin-dir <mod folder> "/seats"`. Needs Claude Code 2.1.287+.
+
+## Agent Dashboard (`usage-history.py`)
+
+The Agent Dashboard is a local app. `usage-app-install.ps1` registers the logon task `Claude usage dashboard`,
+which runs `usage-history.py --serve` on `127.0.0.1:8787` at Idle CPU priority, and adds the Start-menu shortcut
+`Agent Dashboard` that opens the page as an app window (install and `-Uninstall` also remove the shortcuts of the
+app's earlier names, `Quota Management` and `Quota`). Every 5 minutes it reads each
+seat's `usage-cache[-fable].json` (it never probes), appends a line to
+`~/.claude-cli-accounts/.usage-history.jsonl` (35 days kept), and rewrites
+`~/.claude-cli-accounts/usage-dashboard.html` from `usage-dashboard.template.html`. The page shows
+the weekly quota left (all models or Fable) as a share of the whole pool (100 % = every seat full; the headline says how many seats), the usage rate in % of the whole pool per hour, and a projection of
+when the pool runs out, with each seat refilled at its weekly reset. It reloads itself every 5 min.
+**Refresh** (app only) probes every Claude seat (`claude-cli-account.ps1 --status`) and samples again. It updates Codex too when
+`codexUsageScript` (and `codexUsageArgs`) in `rotator.local.json` name your Codex usage command (a `.ps1` runs under pwsh, a `.py`
+under `py -3`; see `rotator.local.example.json`): Refresh runs it first, at Idle and never killed; still running after 120 s, the page
+says Codex is still updating and the lock is held until it ends, then the dashboard samples again (`codex_usage_argv`,
+`run_codex_usage`, `Store.codex_usage_wait`, selftest). Unset, the Codex tab says Refresh cannot update it and how to set it up.
+`--render` re-renders without sampling; `--selftest` runs the checks. `--backfill [--days N]` rebuilds past history (Claude from
+`.rotate-log.txt`, Codex from the session logs) and is safe while the app runs: every write to the history file holds
+`.usage-history.jsonl.lock` (`hist_lock`), and a writer re-reads the file when another process changed it (selftest block A).
+The provider cache has its own `.usage-providers.json.lock` (`pcache_lock`). Both are OS locks on the open lock file
+(`file_lock`: `msvcrt.locking` / `fcntl.flock`), released when the holder exits, so a crash never leaves one held.
+A provider cache that exists but cannot be parsed is never replaced by an empty one: a read-modify-write (`pcache_txn`, `pcache_merge`) raises `PcacheError` and leaves the file alone
+(one copy is kept as `.usage-providers.json.bad-<mtime>`; a plain read just sees it as empty, and so does a 0-byte file), the sampler logs it and keeps sampling, the reset and clear actions answer 500 with the same message, and every save is flushed to disk before it replaces the file.
+The page then shows that message in a banner above the page (an alert, read out when it appears or its text changes and not again on each refresh; a read that fails with an OS error is retried twice, 0.2 s apart, before the banner appears), with every Apply / Resend / Clear button hidden. To recover, check the seats' limits first, then repair or delete the file; deleting it forgets pending resets.
+
+The projection uses, by default, a **typical-day profile** (button `Typical` under `Rate over`): the expected %/h for
+each local hour of the day, built from the limit's whole history (up to 35 days), so nights and weekends are not
+extrapolated at the daytime rate. `1h`/`3h`/`6h`/`24h` hold that recent rate flat instead. `--backtest` replays the
+history, projecting 24 h ahead from every 6 h point with each method (the profile built only from data before that
+point), and prints each method's mean absolute error; run it again once more history has accumulated.
+Account tables badge the seat each tool is on with a blue `CLI` or violet `App` pill (Codex's app and CLI share one login, so `App`; the provider header repeats them with the seat letter) and colour
+each cell: for Claude from the API's own status for that window (`allowed`, `allowed_warning`, `rejected`), for Codex,
+xAI and Gemini green below 85 %, yellow from 85 %, red and `capped` at 100 %. A Codex seat with a banked reset gets an
+`Apply reset` button (app only; it asks first) that runs `codexRedeemScript` (`rotator.local.json`; there is no default)
+with `--account X --confirm`; unset, or with no such file, the button is not shown. The script is never killed (it copies refreshed credentials back as it ends): one still running after 90 s
+gets the answer "still applying", and every other action waits (409) until it exits (`Store.codex_reset`, selftest).
+The script mints a new claim on every run, so before it runs the seat is marked unconfirmed (`codex_pending` in the
+provider cache). A clear answer from the script (`redeemed`, `no_credit`) drops the mark; anything else (a crash,
+unreadable output, the script's own error) keeps it, and the seat shows "Last reset unconfirmed" with no Apply button
+(the server refuses it too). No reading lifts the mark, not even a lower banked count: a count can drop for another reason
+(a credit expiring, one used elsewhere) or before the claim lands. It stays until the user's `Clear`, which asks first
+(Cancel is the default) and then drops it (`POST /api/codex-reset-clear`, `Store.codex_reset_clear`); that is for after
+codex-usage shows the reset was not used. The reset column stays on show while any seat has a reset action or a pending
+state, even with nothing banked (selftest, `usage-sim.test.js`). Gemini is readable only while the Antigravity app is open (the `agy` CLI keeps its token to itself). Gemini's limits are
+shown one per quota group: a group shared by several models is "Pool 1", "Pool 2"... (no model is named), and only a group
+of exactly one model carries that model's name (`parse_gemini`, selftest).
+A reading over 1 h old is shown in a muted warning colour in the `Read` column, over 3 h in a stronger one. A provider with nothing readable (Gemini with the Antigravity app closed) shows just its note.
+Limit: a seat used elsewhere (the app, the VM) only updates when something probes it, so its line moves in steps.
+
+Seats are not all the same size (a Codex Pro seat holds several times a Plus seat's allowance), so each seat has a **weight**: how many regular seats it
+counts as. Set it in `rotator.local.json` (see `rotator.local.example.json`), per provider and seat letter, first match wins: `seatWeights`
+(`{"claude": {"A": 1}, "codex": {"B": 5}}`), then `planWeights` by the plan the provider reports for the seat (`{"codex": {"plus": 1, "pro": 5}}`; the plan name is
+matched without regard to case), then 1. There is no built-in plan table: the providers do not publish exact multipliers, so you state them. Only Codex
+reports a plan, as `plan_type` in its rollout logs (`~/.codex/**/sessions/**/rollout-*.jsonl`, read locally, nothing is sent anywhere; `auth.json` is never read);
+for the other providers set `seatWeights`. A seat with a weight other than 1 shows a small `×5` badge next to its letter in the account tables. Out of the box every seat weighs 1 (the example file ships both maps empty); when seats of one provider report different plans and
+none of them has a weight, the provider's panel says so and points here.
+The pool stays a percent: the pooled % left is Σ weight × (1 − used) ÷ Σ weight, so with seats A (1) and B (5) at 50 % and 10 % used the pool is 83 % left, not 70 %.
+Every pooled number is weighted the same way: the headline, chips, history line, usage rate, typical-day profile, projection (a seat empties when its weighted
+capacity is used) and `--backtest`. A seat of weight 0 is left out of all of them. The per-seat percents in the table stay per seat, and "left across N seats"
+counts seats, not weights. The **current** weights are applied to the whole recorded history, so changing a weight redraws the past too.
+
+**Measured check (Codex only).** The weight is your statement, so the Codex table also shows a measured one, as a sanity check: from the rollout logs, the
+tokens a seat spends per 1 % of its weekly allowance (input minus cached input plus output, the same for every seat), the median over the last 21 days, divided by
+the same figure for the seats of weight 1. It reads `measured ≈ ×4.6 (12 samples)` under the seat, needs at least 5 samples (`not enough data` otherwise), and turns
+amber when it is more than 30 % away from the configured weight (a ratio of the two, either way). It never feeds the pooled numbers. A sample is the tokens
+between two consecutive whole-percent ticks of one log, so a seat used by several sessions at once reads cheaper per percent than it is, and a seat nobody ran
+in the last 21 days has no samples. A log of the active login is credited to the seat whose known weekly reset matches. Claude, xAI and Gemini show nothing:
+the rotator never sees their tokens.
+
+**Suggested weight (Codex only).** When the measurement is both steady and far from the weight, the table adds `Suggested weight ×3 (24 samples)` under the
+measured line and a `Copy setting` button that puts `"seatWeights": {"codex": {"B": 3}}` on the clipboard, for you to paste into `rotator.local.json`. Nothing
+applies it, and a seat without a suggestion keeps today's lines. The rule (`weight_suggestions` in `usage-history.py`, selftest block I): at least 20 samples in
+the last 21 days; the older and the newer half of them (by time), each measured against the same weight-1 seats, within 25 % of each other; the measured ratio
+more than 30 % away from the current weight; then rounded (`nice_weight`) to the nearest 0.5 below 3, to a whole number from 3 up, and no suggestion if that
+is the weight the seat already has. The suggestion's line and the copied fragment are `quotaSuggest` and `quotaFragment` in `usage-sim.js` (`usage-sim.test.js`).
+
+**Banked resets (Claude).** The Claude table's `Banked resets` column shows the reset credits each seat holds: a count, then one muted line per credit
+(`Fable reset · expires <date> (in N d)`), and the header chip adds them up. They come from Claude Code's own usage call
+(`GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1`), which is **undocumented** and **rate-limited**, so the
+dashboard's sampler (`Store.credits_tick` and `Store.credits_read` in `usage-history.py`, parsed by `parse_cedar`, selftest block J) reads one seat per
+5-minute tick and each seat at most once every **6 hours** (a seat whose app login is waiting for its organization, below, is asked again sooner: see there); a 429 or a sign-in error holds that seat for 6 hours, any other failure keeps the last good reading.
+A setup-token (`token.txt`) cannot read credits: the call answers 403 "scope requirement user:profile", the cell says "Reset credits need a full Claude
+login (not a setup-token)" and that seat is asked again only after **7 days**. So when the Claude desktop app has saved a full login for the **same
+account** (`~/.claude-app-seats/<seat>/config.json`, kept by `claude-account`), the credit read and the Apply use it. "The same account" is
+checked three ways: the app seat's `email.txt` or `meta.txt` names the seat's `email.txt` address; the snapshot is pinned to the app seat's
+`owner-uuid.txt` (a snapshot of another account is refused, as `claude-app-seat-keepalive.ps1` does) and only that account's token entries are
+read; and the token's organization is the one the seat's own probe recorded (until it is recorded the seat shows "waiting for this seat's first usage probe": nothing is sent, the setup-token is not tried instead, and no hold is set, but the seat is asked again after 15 minutes instead of 6 hours, so the first read after a probe records the organization uses the login (after 4 pending reads in a row, a seat that is evidently not being probed goes back to the 6-hour interval, unless its organization gets recorded meanwhile: the sampler reads a "waiting" seat at its next tick as soon as the organization is there; any other result clears that count, and a "waiting" note does not outlive a read that failed). While the organization is unknown the app login is not even decrypted: `app_login` looks at `usage-cache.json` and `owner-uuid.txt` before it starts `app-login-token.ps1`, and with no `owner-uuid.txt` the login is not used at all; **Refresh** runs that probe but does not read credits itself, the dashboard's sampler does at the next 5-minute tick once the 15 minutes are up, or at once when the organization is already recorded). Then that login's `user:profile` token is used: the helper is given the seat's organization (`-Org`) and looks only at that organization's entries, so a later-expiring login of another organization of the same account neither hides nor replaces it. An account whose login has no entry for the seat's organization shows "app login is for another organization; open the app on this seat to refresh": nothing is sent, the setup-token is not tried instead (it would only earn the 7-day hold), and the seat is asked again at the ordinary 6-hour interval, not the short pending retry. When the login is the seat's (owner and organization known) but the helper cannot tell (it times out, cannot run, or cannot read the login files just now), the read simply fails: nothing is held, the setup-token is not tried instead, no note is set, and the seat is asked again at the ordinary interval. A login file that stays unreadable is therefore silent too: the seat keeps its last reading, and **Apply** says to try again. `app-login-token.ps1` decrypts it **read-only** (it never refreshes a token
+and never writes a file; the live seat is read from the app's own `%APPDATA%\Claude\config.json` when that holds a login, else from the seat's snapshot); an expired one shows "app login expired; open the
+app on this seat to refresh", and a saved one the helper read but could not decrypt shows "the app login on this seat could not be read; open the app on this seat to sign in again" (no hold; a later transient failure, such as a timeout, leaves that note, and a successful read clears it) (`app_login`, `seat_token`, selftest; `app-login-token.ps1 -SelfTest`). This read changes nothing. The token is sent only in
+that request's header and is never logged or stored. A seat that was read and holds no credits shows an empty cell, one never read `–`, and a seat with a
+note (sign-in needed, rate limited, the two above) shows it, and the column stays for that note even when no seat holds a credit; hover the cell for the read's age. `"claudeResetCredits": false` in `rotator.local.json` switches all of it off, the Apply
+buttons below included.
+
+**Apply reset (Claude).** In the app, a seat whose last reading has a credit usable now gets one button per kind: `Apply Fable reset`, `Apply full reset`, and
+`Apply weekly reset` / `Apply 5-hour reset` when such credits exist. Each asks first, in a dialog naming the seat, its usage, what that kind refills, which
+credit it uses and when that expires, and warns when the window it refills renews on its own within 24 h. Confirming sends `POST /api/claude-reset`
+`{seat, kind}` to the dashboard (same Host and `X-Quota-App` guards as Refresh, one request at a time across Refresh and both resets). The dashboard picks
+the credit itself from the last reading, soonest expiry first, and never takes a credit id from the page; then it makes Claude Code's claim,
+`POST https://api.anthropic.com/api/organizations/<org>/reset_rate_limits` with `{"program": "cedar_ember", "grant_id": ..., "request_id": ...}` (the
+organization from the seat's `usage-cache.json`), and, on a confirmed reset, takes the spent credit off that seat's cached grants straight away (so the page never offers it again while the follow-up read is held by a 429, sign-in or scope hold, which would otherwise mint a second claim for it), then reads that seat's credits again. A credit taken to 0 is dropped, and when it was the reading's `nextId` (the credit the "usable now" gate requires) that moves to the usable credit that expires soonest, or is dropped when none is left, so the seat's other kinds stay usable. The one exception is an `alreadyRedeemed` answer, which means an earlier send of the same claim landed: the claim records `sentAt`, the time of every send (the first and each resend, stamped right before the POST, once the seat's token and the CLI version are already resolved), and a reading taken well after the send before the one just answered (more than `SEND_SETTLE` s, a heuristic: twice the POST's timeout plus a margin) is trusted and left alone; any other reading is decremented, because a spent credit left on offer is worse than one taken off too many, and the server's next read is the final check. A seat whose token cannot be resolved sends nothing and stamps nothing. A claim saved without `sentAt` uses its creation time `at` instead. A claim with no confirmed answer (no reply, a 5xx, `unavailable`)
+keeps its `request_id` in the provider cache, however old, until a resend settles it, so applying again retries the same claim instead of spending a second reset. While it is pending, that seat and kind keep a `Resend pending <kind>` button even when the reading no longer lists a credit of that kind (the blob's `resets[].pending`, from `pending_claims`), and the click resends the stored grant id and request id, never a new grant. A 429, 401/403 or missing sign-in on such a resend keeps the claim. A claim whose resend never gets an answer Claude recognises would stay pending for good, so next to `Resend pending` the seat shows `Clear`: it asks first (Cancel is the default) and then drops that seat-and-kind claim (`POST /api/claude-reset-clear` `{seat, kind, requestId}`, same Host and `X-Quota-App` guards, one request at a time, `Store.claude_reset_clear`). The page sends the request id of the claim it showed, and the server drops the claim only when that is still the pending one: settled or replaced meanwhile, it answers "That pending reset changed; reload to see it." and touches nothing. Use it only once the seat's limit shows the reset was not used: the next Apply then starts a new claim with a new request id. Code: `Store.claude_reset`,
+`consume_reset` and `usable_grants` in `usage-history.py` (selftest block K); the kinds' wording is `QUOTA_RESET_KINDS` in `usage-sim.js`.
+
+**Switching seats from the dashboard.** In the app, each seat row has a Switch column and each provider header a button; they run the rotators next to
+`usage-history.py`, never a copy of their logic, so every rotator check (integrity gate, seat lock, VM-shared block, re-capture of the seat being left)
+still applies. `POST /api/switch` `{provider, role, seat}` (same Host and `X-Quota-App` guards, one action at a time across Refresh, the resets and the
+switches) runs, with no window. It waits up to 120 s for the rotator; one still running then is never killed (a kill mid-switch can leave a login moved
+aside but not replaced): the page is told "Still switching; the dashboard will update when it finishes.", and Refresh, the resets and the switches stay
+refused (409) until it exits, when its outcome is logged and the data rebuilt:
+
+| Button | Runs | Asks first |
+|---|---|---|
+| Claude `Use for CLI` | `pwsh -NoProfile -File claude-cli-account.ps1 --switch <L> --no-usage` | no |
+| Claude `Use for App` | `claude-app-rotator.ps1 --switch <L> --relaunch` | yes: "Quitting the Claude app ends the sessions running in it." |
+| Claude header `Best seat` | `claude-cli-account.ps1 --switch best --no-usage` (`--best` only prints the ranking) | no |
+| Codex `Use for CLI + App` | `codex-app-rotator.ps1 --switch <L>` | yes |
+| Codex header `Next seat` | `codex-app-rotator.ps1 --rotate` (the next saved seat in order, not a headroom pick) | yes |
+
+A button is left off the seat that already holds that role (its CLI/App badge) and off seats the rotator cannot use (Claude CLI: no `token.txt`; Claude
+app: no captured `config.json`; Codex: no saved `auth.json`). The Codex buttons appear only when `codex-app-rotator.ps1` sits next to
+`usage-history.py` (it is not in this repo). The result shows as a toast: the exit code and the rotator's last unindented line, with tokens and email
+addresses removed; the action is also written to the app log, and the data is reloaded so the badges move. Code: `switch_targets`, `switch_check`,
+`switch_argv`, `run_switch`, `switch_outcome`, `Store.switch` in `usage-history.py` (selftest block L); the buttons are `quotaSwitchBtns` /
+`quotaBestBtn` in `usage-sim.js`.
+
+## Keeping the install in sync (`rotator-sync`)
+
+The folder the rotator runs from and this repo's `windows/` folder must hold the same files. The one rule:
+**edit on a repo branch, merge it, then run `rotator-sync --pull`.** A change made directly in the live
+folder shows as a difference until the repo has it; `--pull` replaces it (after a backup). Running straight from
+the clone's own `windows/` folder is the exception: there `git pull` updates the files and `--pull` is refused.
+
+Machine-specific values stay out of the scripts so the same file runs live and sits in the repo. Copy
+`rotator.local.example.json` to `rotator.local.json` (git-ignored) in the live folder and fill it in:
+`heartbeatRepo` and `hostId` (used by `app-seat-publish.ps1` and `claude-cli-account.ps1`; they default to
+the example placeholders), `repoClone` (a local clone of this repo, used by `rotator-sync`) and, only if
+the live folder is not where `rotator-sync.py` sits, `liveDir`. Extra shell functions that must not be in
+the repo go in `rotator-functions.local.ps1` (git-ignored), which `rotator-functions.ps1` dot-sources if it
+exists.
+
+| Command | What it does |
+|---|---|
+| `rotator-sync --check [--quiet]` | Fetches the clone (at most every 6 h), then compares every file under `windows/` at `origin/main` with the live folder, ignoring CRLF/LF and a UTF-8 BOM. Lists `differing` and `missing-live` files; files only in the live folder and `rotator.local.json` / `*.local.*` are ignored. Exit 1 if anything differs. Writes `~/.claude-cli-accounts/.rotator-drift.json`. |
+| `rotator-sync --pull` | Copies every differing or missing file from the ref into the live folder, first saving each overwritten file as `<name>.bak-sync-YYYYMMDD-HHMMSS`. Never touches `rotator.local.json` or `*.local.*`. All or nothing: every new version is first written to a temporary sibling (nothing live is touched yet), then each is backed up and swapped in; if any swap fails, every file already swapped is put back and every added one removed, and the failure is reported (exit 1). Added files go in before changed ones, and the plan is journaled (`<state>.pull-journal.json`) before the first swap, so a pull that is killed mid-way is rolled back by the next `--pull` or `--check` ("recovered an interrupted update"). A journal that outlives its pull is judged by one question, whether every swap happened: when no planned file still has its `.tmp-sync` copy the update finished, and the next `--check` or `--pull` only deletes the journal (a failed delete is retried three times, then a warning and exit 0) and restores nothing; otherwise it rolls back. A rollback decides which swaps happened from every `.tmp-sync` before it restores anything, and removes those `.tmp-sync` copies only after every file is restored, so a rollback that is itself killed is finished by the next run. A `--pull` that finds its journal still there after that recovery (it could not be deleted) stops before staging, says which file to delete by hand, and exits 1. A `--pull` first removes any `.tmp-sync` file a killed run left. It resolves the ref to one commit after fetching and installs exactly that commit. One lock spans the whole run (recovery, staging, install), so a second `--pull` stops with "another update is running; nothing was changed". If it replaces `usage-history.py`, it says to restart the dashboard (the `Claude usage dashboard` scheduled task), since the server keeps the old code until then, and to reload open dashboard windows. If it replaces only `usage-dashboard.template.html` or `usage-sim.js`, it says the page is updated (reload open dashboard windows) and to restart only if `usage-history.py` changed in an earlier pull and the dashboard was not restarted since. If it replaces `claude-rotate-proxy.py` or `rotator_access.py`, it says to stop the running rotate proxy (the `Claude rotate proxy` scheduled task), which imported them at start; the task relaunches it within a minute. When the live folder is the clone's own `windows/` folder (or anywhere inside the clone), `--pull` is refused and `--check` says to use `git pull` and reports no drift. A journal that cannot be read is left in place with a warning, and `--pull` stops on it until it can be read again or is deleted by hand. |
+| `rotator-sync --selftest` | Runs the built-in checks in a temporary repo. |
+
+Options: `--repo <clone>`, `--live <folder>`, `--ref <ref>` (default `origin/main`). The usage dashboard shows
+"Update available from GitHub (N files differ)" when `.rotator-drift.json` lists any file; its Details name the files and
+say to run `rotator-sync --pull`.

@@ -258,6 +258,13 @@ function Get-LineText($e) {
   $t = if ($c -is [string]) { $c } else { (@($c) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
   return ([string]$t).Trim()
 }
+# A slash command that is never an owner answer: cache-keeper's housekeeping commands (the desktop app
+# stamps /keepwarm, /board human) with any arguments, and a status check only when bare. One list for
+# the typed (<command-name>) and the queued (raw prompt) paths. /compact is not an answer either.
+function Test-NonAnswerCommand([string]$cmd, [string]$cargs) {
+  if (@('keepwarm', 'board', 'cache', 'handoff', 'seats', 'compact') -contains $cmd -or $cmd -like 'ck-*') { return $true }
+  return ($cargs -eq '' -and @('usage', 'status', 'cost', 'context') -contains $cmd)
+}
 function Test-OwnerMessage($e, $Pr = $null) {
   if ($e.type -eq 'attachment') {
     $a = $e.attachment
@@ -267,8 +274,10 @@ function Test-OwnerMessage($e, $Pr = $null) {
     $ak = Get-OriginKind $a.origin
     if (-not $ak -or $ak -eq 'plugin' -or $script:NonOwnerKinds -contains $ak) { return $false }
     $t = ([string]$a.prompt).Trim()
-    # A bare status check typed mid-turn is not an answer either.
-    return ($t -and -not (Test-RotatorPing $t) -and $t -notmatch '^/(?:usage|status|cost|context)\s*$')
+    if (-not $t -or (Test-RotatorPing $t)) { return $false }
+    # A slash command typed mid-turn: housekeeping and a bare status check are not an answer.
+    if ($t -match '(?s)^/(\S+)\s*(.*)$' -and (Test-NonAnswerCommand (($Matches[1] -split ':')[-1]) $Matches[2].Trim())) { return $false }
+    return $true
   }
   if ($e.type -ne 'user' -or $e.isSidechain -or $e.isCompactSummary) { return $false }
   $kind = Get-OriginKind $e.origin
@@ -300,8 +309,7 @@ function Test-OwnerMessage($e, $Pr = $null) {
       if ($bare -match '<command-name>/?([^<]*)</command-name>') {
         $cmd = ($Matches[1].Trim() -split ':')[-1]
         $cargs = if ($bare -match '(?s)<command-args>(.*?)</command-args>') { $Matches[1].Trim() } else { '' }
-        if (@('keepwarm', 'board', 'cache', 'handoff', 'seats') -contains $cmd -or $cmd -like 'ck-*') { return $false }
-        return -not ($cargs -eq '' -and @('usage', 'status', 'cost', 'context') -contains $cmd)
+        return -not (Test-NonAnswerCommand $cmd $cargs)
       }
       return $false
     }
@@ -333,7 +341,9 @@ function Test-ParkedLockAnswered {
   # process, one after another, inside the rotation mutex, so the scans' wall time is summed across
   # calls in this process ($script:ParkedScanPassSpent). Once the pass has spent PassSec, each further
   # parked window counts as answered without a scan (fail-open, pinged).
-  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60, [double]$PassSec = 60)
+  param([string]$LockPath, [double]$BudgetSec = 15, [double]$WallSec = 60, [double]$PassSec = 60,
+    # Test seam: returns this process's CPU seconds. A throw (or $null) leaves only the wall clock bounding the scan.
+    [scriptblock]$CpuProbe = { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds })
   if ($null -eq $script:ParkedScanPassSpent) { $script:ParkedScanPassSpent = 0.0 }
   $left = $PassSec - $script:ParkedScanPassSpent
   if ($left -le 0) { return $true }
@@ -359,7 +369,7 @@ function Test-ParkedLockAnswered {
     # boundary resets the test, the compaction summary does not set it, and the copied history's old
     # stamps keep it reset until genuinely new lines follow.
     $prevAfter = $false
-    $cpuNow = { try { [Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds } catch { $null } }
+    $cpuNow = { try { & $CpuProbe } catch { $null } }
     $cpu0 = & $cpuNow
     $n = 0
     $fs = [IO.File]::Open([string]$lock.session, 'Open', 'Read', 'ReadWrite')
@@ -406,7 +416,7 @@ function Test-MergePrParked {
   param(
     [Parameter(Mandatory)][string]$Repo,
     [Parameter(Mandatory)][int]$Pr,
-    [int]$TimeoutSec = 10,
+    [int]$TimeoutSec = 30,   # the real launcher takes ~3 s; 10 s raced it on a loaded machine and failed open
     [string]$Launcher,
     [string]$Python,
     # Test seam: scriptblock taking (@arguments) and returning @{ ExitCode; Stdout }.

@@ -5,13 +5,13 @@ The Merge Driver box's rotator (claude-cli-account.ps1 on Linux, Sync-AppSeatFro
 rotate the CLI onto the seat the Claude DESKTOP app is using, but it cannot read this laptop's
 %APPDATA%. So every 5 min (task 'Claude app-seat heartbeat', via app-seat-publish-hidden.vbs) and at the
 end of every successful claude-app-rotator.ps1 switch, this publishes the app's current seat to ONE open
-issue in your-org/claude-config-backup titled exactly 'app-seat heartbeat (laptop -> box rotator)'.
+issue in the heartbeat repo (rotator.local.json, default your-org/claude-config-backup) titled exactly 'app-seat heartbeat (laptop -> box rotator)'.
 
 Body (the box parses line 1 with ^app-seat:\s*([A-Za-z])\s*$ and judges freshness by the issue's
 updated_at, stale after 15 min, so 'published:' must differ on every run):
     app-seat: D
     published: <ISO-8601 UTC>
-    host: my-laptop
+    host: <hostId from rotator.local.json, default my-laptop>
 No tokens, emails or uuids go in the body.
 
 SEAT LOOKUP: Get-AppSeatLabel is NOT copied here. It is lifted at run time, by AST, out of
@@ -24,9 +24,10 @@ published: it logs and exits, so the box keeps excluding the last seat it knew.
 param()
 
 $ErrorActionPreference = 'Stop'
-$Repo   = 'your-org/claude-config-backup'
+$Local  = try { Get-Content (Join-Path $PSScriptRoot 'rotator.local.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+$Repo   = if ($Local -and $Local.heartbeatRepo) { [string]$Local.heartbeatRepo } else { 'your-org/claude-config-backup' }
 $Title  = 'app-seat heartbeat (laptop -> box rotator)'
-$HostId = 'my-laptop'
+$HostId = if ($Local -and $Local.hostId) { [string]$Local.hostId } else { 'my-laptop' }
 $Log    = Join-Path $PSScriptRoot 'app-seat-publish.log'
 
 function Log([string]$m) {

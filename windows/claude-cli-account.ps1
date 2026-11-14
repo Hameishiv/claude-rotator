@@ -36,13 +36,20 @@ USAGE
 param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
 
 $ErrorActionPreference = 'Continue'
-$Root      = "$env:USERPROFILE\.claude-cli-accounts"
+# LINUX-PORT: map the Windows profile env vars so every path below resolves unchanged on the box.
+if ($IsLinux) { if (-not $env:USERPROFILE) { $env:USERPROFILE = $HOME }; if (-not $env:APPDATA) { $env:APPDATA = Join-Path $HOME '.config' } }
+$Root      = Join-Path $env:USERPROFILE '.claude-cli-accounts'
 $Active    = Join-Path $Root '.active'
 $EnvName   = 'CLAUDE_CODE_OAUTH_TOKEN'
 
 # ---------- helpers ----------
 function ShortHash { param([string]$s); if (-not $s) { return '(none)' }
   $h=[Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($s)); (([BitConverter]::ToString($h)) -replace '-','').Substring(0,12).ToLower() }
+# Live CLI seats are the non-hidden top-level profiles that hold a token. A leading '.' or '_'
+# keeps a directory out of the set — `.inactive` is where old identities are stored, and it is
+# not a candidate list. No letter is reserved: A is a normal seat when it has a token here.
+# The only automatic identity exclusion is the desktop app's current account (Get-AppSeatLabel),
+# applied when a target is chosen, plus a seat in a subscription-disabled cooldown.
 function Get-Candidates { @(Get-ChildItem $Root -Directory -ErrorAction SilentlyContinue |
   Where-Object { $_.Name -notmatch '^[_.]' -and (Test-Path (Join-Path $_.FullName 'token.txt')) } | ForEach-Object { $_.Name } | Sort-Object) }
 function Resolve-Label { param([string]$l); if (-not $l) { return $null }
@@ -53,13 +60,109 @@ function Profile-TokenFile { param([string]$l); Join-Path (Join-Path $Root $l) '
 function Profile-TokenHash { param([string]$l); $f = Profile-TokenFile $l; if (Test-Path $f) { ShortHash (Get-Content $f -Raw).Trim() } else { '(none)' } }
 function Get-ActiveLabel { if (Test-Path $Active) { (Get-Content $Active -Raw).Trim() } else { $null } }
 
+# A subscription-disabled 403 is an explicit access refusal. It is not a quota 429 and not a
+# network failure. The phrases are the API's own (oauth_org_not_allowed / the Claude Code text).
+# Anything else — timeout, 5xx, a different 403 — stays "unknown" and must not mark seats disabled.
+$AccessCooldownSec = 1800
+$script:UnknownProbeMemo = @{}
+function ConvertTo-SanitizedNote([string]$Text) {
+  if (-not $Text) { return '' }
+  $t = $Text -replace 'sk-ant-[A-Za-z0-9_\-]+', '[redacted]'
+  $t = $t -replace '(?i)Bearer\s+\S+', 'Bearer [redacted]'
+  $t = ($t -replace '\s+', ' ').Trim()
+  if ($t.Length -gt 180) { $t = $t.Substring(0, 180) }
+  return $t
+}
+function Test-SubscriptionDisabled {
+  param([int]$Status, [string]$Body)
+  if ($Status -ne 403 -or -not $Body) { return $false }
+  return ($Body -match 'oauth_org_not_allowed' -or
+          $Body -match 'disabled Claude subscription access' -or
+          $Body -match 'OAuth authentication is currently not allowed')
+}
+function Get-AccessCode([string]$Body) {
+  if ($Body -match 'oauth_org_not_allowed') { return 'oauth_org_not_allowed' }
+  return 'subscription_disabled'
+}
+function Get-ErrorMessage([string]$Body) {
+  if (-not $Body) { return '' }
+  try {
+    $j = $Body | ConvertFrom-Json
+    $m = $j.error.message
+    if (-not $m) { $m = $j.message }
+    if ($m) { return ConvertTo-SanitizedNote ([string]$m) }
+  } catch {}
+  return ConvertTo-SanitizedNote $Body
+}
+function Get-AccessMarkerPath([string]$Label) { Join-Path (Join-Path $Root $Label) 'access-disabled.json' }
+function Read-AccessDisabled([string]$Label) {
+  if (-not $Label) { return $null }
+  $f = Get-AccessMarkerPath $Label
+  if (-not (Test-Path -LiteralPath $f)) { return $null }
+  try {
+    $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    $now = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ([int64]$j.until -le $now) { return $null }
+    return $j
+  } catch { return $null }
+}
+function Write-AccessDisabled {
+  param([string]$Label, [int]$Http = 403, [string]$Code = 'oauth_org_not_allowed')
+  if (-not $Label) { return }
+  # Marker only. Never creates, rewrites, or deletes token.txt.
+  $dir = Join-Path $Root $Label
+  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $now = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $obj = [ordered]@{ ts = $now; until = ($now + $AccessCooldownSec); http = $Http; code = $Code; kind = 'subscription_disabled' }
+  $path = Get-AccessMarkerPath $Label
+  $tmp = "$path.tmp-$PID"
+  try {
+    ($obj | ConvertTo-Json -Compress) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline
+    [IO.File]::Move($tmp, $path, $true)
+  } catch {}
+}
+function Clear-AccessDisabled([string]$Label) {
+  $f = Get-AccessMarkerPath $Label
+  if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+}
+function New-AccessDisabledResult {
+  param([string]$Label, [string]$Code = 'oauth_org_not_allowed', [string]$Message = '')
+  $note = "subscription disabled (403 ${Code})"
+  if ($Message) { $note += ": $Message" }
+  [pscustomobject]@{ label=$Label; ok=$false; access='disabled'; http=403; code=$Code; note=(ConvertTo-SanitizedNote $note) }
+}
+function New-ProbeUnknownResult {
+  param([string]$Label, [string]$Note)
+  [pscustomobject]@{ label=$Label; ok=$false; access='unknown'; http=$null; code=$null; note=(ConvertTo-SanitizedNote $Note) }
+}
+function Write-SeatHealth {
+  param([bool]$Ok, [string]$Active, [string]$Reason)
+  $p = Join-Path $Root '.seat-health.json'
+  $obj = [ordered]@{ ok = $Ok; active = $Active; reason = $Reason; ts = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+  $tmp = "$p.tmp-$PID"
+  try {
+    ($obj | ConvertTo-Json -Compress) | Set-Content -LiteralPath $tmp -Encoding UTF8 -NoNewline
+    [IO.File]::Move($tmp, $p, $true)
+  } catch {}
+}
+
+# A secret's temp file is created owner-only (0600 on Linux) BEFORE the secret is written, never chmod-ed afterwards: a
+# 0644 window would let another user read it. CreateNew: a planted or stale file is never reused. Throws on any failure.
+function Write-OwnerOnly([string]$Path, [string]$Text) {
+  Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  $o = [IO.FileStreamOptions]::new(); $o.Mode = 'CreateNew'; $o.Access = 'Write'
+  if ($IsLinux) { $o.UnixCreateMode = [IO.UnixFileMode]'UserRead, UserWrite' }
+  $fs = [IO.FileStream]::new($Path, $o)
+  try { $b = [Text.UTF8Encoding]::new($false).GetBytes($Text); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+}
+
 # Write the active account's setup-token into ~/.claude/.credentials.json too, so that
 # app-spawned / desktop-app-bridged Claude Code sessions follow the switch. Those sessions
 # read this file and IGNORE CLAUDE_CODE_OAUTH_TOKEN, so the env var alone never switched them.
 # Auth-only: leaves skills, MCP connectors, and session logs untouched. Backs up first.
 function Set-DiskCredential {
   param([string]$Token)
-  $cred = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+  $cred = Join-Path (Join-Path $env:USERPROFILE '.claude') '.credentials.json'   # LINUX-PORT: '/' not '\'
   if (-not (Test-Path $cred)) {
     Write-Host "  note: ~/.claude/.credentials.json not found — terminal sessions still switch via the env var," -ForegroundColor DarkYellow
     Write-Host "        but app-spawned sessions need a one-time interactive 'claude' login to create it first." -ForegroundColor DarkYellow
@@ -75,7 +178,8 @@ function Set-DiskCredential {
     $j.claudeAiOauth.expiresAt   = [int64][DateTimeOffset]::UtcNow.AddYears(10).ToUnixTimeMilliseconds()
     if ($j.claudeAiOauth.PSObject.Properties.Name -contains 'refreshToken') { $j.claudeAiOauth.refreshToken = '' }
     # Temp file + one replace: a crash mid-write must not truncate the credentials file (Grok review 2026-10-30).
-    $tmp = "$cred.tmp-$PID"; [IO.File]::WriteAllText($tmp, ($j | ConvertTo-Json -Depth 20)); [IO.File]::Move($tmp, $cred, $true)
+    $tmp = "$cred.tmp-$PID"; Write-OwnerOnly $tmp ($j | ConvertTo-Json -Depth 20)   # LINUX-PORT: owner-only from creation
+    [IO.File]::Move($tmp, $cred, $true)
     Write-Host "  + updated ~/.claude/.credentials.json — app-spawned & desktop-bridged sessions follow too (new sessions)." -ForegroundColor DarkGreen
   } catch {
     Write-Host "  WARN: could not update ~/.claude/.credentials.json ($($_.Exception.Message)). Terminal switch still applied." -ForegroundColor DarkYellow
@@ -92,6 +196,9 @@ function Set-DiskCredential {
 # the taskbar inherit the new token exactly as before — we just don't block on 27 windows.
 function Set-UserEnvFast {
   param([string]$Name, [string]$Value)
+  # LINUX-PORT: no HKCU user-env / WM_SETTINGCHANGE on Linux. Box sessions are NOT pinned to an env token;
+  # they read ~/.claude/.credentials.json, which Set-DiskCredential swaps, so this is a deliberate no-op.
+  if ($IsLinux) { return }
   if ([string]::IsNullOrEmpty($Value)) { Remove-ItemProperty -Path 'HKCU:\Environment' -Name $Name -ErrorAction SilentlyContinue }
   else { Set-ItemProperty -Path 'HKCU:\Environment' -Name $Name -Value $Value -Type String }
   try {
@@ -165,22 +272,80 @@ function Resolve-ProbeCatalogModel {
   return $current[0].id
 }
 
+# The installed CLI's version, read ONCE per script run (cached in $script:CliVersion) with a hard timeout: it used to be spawned on every probe with none, so a
+# hung `claude` froze every probe. Only the process started here is ever killed (with the children it started), and only by its pid. The binary is the one the
+# `claude` wrapper runs, ~/.local/bin/claude.exe, when it exists, else whatever `claude` resolves to. The fallback is for when `claude` is not runnable.
+function Get-CliVersion {
+  param([string]$Preferred = (Join-Path $HOME '.local\bin\claude.exe'), [int]$TimeoutMs = 15000)      # both are test seams
+  if ($script:CliVersion) { return $script:CliVersion }
+  $v = ''
+  $exePath = $Preferred
+  if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+    $found = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $exePath = if ($found) { $found.Source } else { '' }
+  }
+  if ($exePath) {
+    $p = $null
+    try {
+      $psi = [System.Diagnostics.ProcessStartInfo]::new($exePath, '--version')
+      $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
+      $me = Get-Process -Id $PID; $was = $me.PriorityClass      # the child starts at Idle (it inherits this shell's class at start), then this shell goes back
+      try { $me.PriorityClass = 'Idle'; $p = [System.Diagnostics.Process]::Start($psi) } finally { try { $me.PriorityClass = $was } catch {} }
+      $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()      # both drained, so a chatty stderr cannot fill its pipe and stall the wait
+      # One budget for the exit AND the read: a child that exits but leaves a grandchild holding the stdout pipe open would otherwise block `.Result` forever.
+      $done = $p.WaitForExit($TimeoutMs) -and $out.Wait([int][Math]::Max(0, $TimeoutMs - $sw.ElapsedMilliseconds))
+      if ($done) { $v = (($out.Result) -replace '^\s*(\d+\.\d+\.\d+).*','$1').Trim() }
+      else { try { $p.Kill($true) } catch { try { $p.Kill() } catch {} } }     # our own child and its tree, by handle: never by name (Kill($true) needs PowerShell 7; 5.1 kills the child only). An already-exited child is a no-op
+    } catch { $v = '' } finally { if ($p) { $p.Dispose() } }
+  }
+  if ($v -notmatch '^\d+\.\d+\.\d+$') { $v = '2.1.322' }
+  $script:CliVersion = $v
+  return $v
+}
+
 function Probe-Usage {
   param([string]$Label, [string]$Model = 'haiku')
+  # Regression tests inject a fixture. Production never sets the variable, so this is not a backdoor.
+  if ($env:CLAUDE_ROTATOR_SELFTEST -eq '1' -and $global:ClaudeRotatorProbeOverride) {
+    return & $global:ClaudeRotatorProbeOverride $Label $Model
+  }
   $tf = Profile-TokenFile $Label
-  if (-not (Test-Path $tf)) { return [pscustomobject]@{ label=$Label; ok=$false; note='no token' } }
+  if (-not (Test-Path $tf)) { return (New-ProbeUnknownResult $Label 'no token') }
   $tok = (Get-Content $tf -Raw).Trim()
-  if (-not $tok) { return [pscustomobject]@{ label=$Label; ok=$false; note='empty token' } }
+  if (-not $tok) { return (New-ProbeUnknownResult $Label 'empty token') }
+  # The fable gate rejects UAs older than its minimum, so track the installed CLI; the fallback is only for when `claude` is not runnable.
+  $cliVer = Get-CliVersion
   $hdr  = @{ Authorization = "Bearer $tok"; 'anthropic-version' = '2023-06-01'
              'anthropic-beta' = 'oauth-2025-04-20,claude-code-20250219'
-             'User-Agent' = 'claude-cli/2.1.287 (external, cli)' }   # ponytail: hardcoded; the fable gate rejects UAs older than its minimum (2.1.251 on 2026-10-02) -- bump to `claude --version` when fable reads n/a with http 400
+             'User-Agent' = "claude-cli/$cliVer (external, cli)" }
   # Live discovery precedes the one-token usage probe; failure spends nothing.
+  # -SkipHttpErrorCheck keeps the status and body. Invoke-RestMethod used to throw them
+  # away as "model discovery failed", so a 403 oauth_org_not_allowed looked like a blip
+  # and the watcher went blind instead of rotating.
+  $family = $Model
   try {
-    if ($Model -notin @('haiku','fable')) { throw 'Usage probes require a family selector' }
-    $catalog = Invoke-RestMethod -Method Get -Uri 'https://api.anthropic.com/v1/models?limit=100' -Headers $hdr -TimeoutSec 12
-    $Model = Resolve-ProbeCatalogModel $catalog $Model
+    if ($family -notin @('haiku','fable')) { throw 'Usage probes require a family selector' }
+    $cat = Invoke-WebRequest -SkipHttpErrorCheck -Method Get -Uri 'https://api.anthropic.com/v1/models?limit=100' -Headers $hdr -TimeoutSec 12
   } catch {
-    return [pscustomobject]@{ label=$Label; ok=$false; note='model discovery failed; no inference' }
+    return (New-ProbeUnknownResult $Label ("probe failed: network; not marking disabled (" + $_.Exception.Message + ")"))
+  }
+  $catBody = [string]$cat.Content
+  $catStatus = [int]$cat.StatusCode
+  if (Test-SubscriptionDisabled $catStatus $catBody) {
+    return (New-AccessDisabledResult $Label (Get-AccessCode $catBody) (Get-ErrorMessage $catBody))
+  }
+  if ($catStatus -ge 400) {
+    $msg = Get-ErrorMessage $catBody
+    $detail = "probe failed: http $catStatus"
+    if ($msg) { $detail += ": $msg" }
+    return (New-ProbeUnknownResult $Label ($detail + '; not marking disabled'))
+  }
+  try {
+    $catalog = $catBody | ConvertFrom-Json
+    $Model = Resolve-ProbeCatalogModel $catalog $family
+  } catch {
+    return (New-ProbeUnknownResult $Label ("model discovery failed; no inference (" + $_.Exception.Message + ")"))
   }
   $body = (@{ model=$Model; max_tokens=1
               system=@(@{ type='text'; text="You are Claude Code, Anthropic's official CLI for Claude." })
@@ -189,7 +354,10 @@ function Probe-Usage {
     $r = Invoke-WebRequest -SkipHttpErrorCheck -Method Post -Uri 'https://api.anthropic.com/v1/messages' `
            -Headers $hdr -Body $body -ContentType 'application/json' -TimeoutSec 12
   } catch {
-    return [pscustomobject]@{ label=$Label; ok=$false; note=("probe failed: " + $_.Exception.Message) }
+    return (New-ProbeUnknownResult $Label ("probe failed: network; not marking disabled (" + $_.Exception.Message + ")"))
+  }
+  if (Test-SubscriptionDisabled ([int]$r.StatusCode) ([string]$r.Content)) {
+    return (New-AccessDisabledResult $Label (Get-AccessCode ([string]$r.Content)) (Get-ErrorMessage ([string]$r.Content)))
   }
   # $get reads one header value (PS7 returns header values as string arrays). Named to
   # avoid the single-letter `h` -> Get-History alias collision.
@@ -198,14 +366,16 @@ function Probe-Usage {
   # A non-2xx (model not on this plan, ZDR-blocked, etc.) still lands here — Invoke-WebRequest
   # with -SkipHttpErrorCheck never throws on it — but carries no ratelimit headers. Surface the
   # API's error message instead of a bare "n/a" so a missing model isn't indistinguishable from
-  # a real probe failure.
+  # a real probe failure. A quota 429 that carries utilization headers stays ok=$true so the
+  # existing cap path can rotate; it is not an access-disable.
   $note = ''
   if (-not $s5util) {
     $note = "http $([int]$r.StatusCode)"
     try { $e = ($r.Content | ConvertFrom-Json).error; $note += ": $($e.type): $($e.message)" } catch {}
+    $note = ConvertTo-SanitizedNote $note
   }
   [pscustomobject]@{
-    label    = $Label; ok = $true; http = [int]$r.StatusCode; model = $Model; note = $note
+    label    = $Label; ok = $true; access = 'ok'; http = [int]$r.StatusCode; model = $Model; note = $note
     org      = (& $get 'anthropic-organization-id')
     status   = (& $get 'anthropic-ratelimit-unified-status')
     s5_util  = $s5util
@@ -223,7 +393,19 @@ function Probe-Usage {
 }
 
 function Get-UsageCached {
-  param([string]$Label, [bool]$Refresh, [string]$Model = 'haiku', [string]$CacheSuffix = '', [bool]$CacheOnly = $false)
+  param([string]$Label, [bool]$Refresh, [string]$Model = 'haiku', [string]$CacheSuffix = '', [bool]$CacheOnly = $false, [bool]$HonorAccessCooldown = $true)
+  if (-not $script:UnknownProbeMemo) { $script:UnknownProbeMemo = @{} }
+  $memoKey = "$Label|$CacheSuffix"
+  # A network failure is remembered for this process only, so the detail line and the
+  # fallback don't each open another wave of timeouts. It is NOT written to disk: the next
+  # tick probes again, and a timeout must not mark the seat subscription-disabled.
+  if ($HonorAccessCooldown -and $script:UnknownProbeMemo.ContainsKey($memoKey)) {
+    return $script:UnknownProbeMemo[$memoKey]
+  }
+  if ($HonorAccessCooldown) {
+    $marked = Read-AccessDisabled $Label
+    if ($marked) { return (New-AccessDisabledResult $Label ([string]$marked.code) 'cooldown, not re-probed') }
+  }
   $cf  = Join-Path (Join-Path $Root $Label) "usage-cache$CacheSuffix.json"
   $ttl = if ($Model -like '*fable*') { $FableTTL } else { $UsageTTL }
   $now = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -237,10 +419,24 @@ function Get-UsageCached {
     } catch {}
   }
   # CacheOnly = a switch/rotate readout. It must never pay for a live probe (see Show-Usage).
-  if ($CacheOnly) { return [pscustomobject]@{ label=$Label; ok=$false; note='not probed (run claude-usage)' } }
+  if ($CacheOnly) { return [pscustomobject]@{ label=$Label; ok=$false; access='unknown'; note='not probed (run claude-usage)' } }
   $d = Probe-Usage $Label $Model
+  if (-not ($d.PSObject.Properties.Name -contains 'access') -or -not $d.access) {
+    $d | Add-Member -NotePropertyName access -NotePropertyValue $(if ($d.ok) { 'ok' } else { 'unknown' }) -Force
+  }
   $d | Add-Member -NotePropertyName ageSec -NotePropertyValue 0 -Force
-  if ($d.ok) { try { @{ ts=$now; data=$d } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cf -Encoding UTF8 } catch {} }
+  if ($d.access -eq 'disabled') {
+    Write-AccessDisabled $Label 403 $(if ($d.code) { [string]$d.code } else { 'oauth_org_not_allowed' })
+  } elseif ($d.ok) {
+    # Only a Fable probe that PROVES access clears the seat's shared refusal marker: a 2xx carrying the usage headers. A Haiku probe
+    # running beside a refused Fable one, or an ok=$true 500 / unrelated 403 with no usage headers, proves nothing.
+    $proved = ([int]$d.http -ge 200 -and [int]$d.http -lt 300 -and ($d.status -or $d.s5_util -or $d.oi7_util))
+    if ($Model -like '*fable*' -and $proved) { Clear-AccessDisabled $Label }
+    if ($script:UnknownProbeMemo.ContainsKey($memoKey)) { [void]$script:UnknownProbeMemo.Remove($memoKey) }
+    try { @{ ts=$now; data=$d } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cf -Encoding UTF8 } catch {}
+  } elseif ($HonorAccessCooldown -and $d.access -eq 'unknown') {
+    $script:UnknownProbeMemo[$memoKey] = $d
+  }
   return $d
 }
 
@@ -250,19 +446,32 @@ function Get-UsageCached {
 # file Get-UsageCached would have written, so the ordered print loop below then just reads
 # cache hits — no duplicated probe logic, and nothing to keep in sync.
 function Prefetch-Usage {
-  param([string[]]$Labels, [bool]$Refresh, [bool]$WithFable = $true)
-  $fnText = ('Profile-TokenFile','Resolve-ProbeCatalogModel','Probe-Usage','Get-UsageCached' |
-    ForEach-Object { "function $_ {" + (Get-Command $_ -CommandType Function).Definition + "}" }) -join "`n"
+  param([string[]]$Labels, [bool]$Refresh, [bool]$WithFable = $true, [bool]$HonorAccessCooldown = $true)
   $models = @(@{ m='haiku'; s='' })
   if ($WithFable) { $models += @{ m='fable'; s='-fable' } }
+  # The regression suite injects Probe-Usage. -Parallel would run in a clean runspace and miss
+  # that fixture (and would be free to touch the network). In-process here is test-only.
+  if ($env:CLAUDE_ROTATOR_SELFTEST -eq '1') {
+    foreach ($l in $Labels) { foreach ($mm in $models) { $null = Get-UsageCached $l $Refresh $mm.m $mm.s $false $HonorAccessCooldown } }
+    return
+  }
+  $fnText = ('Profile-TokenFile','ConvertTo-SanitizedNote','Test-SubscriptionDisabled','Get-AccessCode','Get-ErrorMessage','Get-AccessMarkerPath','Read-AccessDisabled','Write-AccessDisabled','Clear-AccessDisabled','New-AccessDisabledResult','New-ProbeUnknownResult','Resolve-ProbeCatalogModel','Get-CliVersion','Probe-Usage','Get-UsageCached' |
+    ForEach-Object { "function $_ {" + (Get-Command $_ -CommandType Function).Definition + "}" }) -join "`n"
   $work = @(foreach ($l in $Labels) { foreach ($mm in $models) { @{ l=$l; m=$mm.m; s=$mm.s } } })
-  $work | ForEach-Object -ThrottleLimit 12 -Parallel {
+  $cliVer = Get-CliVersion      # once, here: each clean runspace below would otherwise start its own `claude --version`
+  $memo = $work | ForEach-Object -ThrottleLimit 12 -Parallel {
     # Re-create what the probe needs inside the runspace: -Parallel starts a clean session,
     # so script-scope functions and variables are NOT inherited.
-    $Root = $using:Root; $UsageTTL = $using:UsageTTL; $FableTTL = $using:FableTTL
+    $Root = $using:Root; $UsageTTL = $using:UsageTTL; $FableTTL = $using:FableTTL; $AccessCooldownSec = $using:AccessCooldownSec
+    $script:UnknownProbeMemo = @{}
+    $script:CliVersion = $using:cliVer
     . ([scriptblock]::Create($using:fnText))
-    $null = Get-UsageCached $_.l $using:Refresh $_.m $_.s
-  } | Out-Null
+    $null = Get-UsageCached $_.l $using:Refresh $_.m $_.s $false $using:HonorAccessCooldown
+    # A failed probe is memoized in this runspace only: hand it back, so the ranking below does not probe it again.
+    foreach ($k in @($script:UnknownProbeMemo.Keys)) { [pscustomobject]@{ k = $k; v = $script:UnknownProbeMemo[$k] } }
+  }
+  if (-not $script:UnknownProbeMemo) { $script:UnknownProbeMemo = @{} }
+  foreach ($m in @($memo)) { if ($m.k) { $script:UnknownProbeMemo[$m.k] = $m.v } }
 }
 
 function UsageBar { param([double]$frac, [int]$width=10)
@@ -303,7 +512,9 @@ function Show-Usage {
     $anyFresh = @($cands | Where-Object { (Get-UsageCached $_ $false 'haiku' '' $true).ok }).Count
     if (-not $anyFresh) { Write-Host "  (usage not shown - nothing cached; run claude-usage for a live read)" -ForegroundColor DarkGray; return }
   } else {
-    Prefetch-Usage $cands $Refresh
+    # A manual live read may re-check a cooled-down seat once. The watcher does not: it calls
+    # Get-UsageCached with the cooldown honored, so a disabled seat is not probed every tick.
+    Prefetch-Usage $cands $Refresh $true (-not $Refresh)
     # The prefetch just wrote every cache file. Leaving $Refresh set here would make the
     # ordered print loop below ignore those files and probe all ten AGAIN, serially — which
     # is exactly the cost the prefetch exists to remove.
@@ -359,12 +570,68 @@ function Show-Usage {
 # Which seat is the DESKTOP APP logged into? That seat is never a CLI rotation target (owner,
 # 2026-08-16): the app and the CLI would draw on ONE account's quota, so rotating onto it burns
 # that seat twice as fast and takes the app down together with the CLI.
-# Ground truth is the app's live account uuid in %APPDATA%\Claude\config.json.
+# Ground truth is the app's live account uuid in %APPDATA%\Claude\config.json, matched to a
+# captured seat's owner-uuid.txt. The exclusion is that identity, whichever label it is — there
+# is no reserved letter. An explicit --switch still overrides.
 # claude-app-rotator.ps1 is emphatic that its own .active pointer DRIFTS whenever you log in or
 # out inside the app by hand, so .active is only the fallback for a uuid matching no captured seat.
+# LINUX-PORT (owner ruling 2026-10-20): the box must never use the seat the laptop's Claude desktop
+# app is on AT THAT MOMENT. The box has no desktop app and cannot poll the laptop, so the laptop
+# PUSHES its live app seat (app-seat-publish.ps1, every 5 min + on every claude-app-rotator switch)
+# into the body of one heartbeat issue in the heartbeat repo (rotator.local.json heartbeatRepo, default your-org/claude-config-backup). This reads it and
+# refreshes ~/.claude-app-seats/.active, which Get-AppSeatLabel below already falls back to.
+# FAIL-SAFE: freshness is judged on GitHub's own updated_at (server clock, so laptop clock skew
+# cannot fake it). Record older than StaleMin, unreadable, or gh down -> .active is left as the
+# LAST KNOWN seat, so that seat stays excluded, and the episode is logged once (not every tick).
+# One read per pwsh run (~1s); --check-rotate, --best, --usage and --switch best all pass here.
+$AppSeatSyncTitle = 'app-seat heartbeat (laptop -> box rotator)'
+function Sync-AppSeatFromLaptop {
+  if ($env:CLAUDE_ROTATOR_SKIP_APP_SYNC -eq '1') { return }
+  if ($script:AppSeatSynced) { return }; $script:AppSeatSynced = $true
+  $appRoot = Join-Path $env:USERPROFILE '.claude-app-seats'
+  New-Item -ItemType Directory -Path $appRoot -Force | Out-Null     # a fresh install has none yet; .active and the sync state live here
+  $act  = Join-Path $appRoot '.active'
+  $conf = Join-Path $appRoot '.laptop-sync.json'
+  $local = try { Get-Content (Join-Path $PSScriptRoot 'rotator.local.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+  $hbRepo = if ($local -and $local.heartbeatRepo) { [string]$local.heartbeatRepo } else { 'your-org/claude-config-backup' }
+  $c = [ordered]@{ repo = $hbRepo; issue = 0; staleMin = 15; lastSeen = ''; lastUpdated = ''; staleLogged = $false; unconfLogged = $false }
+  if (Test-Path $conf) { try { $j = Get-Content $conf -Raw | ConvertFrom-Json; foreach ($k in @($c.Keys)) { if ($null -ne $j.$k) { $c[$k] = $j.$k } } } catch {} }
+  $save = { try { $c | ConvertTo-Json | Set-Content -LiteralPath $conf -Encoding UTF8 } catch {} }
+  if ([string]$c.repo -ne $hbRepo) { $c.repo = $hbRepo; $c.issue = 0; $c.unconfLogged = $false; $c.staleLogged = $false; $c.lastSeen = ''; $c.lastUpdated = ''; & $save }   # the configured heartbeat repo always wins over the cache: another repo's issue number and logged-once flags mean nothing here
+  $known = if (Test-Path $act) { (Get-Content $act -Raw).Trim() } else { '' }
+  $gh = { param([string]$path, [string]$jq) $o = & timeout 15 gh api $path --jq $jq 2>$null; if ($LASTEXITCODE -ne 0) { return $null }; $o }
+  if (-not [int]$c.issue) {
+    $n = & $gh "repos/$($c.repo)/issues?state=open&per_page=100" (".[] | select(.title == `"$AppSeatSyncTitle`") | .number")
+    $n = @($n | Where-Object { $_ -match '^\d+$' })[0]
+    if (-not $n) {
+      if (-not $c.unconfLogged) { Write-RotateLog "APP-SEAT SYNC: no heartbeat issue '$AppSeatSyncTitle' in $($c.repo) yet (laptop side not installed) - excluding last known app seat '$known'" DarkYellow; $c.unconfLogged = $true; & $save }
+      return
+    }
+    $c.issue = [int]$n; $c.unconfLogged = $false; & $save
+  }
+  $raw = & $gh "repos/$($c.repo)/issues/$($c.issue)" '[.updated_at, .body] | @json'
+  $seat = ''; $upd = $null
+  if ($raw) { try { $r = ($raw -join "`n") | ConvertFrom-Json; $v = $r[0]; $upd = if ($v -is [datetime]) { [DateTimeOffset]::new($v.ToUniversalTime()) } else { [DateTimeOffset]::Parse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal) }; if ([string]$r[1] -match '(?m)^app-seat:\s*([A-Za-z])\s*$') { $seat = $Matches[1].ToUpper() } } catch {} }
+  $ageMin = if ($upd) { ([DateTimeOffset]::UtcNow - $upd).TotalMinutes } else { [double]::MaxValue }
+  if (-not $seat -or $ageMin -gt [double]$c.staleMin) {
+    if (-not $c.staleLogged) {
+      $why = if (-not $raw) { 'heartbeat unreadable (gh/network)' } elseif (-not $seat) { 'heartbeat has no app-seat line' } else { "heartbeat is {0:n0} min old (> $($c.staleMin))" -f $ageMin }
+      Write-RotateLog "APP-SEAT SYNC STALE: $why - FAIL-SAFE, still excluding last known app seat '$known'" DarkYellow
+      $c.staleLogged = $true; & $save
+    }
+    return
+  }
+  if ($c.staleLogged) { Write-RotateLog "APP-SEAT SYNC fresh again (laptop app on '$seat')" Gray; $c.staleLogged = $false }
+  if ($seat -ne $known) {
+    try { $tmp = "$act.tmp"; Set-Content -LiteralPath $tmp -Value $seat -Encoding UTF8 -NoNewline; Move-Item -LiteralPath $tmp -Destination $act -Force
+          Write-RotateLog "APP-SEAT SYNC: laptop desktop app is now on '$seat' (was '$known') - excluded from box rotation" Cyan } catch {}
+  }
+  $c.lastSeen = $seat; $c.lastUpdated = $upd.ToString('o'); & $save
+}
 function Get-AppSeatLabel {
   $appRoot = Join-Path $env:USERPROFILE '.claude-app-seats'
-  $cfg     = Join-Path $env:APPDATA 'Claude\config.json'
+  if ($IsLinux) { Sync-AppSeatFromLaptop }   # LINUX-PORT: live laptop app seat -> .active (see above)
+  $cfg     = Join-Path (Join-Path $env:APPDATA 'Claude') 'config.json'   # LINUX-PORT: no desktop app on the box -> falls back to ~/.claude-app-seats/.active
   $uuid    = ''
   if (Test-Path $cfg) {
     try { $j = Get-Content $cfg -Raw | ConvertFrom-Json -AsHashtable
@@ -393,7 +660,11 @@ function Rank-Accounts {
     $u  = Get-UsageCached $l $false
     $fu = if ($WithFable) { Get-UsageCached $l $false 'fable' '-fable' }
           else { [pscustomobject]@{ ok = $false; note = 'not probed' } }
-    if (-not $u.ok) { [pscustomobject]@{ label=$l; usable=$false; why=$u.note; score=9 }; continue }
+    if (-not $u.ok) {
+      $whyAccess = if ($u.access) { [string]$u.access } else { 'unknown' }
+      [pscustomobject]@{ label=$l; usable=$false; why=$u.note; access=$whyAccess; score=9 }
+      continue
+    }
     $s5 = [double]$u.s5_util; $w7 = [double]$u.w7_util
     $capped = ($u.s5_stat -eq 'rejected') -or ($u.w7_stat -eq 'rejected') -or ($u.status -eq 'rejected')
     # A fable-capped account is NOT a rotation target (owner, 2026-08-16): Fable is what runs
@@ -401,13 +672,15 @@ function Rank-Accounts {
     # for another. An UNKNOWN fable reading is deliberately treated as not-capped — excluding on
     # a probe hiccup would wedge rotation entirely, which is the worse failure.
     $fCapped = ($fu.ok -and $fu.oi7_stat -eq 'rejected')
+    $fDenied = ($fu.access -eq 'disabled')     # Fable's explicit access refusal rules the seat out, like Haiku's does above
     $isApp   = ($appSeat -and ($l -ieq $appSeat))
     $why = if ($isApp) { 'claude-account (desktop app) is on this seat' }
+           elseif ($fDenied) { 'Fable access refused (403)' }
            elseif ($capped -and $fCapped) { 'capped + fable capped' }
            elseif ($capped) { 'capped' }
            elseif ($fCapped) { 'fable capped (needed for Gate C)' } else { '' }
     [pscustomobject]@{
-      label = $l; usable = (-not $capped -and -not $fCapped -and -not $isApp); why = $why
+      label = $l; usable = (-not $capped -and -not $fCapped -and -not $fDenied -and -not $isApp); why = $why; access = $(if ($fDenied) { 'disabled' } else { 'ok' })
       w7reset = $(if ($u.w7_reset) { [int64]$u.w7_reset } else { [int64]::MaxValue })
       score = [math]::Max($s5, $w7); s5 = $s5; w7 = $w7
       fable = $(if ($fu.ok -and $null -ne $fu.oi7_util) { [double]$fu.oi7_util } else { $null })
@@ -599,24 +872,46 @@ function Invoke-CheckRotateCore {
   if ($ForceNow) { $st.nextHaiku = 0 }
 
   $trigger = $null; $capped = $null
-  if ($now -ge [int64]$st.nextHaiku) {
+  # A seat already marked subscription-disabled is not probed again until the cooldown ends.
+  # That includes --now: the proxy or the hook just saw the 403 and wrote the marker.
+  $disabledNow = Read-AccessDisabled $act
+  if ($disabledNow) {
+    $trigger = "subscription access disabled on '$act' (403 $($disabledNow.code); cooldown, not re-probed)"
+    $capped = 'access'
+  } elseif ($now -ge [int64]$st.nextHaiku) {
     # A reading the proxy took off real traffic in the last 2 min is as good as a probe, and free.
     $u = Get-ProxySample $act $ForceNow
     if (-not $u) { $u = Get-UsageCached $act $true }          # live, haiku only: ~1s, ~9 tokens
+    # An explicit 403 (oauth_org_not_allowed / subscription disabled) is not a blip. Do not probe
+    # it twice and do not go blind: rotate. A timeout or any other non-403 is still retried once.
+    if (-not $u.ok -and $u.access -eq 'disabled') {
+      $trigger = "subscription access disabled (403 $($u.code))"
+      $capped = 'access'
+    } else {
     # Retry ONCE before going blind. A failed probe is not a neutral event: it is the watcher losing
     # sight of the only window it rotates on, and the projection below cannot see through a sample
     # that never arrived. Seat C capped at 100% on 2026-09-23 with four logged 12-second
     # `HttpClient.Timeout` failures during the climb. The failures are transient — a retry costs at
     # most one more 12s timeout against a 5-minute tick, and ~9 tokens when it succeeds.
+    # Drop the process memo so this retry is a real second probe, not the failure we just stored.
+    if ($script:UnknownProbeMemo) { [void]$script:UnknownProbeMemo.Remove("$act|") }
     if (-not $u.ok) { $u = Get-UsageCached $act $true }
-    if (-not $u.ok) {
+    if (-not $u.ok -and $u.access -eq 'disabled') {
+      $trigger = "subscription access disabled (403 $($u.code))"
+      $capped = 'access'
+    } elseif (-not $u.ok) {
       Write-RotateLog "probe of '$act' failed twice ($($u.note)) - NOT rotating, blind until the next tick" DarkYellow
       # $SessionProbeSec, never a bare 300: the task ticks every 300s and $now is read after pwsh
       # startup, so a 300 here re-creates in the failure path exactly the race that was taken out of
       # the success path — the next tick lands a second short of the deadline and skips, turning one
       # failed probe into TEN minutes of blindness instead of five.
-      $st.nextHaiku = $now + $SessionProbeSec; Save-RotateState $st; return 0
+      # Unknown stays unknown: no access-disabled marker for this seat or any other.
+      $st.nextHaiku = $now + $SessionProbeSec; Save-RotateState $st
+      Write-SeatHealth $true $act 'probe_transient'
+      return 0
     }
+    }
+    if ($trigger) { } else {
     $s5 = [int][math]::Round([double]$u.s5_util * 100); $w7 = [int][math]::Round([double]$u.w7_util * 100)
     # Project the session window forward one probe interval before testing the bar. A bare level
     # test is a test on a sample that is already up to $SessionProbeSec stale, and the margin
@@ -652,6 +947,16 @@ function Invoke-CheckRotateCore {
     elseif ($u.status -eq 'rejected') { $trigger = "account REJECTED by the server (claim $($u.claim); session $s5%, weekly $w7%)"; $capped = 'session' }
     elseif ($s5 -ge $sessBar)      { $trigger = "session at $s5% >= $sessBar% (weekly $w7%, left to burn)" }
     elseif ($proj -ge $sessBar)    { $trigger = "session at $s5% burning {0:n1}%/min -> {1}% by the next probe, bar $sessBar% (weekly $w7%, left to burn)" -f ($rate * 60), $proj }
+    }
+  }
+
+  # LINUX-PORT (owner ruling 2026-10-20): never SIT on the laptop desktop app's current seat either.
+  # Rank-Accounts already keeps that identity out of every target list; this makes the watcher move
+  # off it when the app switches onto the seat the box is using. Identity, not a reserved letter.
+  # Proactive, like a session-bar rotation: $capped stays unset, so no session pings.
+  if (-not $trigger -and $IsLinux) {
+    $appNow = Get-AppSeatLabel
+    if ($appNow -and ($act -ieq $appNow)) { $trigger = "is the seat the laptop's Claude desktop app is on ('$appNow') - the box never shares it (owner, 2026-10-20)" }
   }
 
   # ---- Fable: free baseline, then armed-and-escalating only once it is genuinely at risk ----
@@ -669,7 +974,13 @@ function Invoke-CheckRotateCore {
     if (-not $trigger -and [int64]$st.fableTs -gt 0 -and $dist -le $FableArmAt) {
       if ($now -ge [int64]$st.nextFable) {
         $fu = Get-UsageCached $act $true 'fable' '-fable'
-        if ($fu.ok -and $null -ne $fu.oi7_util) {
+        # An explicit 403 on the Fable probe is the same subscription refusal as on the Haiku one (Get-UsageCached has already written the
+        # disabled marker): rotate now through the same access trigger. Falling through left $trigger unset, so the seat was declared 'ready'
+        # until the NEXT tick read the marker.
+        if (-not $fu.ok -and $fu.access -eq 'disabled') {
+          $trigger = "subscription access disabled (403 $($fu.code))"
+          $capped = 'access'
+        } elseif ($fu.ok -and $null -ne $fu.oi7_util) {
           $st.fableBase = [int][math]::Round([double]$fu.oi7_util * 100)
           # Record the CACHE's timestamp, not $now. Get-UsageCached stamps the file a second or
           # two later than this function's $now, so storing $now leaves our own write looking
@@ -687,42 +998,82 @@ function Invoke-CheckRotateCore {
   }
 
   Save-RotateState $st
-  if (-not $trigger) { return 0 }            # healthy: stay silent, the log is for events only
+  if (-not $trigger) {
+    Write-SeatHealth $true $act 'ready'
+    return 0            # healthy: stay silent, the log is for events only
+  }
   Write-RotateLog "TRIGGER: active account '$act' $trigger$(if ($Source) { " [via $Source]" })" Yellow
   $recent = @(@($st.rotations) | Where-Object { $_ -and ($now - [int64]$_) -lt $RotateCapWindow })
   if ($recent.Count -ge $RotateCapCount -and -not $DryRun) {
     Write-RotateLog "RATE CAP: $($recent.Count) rotations in the last $([int]($RotateCapWindow/60)) min - NOT rotating again. Every seat may be failing; owner action needed (claude-rotator --best)." Red
+    if ($capped -eq 'access') { Write-SeatHealth $false $act 'subscription_disabled' }
     return 3
   }
   $win = Select-RotationTarget $sessBar
+  # Access refusal only: if ranking learned nothing because the network failed, step once to the
+  # first eligible seat in label order. Do not mark those seats disabled. Do not touch a seat the
+  # desktop-app identity rule already excludes. One pick, no second wave of probes.
+  if (-not $win -and $capped -eq 'access') {
+    $win = Select-RotationTarget $sessBar -UnknownExcept $act
+    if ($win) { Write-RotateLog "fallback '$($win.label)' with usage unknown (network); not marked disabled" DarkYellow }
+  }
   if (-not $win) {
     # Never rotate onto a fable-capped seat to escape this, and never onto one that would
     # re-trigger next tick. Surface loudly and leave it to the owner — the same boundary
     # codex_failover_review.py draws around redeeming a reset.
     $detail = (Rank-Accounts $false $false | ForEach-Object {
-                 "{0}=s{1}%/w{2}%{3}" -f $_.label, [int][math]::Round($_.s5*100), [int][math]::Round($_.w7*100),
-                 $(if ($_.why) { "($($_.why))" } else { '' }) }) -join ' '
+                 $sTxt = if ($null -eq $_.s5) { 'n/a' } else { '{0}%' -f [int][math]::Round($_.s5*100) }
+                 $wTxt = if ($null -eq $_.w7) { 'n/a' } else { '{0}%' -f [int][math]::Round($_.w7*100) }
+                 "{0}=s{1}/w{2}{3}" -f $_.label, $sTxt, $wTxt, $(if ($_.why) { " ($($_.why))" } else { '' }) }) -join ' '
     Write-RotateLog "NO USABLE TARGET - staying on '$act'. $detail" Red
-    Write-RotateLog "  every alternative is capped, fable-capped, or already >= $sessBar% session. Owner action needed." Red
+    Write-RotateLog "  every alternative is capped, fable-capped, the desktop-app seat, or already >= $sessBar% session. Owner action needed." Red
+    if ($capped -eq 'access') { Write-SeatHealth $false $act 'exhausted' }
     return 3
   }
-  if ($win.label -eq $act) { Write-RotateLog "'$act' is still the best available - staying put" Yellow; return 0 }
+  if ($win.label -eq $act) {
+    Write-RotateLog "'$act' is still the best available - staying put" Yellow
+    $still = Read-AccessDisabled $act
+    Write-SeatHealth (-not [bool]$still) $act $(if ($still) { 'subscription_disabled' } else { 'ready' })
+    return 0
+  }
 
-  $target = "{0} ({1}) session {2}%, weekly {3}%, fable {4}" -f $win.label, (Profile-Email $win.label),
+  $target = if ($win.usageUnknown) {
+    "{0} ({1}) usage unknown (network); not marked disabled" -f $win.label, (Profile-Email $win.label)
+  } else {
+    "{0} ({1}) session {2}%, weekly {3}%, fable {4}" -f $win.label, (Profile-Email $win.label),
             [int][math]::Round($win.s5 * 100), [int][math]::Round($win.w7 * 100),
             $(if ($null -eq $win.fable) { 'unknown' } else { "$([int][math]::Round($win.fable*100))%" })
-  if ($DryRun) { Write-RotateLog "DRY RUN: would rotate '$act' -> $target" Cyan; return 0 }
+  }
+  if ($DryRun) {
+    Write-RotateLog "DRY RUN: would rotate '$act' -> $target" Cyan
+    if ($capped -eq 'access') { Write-SeatHealth $false $act 'subscription_disabled' }
+    return 0
+  }
   $rc = Apply-Active $win.label
   if ($rc -ne 0) { Write-RotateLog "rotation to '$($win.label)' FAILED" Red; return $rc }
   Write-RotateLog "ROTATED '$act' -> $target" Green
   $st.rotations = @($recent + $now); Save-RotateState $st
+  Write-SeatHealth $true $win.label 'ready'
   # Only after a CAP (owner, 2026-08-16). A proactive session rotation happens BEFORE anything is
   # blocked, so there is nothing to tell a session it can now resume — pinging then would just
-  # interrupt working sessions for no reason.
+  # interrupt working sessions for no reason. Subscription-disabled is a cap: the session is stuck.
   if ($capped) {
-    Ping-ActiveSessions ("Usage reset: the {0} limit capped, so the CLI account was rotated to {1}. Fresh {0} quota is available now - continue where you left off." -f $capped, $win.label)
+    $ping = if ($capped -eq 'access') {
+      "Claude subscription access was refused on the previous seat, so the CLI account was rotated to $($win.label). Continue where you left off."
+    } else {
+      "Usage reset: the {0} limit capped, so the CLI account was rotated to {1}. Fresh {0} quota is available now - continue where you left off." -f $capped, $win.label
+    }
+    Ping-ActiveSessions $ping
   }
   return 0
+}
+
+# Leave a seat that is already known subscription-disabled, before the next CLI request.
+# A healthy seat, including seat A, is left exactly where it is. No letter is special.
+function Invoke-EnsureCliSeat {
+  $act = Get-ActiveLabel
+  if (-not $act -or -not (Read-AccessDisabled $act)) { return 0 }
+  return (Invoke-CheckRotate 0 $false $true 'ensure')
 }
 
 # Rank on the HAIKU probe only — ~1s for every account at once. Probing fable for all five up
@@ -730,7 +1081,22 @@ function Invoke-CheckRotateCore {
 # enough to look broken, and long enough to burn several more points at ~2%/min. Fable is only
 # needed to REJECT a capped target, so buy it one candidate at a time — normally exactly one.
 function Select-RotationTarget {
-  param([int]$Bar)
+  param([int]$Bar, [string]$UnknownExcept)
+  if ($PSBoundParameters.ContainsKey('UnknownExcept')) {
+    # The access-refusal fallback: usage unknown (network), so no session bar, but every other exclusion
+    # still holds - the active seat, the desktop-app seat, a seat marked disabled, and a seat whose cached
+    # Fable reading says rejected (cache only: the network is what failed, so no probe).
+    $appSeat = Get-AppSeatLabel
+    $unknown = @(Rank-Accounts $false $false | Where-Object {
+      $_.access -eq 'unknown' -and $_.label -ne $UnknownExcept -and -not ($appSeat -and ($_.label -ieq $appSeat)) -and -not (Read-AccessDisabled $_.label)
+    } | Sort-Object label)
+    foreach ($c in $unknown) {
+      $fu = Get-UsageCached $c.label $false 'fable' '-fable' $true
+      if ($fu.ok -and $fu.oi7_stat -eq 'rejected') { continue }       # Gate C needs Fable
+      return [pscustomobject]@{ label = $c.label; s5 = 0; w7 = 0; fable = $null; usageUnknown = $true }
+    }
+    return $null
+  }
   $viable = @(Rank-Accounts $true $false | Where-Object {
                 $_.usable -and ([int][math]::Round($_.s5 * 100)) -lt $Bar })
   if (-not $viable) { return $null }
@@ -744,6 +1110,7 @@ function Select-RotationTarget {
   $ordered = if ($roomy) { @($roomy | Sort-Object { [int64]$_.w7reset }) } else { @($viable | Sort-Object s5) }
   foreach ($c in $ordered) {
     $fu = Get-UsageCached $c.label $true 'fable' '-fable'
+    if ($fu.access -eq 'disabled') { continue }                       # the Fable probe was an explicit access refusal: never a target
     if ($fu.ok -and $fu.oi7_stat -eq 'rejected') { continue }         # Gate C needs Fable
     $c | Add-Member -NotePropertyName fable -NotePropertyValue $(if ($fu.ok -and $null -ne $fu.oi7_util) { [double]$fu.oi7_util } else { $null }) -Force
     return $c
@@ -799,7 +1166,8 @@ function Save-ProfileToken {
     Copy-Item $tf (Join-Path $dst ("token.txt.bak-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Force
   }
   New-Item -ItemType Directory -Path $dst -Force | Out-Null
-  $tmp = "$tf.tmp-$PID"; Set-Content -LiteralPath $tmp -Value $Tok -Encoding UTF8 -NoNewline; [IO.File]::Move($tmp, $tf, $true)
+  $tmp = "$tf.tmp-$PID"; Write-OwnerOnly $tmp $Tok   # LINUX-PORT: token files are owner-only from creation
+  [IO.File]::Move($tmp, $tf, $true)
 }
 
 function Resolve-Target {
@@ -835,6 +1203,7 @@ for ($i=0; $i -lt $a.Count; $i++) {
     '^--?(usage|u)$'                   { $mode='usage' }
     '^--?(best|headroom)$'             { $mode='best' }
     '^--?(check-?rotate|auto-?rotate|monitor)$' { $mode='checkrotate' }
+    '^--?(ensure-cli-seat|ensure)$'    { $mode='ensure' }
     '^--?(dry-?run|whatif)$'           { $DryRun = $true }
     '^--?(threshold|at)$'              { if ($i+1 -lt $a.Count -and $a[$i+1] -match '^\d+$') { $Threshold=[int]$a[$i+1]; $i++ } }
     '^--?(refresh|fresh)$'             { $Refresh = $true }
@@ -851,6 +1220,9 @@ for ($i=0; $i -lt $a.Count; $i++) {
   }
 }
 if (-not $mode) { $mode = if ($unknown.Count) { 'unknown' } else { 'status' } }
+# Dot-sourcing imports the functions for the regression tests. A normal `pwsh -File` run
+# falls through and executes the mode below. Tests never reach the network from here.
+if ($MyInvocation.InvocationName -eq '.') { return }
 New-Item -ItemType Directory -Path $Root -Force | Out-Null
 
 # ---------- modes ----------
@@ -864,8 +1236,10 @@ switch ($mode) {
     Write-Host "  --usage   (--refresh)    session(5h)+weekly(7d)+fable(weekly) usage for every account (also: claude-usage)"
     Write-Host "  --best    (--headroom)   rank accounts by headroom; 'best' is also a switch target:"
     Write-Host "                           claude-rotator --switch best   (skips capped + fable-capped)"
-    Write-Host "  --check-rotate           rotate when the ACTIVE account passes the session bar (80%), or"
-    Write-Host "                           when its weekly/fable window CAPS. Add --dry-run to preview."
+    Write-Host "  --ensure-cli-seat        if the active seat is subscription-disabled, rotate before the next request"
+    Write-Host "  --check-rotate           rotate when the ACTIVE account passes the session bar (85%), or"
+    Write-Host "                           when its weekly/fable window CAPS, or on a subscription-disabled 403."
+    Write-Host "                           Add --dry-run to preview. No seat letter is reserved."
     Write-Host "                           Runs every 5 min as the 'Claude usage auto-rotate' task."
     Write-Host "                           After a CAP rotation it pings running sessions that quota is back."
     Write-Host "  --capture <l>            paste a setup-token (from `claude setup-token`) into profile <l>"
@@ -919,6 +1293,7 @@ switch ($mode) {
   # must not hand back an hour-old fable number. --refresh is now a no-op here (kept working).
   'usage' { Show-Usage $true $false; break }
   'checkrotate' { exit (Invoke-CheckRotate $Threshold $DryRun $NowCheck $Source) }
+  'ensure' { exit (Invoke-EnsureCliSeat) }
   'best' {
     $r = Rank-Accounts $true
     # Same order the watcher rotates in, so what you read is what it would do.

@@ -21,6 +21,9 @@ USAGE  (run in normal PowerShell, app CLOSED for capture/switch/rotate)
   claude-app-rotator.ps1 --status            # app state, live account + UUID, profiles
   claude-app-rotator.ps1 --list              # list captured account profiles
   claude-app-rotator.ps1 --switch <label>    # back up current login, load profile <label>
+  claude-app-rotator.ps1 --switch <label> --relaunch
+                                             # close the running app first (gracefully; aborts if it
+                                             # is still running after 30 s), switch, reopen the app
   claude-app-rotator.ps1 --rotate [label]    # cycle to the next profile (or switch to <label>)
   claude-app-rotator.ps1 --capture <label>   # save the CURRENT login as profile <label>
   claude-app-rotator.ps1 --usage [--refresh]  # per-account usage incl. Fable (app seats = the
@@ -130,6 +133,65 @@ function Enter-SeatLock {
   Write-Host "BLOCKED: $p is held (the seat keep-alive is refreshing a seat). Re-run in a minute." -ForegroundColor Red
   exit 1
 }
+$script:CloseWaitSec = 30
+function Close-AppGracefully {
+  # --relaunch: ask every app window to close, then wait. Never force-kills: a kill mid-write can tear
+  # the login storage this script is about to move aside. Returns $true once no app process is left.
+  $p = @(Get-AppProcs)
+  if ($p.Count -eq 0) { return $true }
+  Write-Host "Closing the Claude app (PIDs $($p.Id -join ', '))..." -ForegroundColor DarkGray
+  foreach ($w in @($p | Where-Object { $_.MainWindowHandle -ne 0 })) { [void]$w.CloseMainWindow() }
+  $deadline = (Get-Date).AddSeconds($script:CloseWaitSec)
+  while ((Get-Date) -lt $deadline -and @(Get-AppProcs).Count) { Start-Sleep -Milliseconds 500 }
+  return (@(Get-AppProcs).Count -eq 0)
+}
+function Find-AppLauncher {
+  # The installed app's launcher, as {file; args}: the Squirrel stub the Start-menu shortcut runs (it starts the newest
+  # app-* build), else Squirrel's Update.exe --processStart, else the MSIX package by its AUMID. $null when none is found.
+  $sq = Join-Path $env:LOCALAPPDATA 'AnthropicClaude'
+  if (Test-Path (Join-Path $sq 'claude.exe')) { return @{ file = (Join-Path $sq 'claude.exe'); args = @() } }
+  if (Test-Path (Join-Path $sq 'Update.exe')) { return @{ file = (Join-Path $sq 'Update.exe'); args = @('--processStart', 'claude.exe') } }
+  try {
+    $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction Stop | Select-Object -First 1
+    if ($pkg) {
+      $id = @((Get-AppxPackageManifest $pkg).Package.Applications.Application)[0].Id
+      if ($id) { return @{ file = "shell:AppsFolder\$($pkg.PackageFamilyName)!$id"; args = @() } }
+    }
+  } catch {}
+  return $null
+}
+function Start-ClaudeApp {
+  $l = Find-AppLauncher
+  if (-not $l) { Write-Host "Could not find the installed Claude app to reopen; open it from the Start menu." -ForegroundColor DarkYellow; return $false }
+  try {
+    # The app is a user-facing program: it must not inherit this shell's class. The dashboard server runs this script at Idle (or BelowNormal), and a
+    # child starts at its parent's class, so the shell goes to Normal for the launch and back after: the reverse of Get-CliVersion (claude-cli-account.ps1).
+    $me = Get-Process -Id $PID; $was = $me.PriorityClass
+    try {
+      if ("$was" -eq 'Idle' -or "$was" -eq 'BelowNormal') { try { $me.PriorityClass = 'Normal' } catch {} }
+      if ($l.args.Count) { Start-Process -FilePath $l.file -ArgumentList $l.args } else { Start-Process -FilePath $l.file }
+    } finally { try { $me.PriorityClass = $was } catch {} }
+    return $true
+  } catch { Write-Host "Could not reopen the Claude app: $($_.Exception.Message)" -ForegroundColor DarkYellow; return $false }
+}
+function Invoke-SwitchRelaunch([string]$label) {
+  # --switch <label> --relaunch. Closing first, then the ordinary switch with every one of its gates; the app is reopened
+  # afterwards, on the new login, or on the old one when the switch refused (Invoke-Switch exits, so this runs in finally).
+  $wasRunning = @(Get-AppProcs).Count -gt 0
+  if (-not (Close-AppGracefully)) {
+    Write-Host "ABORTED: the Claude app was still running $($script:CloseWaitSec) s after it was asked to close (if it lives in the system tray, quit it from the tray icon and run this again). Nothing was switched; it was not force-closed (that can tear the login storage)." -ForegroundColor Red
+    exit 1
+  }
+  $script:SwitchDone = $false
+  try { Invoke-Switch $label }
+  finally {
+    if ($script:SwitchDone) {
+      if (Start-ClaudeApp) { Write-Host "Relaunched the Claude app on seat $(Resolve-Label $label)." -ForegroundColor Green }
+    } elseif ($wasRunning) {
+      if (Start-ClaudeApp) { Write-Host "Switch failed; relaunched the Claude app on its old login." -ForegroundColor Red }
+    }
+  }
+}
 function Copy-Dir($src,$dst){ robocopy $src $dst /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null }
 function Mirror-Dir($src,$dst){ robocopy $src $dst /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null }
 
@@ -203,17 +265,19 @@ function Invoke-Switch([string]$label) {
     try { & $pub | Out-Null } catch { Write-Host "  (app-seat publish skipped: $($_.Exception.Message))" -ForegroundColor DarkYellow }
   }
   Write-Host "To undo: --switch <previous-label>, or restore that backup folder into $AppDir." -ForegroundColor DarkGray
-  Write-Host "Now reopen the Claude desktop app." -ForegroundColor Cyan
+  $script:SwitchDone = $true
+  if (-not $Relaunch) { Write-Host "Now reopen the Claude desktop app." -ForegroundColor Cyan }
 }
 
 # ---- flag parse ----
-$mode = $null; $label = $null
+$mode = $null; $label = $null; $Relaunch = $false
 $a = @($Args | Where-Object { $_ })
 for ($i=0; $i -lt $a.Count; $i++) {
   switch -regex ($a[$i]) {
     '^--?(status|st)$'        { $mode='status' }
     '^--?(usage|u)$'          { $mode='usage' }
     '^--?refresh$'            { $usageRefresh = $true }
+    '^--?relaunch$'           { $Relaunch = $true }
     '^--?(list|ls)$'          { $mode='list' }
     '^--?(help|h|\?)$'        { $mode='help' }
     '^--?(capture|save|add)$' { $mode='capture'; if ($i+1 -lt $a.Count){ $label=$a[$i+1]; $i++ } }
@@ -227,6 +291,9 @@ for ($i=0; $i -lt $a.Count; $i++) {
   }
 }
 if (-not $mode) { $mode='status' }
+if ($Relaunch -and $mode -ne 'switch') { Write-Host "--relaunch works with --switch <label> only." -ForegroundColor Red; exit 2 }
+# Dot-sourcing imports the functions for test-app-relaunch.ps1 (same pattern as claude-cli-account.ps1).
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 New-Item -ItemType Directory -Path $SeatRoot -Force | Out-Null
 
@@ -305,7 +372,7 @@ switch ($mode) {
     break
   }
 
-  'switch' { Invoke-Switch $label; break }
+  'switch' { if ($Relaunch) { Invoke-SwitchRelaunch $label } else { Invoke-Switch $label }; break }
 
   'rotate' {
     if ($label) { Invoke-Switch $label; break }

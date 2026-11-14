@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>Agent Dashboard</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#0c0a09">
+<style>
+:root{color-scheme:dark;--ok:#4ade80;--caution:#facc15;--bad:#f87171;--bg:#0b0b0c;--panel:#141415;--ink:#f4f4f5;--ink2:#d4d4d8;--muted:#8b8b94;--grid:#26262a;--btn:#1c1c1f;--btnon:#f4f4f5;--btnonink:#0b0b0c;--warn:#fbbf24;--c-claude:#f4906b;--c-codex:#6ea8ff;--c-grok:#a1a1aa;--c-gemini:#a78bfa;--bdg-cli:#60a5fa;--bdg-cli-ink:#0b1220;--bdg-app:#a78bfa;--bdg-app-ink:#120a26}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed;--bdg-cli:#1d4ed8;--bdg-cli-ink:#fff;--bdg-app:#6d28d9;--bdg-app-ink:#fff}}
+:root[data-theme="light"]{color-scheme:light;--ok:#15803d;--caution:#a16207;--bad:#b91c1c;--bg:#f7f7f5;--panel:#fff;--ink:#18181b;--ink2:#3f3f46;--muted:#71717a;--grid:#e4e4e7;--btn:#efeff0;--btnon:#18181b;--btnonink:#fff;--warn:#b45309;--c-claude:#c2410c;--c-codex:#2563eb;--c-grok:#52525b;--c-gemini:#7c3aed;--bdg-cli:#1d4ed8;--bdg-cli-ink:#fff;--bdg-app:#6d28d9;--bdg-app-ink:#fff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:16px}
+button,select{font:inherit;color:var(--ink2);background:var(--btn);border:0;border-radius:10px;padding:8px 12px;cursor:pointer}
+button:focus-visible,select:focus-visible{outline:2px solid var(--ink2);outline-offset:2px}
+button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-4px}
+button[aria-pressed="true"]{background:var(--btnon);color:var(--btnonink)}
+button:disabled{opacity:.6;cursor:default}
+.top{display:flex;justify-content:flex-end;gap:4px}
+.top button{background:none;padding:0;width:36px;height:36px;display:inline-grid;place-items:center}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:12px}
+.row.t{align-items:baseline}
+.grow{margin-left:auto}
+h1{font-size:28px;margin:0;line-height:1.1}
+.sub,.lbl,.note,.of,.muted{color:var(--muted)}
+.btns{display:flex;flex-wrap:wrap;gap:8px}
+.btns button{display:inline-flex;gap:8px;align-items:center}
+.btns .primary{background:var(--btnon);color:var(--btnonink)}
+.btns button[aria-pressed="true"]{background:var(--btnon);color:var(--btnonink)}
+.tabs button,.seg button{background:none}
+.tabs button[aria-pressed="true"],.seg button[aria-pressed="true"]{background:var(--btn);color:var(--ink)}
+.tabs{display:flex;flex-wrap:wrap;gap:4px}
+.tabs button{display:inline-flex;gap:8px;align-items:center;padding:8px 12px}
+.tabs button span.n{color:var(--muted)}
+.seg{display:inline-flex;background:var(--panel);border-radius:12px;padding:3px}
+.seg button{padding:6px 14px;border-radius:9px}
+select{background:var(--panel);color:var(--ink);padding:9px 12px}
+.range{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.range button{background:var(--panel);padding:8px 14px}
+.range button.i{padding:8px 10px;background:none}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--acc);display:inline-block;flex:none}
+#pcerr{box-sizing:border-box;max-width:1068px;margin:16px auto 0}@media(max-width:1100px){#pcerr{margin:16px 16px 0}}
+.pcerr{margin-top:12px;background:var(--panel);border-radius:12px;border-left:4px solid var(--warn);padding:10px 14px;font-size:14px;color:var(--ink2)}
+.drift{margin-top:12px;background:var(--panel);border-radius:12px;padding:6px 14px;font-size:14px}
+.drift summary{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;list-style:none;color:var(--ink2);padding:4px 0}
+.drift summary::-webkit-details-marker{display:none}
+.drift summary svg{width:18px;height:18px;fill:none;stroke:var(--warn);stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.drift .dl{margin-left:auto;display:inline-flex;gap:10px;align-items:center;color:var(--muted)}
+.drift .dl b{font-weight:500;color:var(--ink2);text-decoration:underline;text-underline-offset:3px}
+.drift .dd{padding:2px 0 10px;color:var(--ink2)}
+.drift .dd p{margin:8px 0}
+.drift ul{list-style:none;margin:8px 0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.drift li{background:var(--btn);border-radius:6px;padding:2px 8px;font-size:13px}
+.drift code{font:13px ui-monospace,Consolas,monospace;background:var(--btn);border-radius:4px;padding:1px 5px}
+.msg{margin-top:12px;color:var(--warn);min-height:0}
+.panel{background:var(--panel);border-radius:16px;padding:20px;margin-top:16px}
+.ph{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between}
+.ph .nm{display:flex;gap:10px;align-items:center;font-size:17px}
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+.chips button{background:none;padding:6px 12px}
+.chips button em{font-style:normal;color:var(--muted);margin-left:6px}
+.chips button[aria-pressed="true"]{background:var(--btn);color:var(--ink)}
+.chips button[aria-pressed="true"] em{color:var(--muted)}
+.chip{align-self:center;color:var(--ink2);background:var(--btn);border-radius:999px;padding:4px 12px;font-size:13px}
+.hd{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;align-items:flex-end;margin-top:8px}
+.big{font-size:52px;font-weight:650;line-height:1;font-variant-numeric:tabular-nums}
+.of{font-size:18px;margin-left:8px}
+.stat{text-align:right}.stat b{display:block;font-size:20px;font-weight:500}.stat .why{display:block;font-size:13px}
+.chart{position:relative;margin-top:12px}
+svg.c{display:block;width:100%;height:auto;overflow:visible}
+svg text{font:12px system-ui,-apple-system,"Segoe UI",sans-serif}
+.hit{touch-action:pan-y}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);padding:6px 9px;border-radius:8px;font-size:13px;white-space:nowrap;display:none;transform:translate(-50%,-125%);z-index:2}
+.note{font-size:13px;margin:8px 0 0}
+details{margin-top:12px}
+summary{cursor:pointer;color:var(--muted);padding:4px 0}
+.wrap{overflow-x:auto;max-width:100%}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap}
+th{color:var(--muted);font-weight:500}
+td.lv-ok{--lvc:var(--ok)}td.lv-warn{--lvc:var(--caution)}td.lv-bad{--lvc:var(--bad)}
+.pv{color:var(--lvc,var(--ink))}
+.lv-bad .pv{font-weight:600}
+.bar{display:block;height:4px;min-width:72px;margin-top:4px;border-radius:2px;background:var(--grid);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--lvc,var(--muted))}
+.bdg{display:inline-block;margin-left:8px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em;line-height:18px;vertical-align:1px;white-space:nowrap;background:var(--bdg-cli);color:var(--bdg-cli-ink)}
+.bdg.app{background:var(--bdg-app);color:var(--bdg-app-ink)}
+td small.ms.warn{color:var(--warn)}
+.cp{margin-left:6px;padding:1px 8px;font-size:12px;color:var(--ink)}
+.bdg.wt{background:var(--btn);color:var(--ink2);box-shadow:inset 0 0 0 1px var(--muted);font-weight:600;letter-spacing:0}
+.ph .bdg{margin-left:0;vertical-align:0}
+.inuse{display:inline-flex;flex-wrap:wrap;gap:6px}
+td small{display:block;color:var(--muted);font-size:12px}
+li small{color:var(--muted);font-size:12px;margin-left:6px}
+td.w3{color:color-mix(in srgb,var(--warn) 45%,var(--muted))}
+td.w{color:var(--warn);font-weight:600}
+td.nt{color:var(--warn);white-space:normal;min-width:220px}
+td.bk{white-space:normal;min-width:12em;max-width:17em}td:first-child{white-space:normal;min-width:9em}td:first-child small{white-space:normal}
+.empty{margin-top:12px;padding:14px 16px;border-radius:12px;background:var(--bg);color:var(--ink2)}
+.empty p{margin:0}.empty p+p{margin-top:6px}
+.rs{display:block;margin-top:6px;padding:4px 10px;font-size:13px;color:var(--ink)}
+.sw{padding:4px 10px;font-size:13px;color:var(--ink)}
+td .sw{display:block;margin-top:6px}td .sw:first-child{margin-top:0}
+.ph .sw{white-space:nowrap}
+dialog{background:var(--panel);color:var(--ink);border:1px solid var(--grid);border-radius:16px;padding:20px;width:min(460px,calc(100vw - 32px));font:inherit}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+dialog h2{font-size:19px;margin:0 0 14px;line-height:1.25}
+dialog dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+dialog dt{color:var(--muted)}dialog dd{margin:0;font-variant-numeric:tabular-nums}
+dialog .warn{color:var(--warn);margin:14px 0 0}
+dialog .dact{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+dialog .dact .primary{background:var(--btnon);color:var(--btnonink)}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);max-width:min(560px,calc(100vw - 32px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;z-index:5;box-shadow:0 2px 12px rgba(0,0,0,.35)}
+.toast[hidden]{display:none}
+@media (max-width:600px){.panel{padding:14px}.big{font-size:42px}h1{font-size:24px}.stat{text-align:left}th,td{padding:8px 6px}.bar{min-width:60px}td:first-child{min-width:10em}td small.pl,td small.ms,td small.sg{white-space:normal}}
+</style>
+</head>
+<body>
+<div id="pcerr" class="pcerr" role="alert" hidden></div>
+<main id="app"></main>
+<dialog id="rsdlg" aria-labelledby="rsT"></dialog>
+<dialog id="swdlg" aria-labelledby="swT"></dialog>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>__SIM__</script>
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('q2' + k); return v == null ? d : v; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('q2' + k, v); } catch (e) {} }
+};
+let D = JSON.parse($('data').textContent);
+const MULTS = [['1', 'Same as now (×1)'], ['0.5', 'Half (×0.5)'], ['1.5', '1.5× (×1.5)'], ['2', 'Double (×2)'], ['0', 'Stop (×0, only resets)']];
+const pick = (v, ok, d) => ok.includes(v) ? v : d;
+const ui = {
+  tab: store.get('tab', 'all'),
+  view: pick(store.get('view', 'rem'), ['rem', 'drain'], 'rem'),
+  win: pick(store.get('win', 'typ'), ['typ', '1', '3', '6', '24'], 'typ'),
+  mult: pick(store.get('mult', '1'), MULTS.map(m => m[0]), '1'),
+  emails: store.get('emails', '0') === '1',
+  theme: pick(store.get('theme', 'system'), ['system', 'light', 'dark'], 'system'),
+  lim: (() => { try { return JSON.parse(store.get('lim', '{}')) || {}; } catch (e) { return {}; } })()
+};
+let off = 0, busy = false, msg = '', charts = {};
+let sw = null;   // the switch in progress or awaiting confirmation: {pid, role, seat, busy}
+const swBusy = () => busy || !!(sw && sw.busy);
+const closed = {}; // provider id -> accounts <details> was collapsed by the viewer
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const loc = (t, o) => new Date(t * 1000).toLocaleString([], o);
+const fmtDT = t => loc(t, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+const fmtWT = t => loc(t, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+const fmtD = t => loc(t, { month: 'short', day: 'numeric' });
+const ago = t => { const s = D.now - t; return s < 90 ? 'just now' : s < 5400 ? Math.round(s / 60) + ' min ago' : s < 172800 ? +(s / 3600).toFixed(1) + ' h ago' : Math.round(s / 86400) + ' d ago'; };
+const nm = a => quotaSeat(a, ui.emails, esc);
+const fr = v => v >= 10 ? Math.round(v) : v >= 1 ? +v.toFixed(1) : +v.toFixed(2);     // a rate in % of the whole pool per hour: finer when small, as it is divided by the seats
+const seatsOf = lim => (lim.seats || []).length || Math.round((lim.cap || 100) / 100);      // seats counted in the pool; the cap is in weighted seats
+const sh = (v, lim) => quotaShare(v, lim.cap);
+const seatsTxt = lim => seatsOf(lim) + ' seat' + (seatsOf(lim) === 1 ? '' : 's');
+// The rate the headline number and the projection use. 'typ' is the limit's typical-day profile (24 hourly %/h); a young limit has none and falls back to 3h.
+function rateFor(lim) {
+  const w = winKey();                  // not ui.win: in the drain view Typical shows the 3h segment, so the headline must use 3h too
+  if (w === 'typ' && lim.profile) return { rate: lim.profile, avg: lim.typical, why: 'Typical week, average of all hours', proj: 'typical-day profile' };
+  const k = w === 'typ' ? '3' : w, b = lim.burn ? lim.burn[k] : null;
+  return { rate: b, avg: b, why: w === 'typ' ? 'Last 3h (not enough history for a typical week)' : 'Last ' + k + 'h', proj: k + 'h burn' };
+}
+const winKey = () => ui.view === 'drain' && ui.win === 'typ' ? '3' : ui.win;     // the rate-over-time line has one value per window, none for Typical
+
+const ICON = {
+  reload: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  moon: '<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>',
+  auto: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+  left: '<path d="M15 5l-7 7 7 7"/>', right: '<path d="M9 5l7 7-7 7"/>',
+  warn: '<path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5"/>',
+  grid: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>'
+};
+const ico = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]}</svg>`;
+
+// The provider cache cannot be read: say why (the server's message names the file and what to do); the reset buttons are held back meanwhile (resetBtn, openReset, openClear).
+// The banner lives OUTSIDE #app, which render() rebuilds: one alert node (#pcerr) whose text is set only when the message changes. An alert is
+// announced when its content changes, so a new message is read out once and an unchanged one is not read again on every render.
+function pcacheShow(el, m) {
+  m = m || '';
+  if (!el || el.dataset.m === m) return;
+  el.dataset.m = m; el.textContent = m; el.hidden = !m;                              // textContent: the message is never parsed as markup
+}
+function driftRow(d) {
+  return `<details class="drift" data-p="drift"${closed.drift === false ? ' open' : ''}><summary>${ico('warn')}<span>Update available from GitHub (${d.n} file${d.n === 1 ? '' : 's'} differ${d.n === 1 ? 's' : ''})</span>` +
+    `<span class="dl">${d.checked ? `<span>Checked ${esc(ago(d.checked))}</span>` : ''}<b>Details</b></span></summary><div class="dd">` +
+    `<p>The rotator files on this PC differ from the latest version on GitHub:</p>` +
+    `<ul>${d.names.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` +
+    `<p>To update, open a terminal in the rotator folder and run <code>rotator-sync --pull</code>. It downloads the new versions and keeps a backup of every file it replaces (<code>&lt;name&gt;.bak-sync-&lt;date&gt;</code>). Your own settings (<code>rotator.local.json</code>) are never touched.</p></div></details>`;
+}
+
+function applyTheme() {
+  const r = document.documentElement;
+  if (ui.theme === 'system') r.removeAttribute('data-theme'); else r.setAttribute('data-theme', ui.theme);
+}
+
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v))), f = v / e;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+}
+
+function chart(p, lim, W) {
+  const H = 340, L = 52, R = 12, T = 30, B = 30, pw = W - L - R;
+  const d0 = new Date((D.now - 7 * 86400 + off) * 1000); d0.setHours(0, 0, 0, 0);
+  const d1 = new Date(d0); d1.setDate(d1.getDate() + 14);
+  const x0 = d0 / 1000, x1 = d1 / 1000;
+  const X = t => L + (t - x0) / (x1 - x0) * pw;
+  const drain = ui.view === 'drain';
+  const mult = parseFloat(ui.mult), rf = rateFor(lim), rate = rf.rate, wk = winKey();
+  const sc = a => a.map(q => [q[0], sh(q[1], lim)].concat(q.slice(2)));          // pooled -> % of the whole pool, for display only
+  const hist = drain ? [] : sc(lim.hist.filter(q => q[0] >= x0 && q[0] <= x1));
+  const dr = drain ? sc(((lim.drain || {})[wk] || []).filter(q => q[0] >= x0 && q[0] <= x1)) : [];
+  let pr = null;
+  if (!drain && rate != null && x1 > D.now && lim.seats && lim.seats.length) {
+    pr = quotaProject(lim.seats, Array.isArray(rate) ? rate.map(r => r * mult) : rate * mult, D.now, x1 - D.now);
+    pr.pts = sc(pr.pts.filter(q => q[0] >= x0 && q[0] <= x1));
+  }
+  const ymax = drain ? niceMax(Math.max(0, ...dr.map(q => q[1]))) : 100;
+  const Y = v => T + (1 - Math.min(Math.max(v, 0), ymax) / ymax) * (H - T - B);
+  const yl = v => drain ? fr(v) + '%/h' : Math.round(v) + '%';
+  const s = [];
+  for (const v of [0, ymax / 2, ymax]) s.push(`<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end" fill="var(--muted)">${yl(v)}</text>`);
+  const ppd = pw / 14;
+  for (const d = new Date(d0); d < d1;) {
+    const n = new Date(d); n.setDate(n.getDate() + 1);
+    const a = d / 1000, b = n / 1000, day = d.getDate();
+    s.push(`<line x1="${X(a)}" x2="${X(a)}" y1="${T}" y2="${H - B}" stroke="var(--grid)"/>`);
+    if (ppd >= 22 || day % 2) s.push(`<text x="${(X(a) + X(b)) / 2}" y="${H - 10}" text-anchor="middle" fill="var(--muted)">${ppd >= 52 ? d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }) : day}</text>`);
+    d.setTime(n.getTime());
+  }
+  s.push(`<line x1="${X(x1)}" x2="${X(x1)}" y1="${T}" y2="${H - B}" stroke="var(--grid)"/>`);
+  const pt = q => X(q[0]).toFixed(1) + ',' + Y(q[1]).toFixed(1);
+  let anyB = false;
+  if (hist.length) {
+    const runs = [];
+    for (const q of hist) {
+      const b = q[2] ? 1 : 0; let r = runs[runs.length - 1];
+      if (!r || r.b !== b) { const nr = { b, pts: [] }; if (r) nr.pts.push(r.pts[r.pts.length - 1]); runs.push(nr); r = nr; }
+      r.pts.push(q);
+    }
+    for (const r of runs) {
+      if (r.pts.length < 2) continue;
+      if (r.b) anyB = true;
+      const l = r.pts.map(pt).join(' ');
+      s.push(`<g${r.b ? ' opacity=".55"' : ''}><polygon points="${X(r.pts[0][0])},${Y(0)} ${l} ${X(r.pts[r.pts.length - 1][0])},${Y(0)}" fill="url(#g-${esc(p.id)})"/><polyline points="${l}" fill="none" stroke="var(--acc)" stroke-width="2" stroke-linejoin="round"${r.b ? ' stroke-dasharray="1 4" stroke-linecap="round"' : ''}/></g>`);
+    }
+  }
+  if (dr.length) s.push(`<polyline points="${dr.map(pt).join(' ')}" fill="none" stroke="var(--acc)" stroke-width="2" stroke-linejoin="round"/>`);
+  if (pr && pr.pts.length > 1) s.push(`<polyline points="${pr.pts.map(pt).join(' ')}" fill="none" stroke="var(--acc)" stroke-width="2" stroke-dasharray="6 5"/>`);
+  if (D.now >= x0 && D.now <= x1) s.push(`<line x1="${X(D.now)}" x2="${X(D.now)}" y1="${T}" y2="${H - B + 4}" stroke="var(--muted)"/><text x="${X(D.now)}" y="${T - 10}" text-anchor="middle" fill="var(--muted)">Now</text>`);
+  let emptyTxt = '';
+  if (pr && pr.empty && pr.empty >= x0 && pr.empty <= x1) {
+    const ex = X(pr.empty), tx = Math.min(Math.max(ex, L + 70), W - R - 70);
+    emptyTxt = 'Empty ' + fmtWT(pr.empty);
+    s.push(`<circle cx="${ex}" cy="${Y(0)}" r="5" fill="var(--panel)" stroke="var(--ink)" stroke-width="2"/><text x="${tx}" y="${Y(0) - 12}" text-anchor="middle" fill="var(--ink)" stroke="var(--panel)" stroke-width="4" paint-order="stroke">${emptyTxt}</text>`);
+  }
+  if (drain && !dr.length) s.push(`<text x="${L + pw / 2}" y="${(T + H - B) / 2}" text-anchor="middle" fill="var(--muted)">not enough history in this range</text>`);
+  s.push(`<line class="cx" y1="${T}" y2="${H - B}" stroke="var(--ink2)" visibility="hidden"/><circle class="cd" r="5" fill="var(--acc)" stroke="var(--panel)" stroke-width="2" visibility="hidden"/><rect class="hit" x="${L}" y="0" width="${pw}" height="${H}" fill="transparent"/>`);
+  const cand = drain ? dr.map(q => [q[0], q[1], 'd']) : hist.map(q => [q[0], q[1], q[2] ? 'b' : 'r']).concat(pr ? pr.pts.map(q => [q[0], q[1], 'p']) : []);
+  charts[p.id] = { W, H, L, R, x0, x1, X, Y, cand };
+  const label = drain ? `${lim.label} usage rate over the last ${wk} hours` : `${lim.label}: ${Math.round(sh(lim.now, lim))}% left now across ${seatsTxt(lim)}` + (emptyTxt ? ', projected ' + emptyTxt.toLowerCase() : '');
+  const notes = [];
+  if (!drain) {
+    notes.push('Solid: recorded');
+    if (anyB) notes.push('dotted: rebuilt from the rotation log');
+    if (pr) notes.push('dashed: projected at ' + (mult === 0 ? 'no further usage' : rf.proj + ' ×' + ui.mult));
+  } else notes.push('Usage rate over ' + wk + 'h, evaluated hourly');
+  const young = !drain && hist.length < 2 ? `<p class="note">History starts ${lim.hist.length ? esc(fmtDT(lim.hist[0][0])) : 'now'}; the line fills in as readings arrive every 5 minutes.</p>` : '';
+  return `<div class="chart" data-p="${esc(p.id)}"><svg class="c" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}"><defs><linearGradient id="g-${esc(p.id)}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--acc)" stop-opacity=".32"/><stop offset="1" stop-color="var(--acc)" stop-opacity=".02"/></linearGradient></defs>${s.join('')}</svg><div class="tip"></div></div><p class="note">${notes.join(' · ')}</p>${young}`;
+}
+
+// A reading over 3 h old is a muted warning (Codex readings go stale between codex-usage runs); over 24 h the stronger one.
+const readAge = a => { const s = a.readAt ? D.now - a.readAt : 0; return s > 10800 ? ' class="w" title="Reading is over 3 hours old"' : s > 3600 ? ' class="w3" title="Reading is over an hour old"' : ''; };
+// A reset time more than 6 days away would read like the weekday just gone ("Thu" on a Friday): give it its date.
+const fmtRS = t => t - D.now > 6 * 86400 ? fmtDT(t) : fmtWT(t);
+const bkTitle = a => { const t = [a.bankedAt ? 'Read ' + ago(a.bankedAt) : '', a.bankedNote || ''].filter(Boolean).join(' · '); return t ? ` title="${esc(t)}"` : ''; };
+// Codex: one Apply reset per seat with a credit. Claude: one button per kind the server says is usable now (it picks the grant again on the click).
+const resetBtn = (p, a) => !D.app || !p.canReset || D.pcacheError ? '' : p.id === 'claude'
+  ? (a.resets || []).filter(r => QUOTA_RESET_KINDS[r.kind]).map(r => `<button class="rs" data-a="reset" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">${r.pending ? 'Resend pending' : 'Apply'} ${esc(QUOTA_RESET_KINDS[r.kind].noun)}</button>` +
+      (r.pending ? `<button class="rs" data-a="rsclear" data-p="claude" data-v="${esc(a.label)}" data-k="${esc(r.kind)}">Clear</button>` : '')).join('')
+  : a.resetPending ? `<small class="muted">Last reset unconfirmed</small><button class="rs" data-a="rsclear" data-v="${esc(a.label)}">Clear</button>`
+  : a.banked >= 1 ? `<button class="rs" data-a="reset" data-p="${esc(p.id)}" data-v="${esc(a.label)}">Apply reset</button>` : '';
+
+function accounts(p) {
+  const wl = {}, ids = [];
+  for (const a of p.accounts) for (const w of a.windows) if (!wl[w.id]) { wl[w.id] = w.label; ids.push(w.id); }
+  ids.sort((a, b) => 'swfm'.indexOf(a) - 'swfm'.indexOf(b));
+  const anyNote = p.limits.length && p.accounts.some(a => a.note), anyBank = quotaBankedTotal(p) != null || p.accounts.some(a => (a.resets || []).length || a.resetPending || a.bankedNote), anySw = D.app && p.accounts.some(a => (a.switch || []).length);
+  const rows = p.accounts.map(a => {
+    const cells = ids.map(id => {
+      const w = a.windows.find(x => x.id === id);
+      if (!w) return '<td>–</td>';
+      const lv = quotaLevel(p.id, w), pct = w.used == null ? null : Math.round(w.used * 100);
+      return `<td class="lv-${lv || 'na'}"${lv ? ` title="${{ ok: 'Allowed', warn: 'Close to the limit', bad: 'Capped' }[lv]}"` : ''}>${pct == null ? '–' : `<span class="pv">${pct}%${lv === 'bad' ? ' · capped' : ''}</span><span class="bar" aria-hidden="true"><i style="width:${Math.min(pct, 100)}%"></i></span>`}${w.assumed ? '<small>assumed after reset</small>' : ''}${w.reset ? `<small>resets ${esc(fmtRS(w.reset))}</small>` : ''}</td>`;
+    }).join('');
+    return `<tr><td>${nm(a)}</td>${cells}${anyBank ? `<td class="bk"${bkTitle(a)}>${quotaBankedCell(a, D.now, fmtDT, esc)}${resetBtn(p, a)}</td>` : ''}<td${readAge(a)}>${a.readAt ? 'Read ' + esc(ago(a.readAt)) : '–'}</td>${anySw ? `<td>${quotaSwitchBtns(p, a, swBusy(), esc)}</td>` : ''}${anyNote ? `<td class="nt">${esc(a.note)}</td>` : ''}</tr>`;
+  }).join('');
+  return `<details data-p="${esc(p.id)}"${closed[p.id] ? '' : ' open'}><summary>Accounts</summary><div class="wrap"><table><thead><tr><th>Account</th>${ids.map(id => `<th>${esc(wl[id])}</th>`).join('')}${anyBank ? '<th>Banked resets</th>' : ''}<th>Read</th>${anySw ? '<th>Switch</th>' : ''}${anyNote ? '<th>Note</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div></details>`;
+}
+
+function panel(p, W) {
+  const lim = p.limits.find(l => l.id === ui.lim[p.id]) || p.limits[0], bk = quotaBankedTotal(p);
+  let h = `<section class="panel" style="--acc:var(--c-${esc(p.id)})"><div class="ph"><div class="nm"><span class="dot"></span><b>${esc(p.name)}</b><span class="muted">${p.total} account${p.total === 1 ? '' : 's'}</span>${quotaInUse(p, esc) ? `<span class="inuse">${quotaInUse(p, esc)}</span>` : ''}${D.app ? quotaBestBtn(p, swBusy(), esc) : ''}</div>`;
+  h += `<div class="chips">${p.limits.map(l => `<button data-a="lim" data-p="${esc(p.id)}" data-v="${esc(l.id)}" aria-pressed="${l === lim}">${esc(l.label)}<em>${Math.round(sh(l.now, l))}%</em></button>`).join('')}${bk != null ? `<span class="chip">${bk} banked reset${bk === 1 ? '' : 's'}</span>` : ''}</div></div>`;
+  if (p.note) h += `<p class="note">${esc(p.note)}</p>`;
+  if (lim) {
+    const rf = rateFor(lim);
+    h += `<div class="hd"><div><span class="big">${Math.round(sh(lim.now, lim))}%</span><span class="of">left across ${seatsTxt(lim)}</span></div><div class="stat"><span class="muted">Usage rate</span><b>${rf.avg == null ? 'not enough history yet' : fr(sh(rf.avg, lim)) + '%/h'}</b><span class="muted why">${esc(rf.why)}</span></div></div>`;
+    h += chart(p, lim, W);
+  } else {        // no pooled chart; the accounts table below still carries the readings and the reset/switch buttons
+    const ps = (quotaNoPool(p) ? [`<p>${esc(quotaNoPool(p))}</p>`] : []).concat(p.accounts.filter(a => a.note).map(a => `<p>${p.accounts.length > 1 ? nm(a) + ': ' : ''}${esc(a.note)}</p>`));
+    h += `<div class="empty">${ps.length ? ps.join('') : '<p>No usage data yet.</p>'}</div>`;
+  }
+  return h + accounts(p) + '</section>';
+}
+
+function render() {
+  charts = {};
+  applyTheme();
+  const ps = D.providers || [];
+  if (ui.tab !== 'all' && !ps.some(p => p.id === ui.tab)) ui.tab = 'all';
+  const tot = ps.reduce((a, p) => a + p.total, 0), ld = ps.reduce((a, p) => a + p.loaded, 0);
+  const app = $('app'), narrow = innerWidth < 600;
+  const W = Math.max(280, Math.min(1100, app.clientWidth || 1068) - 32 - (narrow ? 28 : 40));
+  const d0 = new Date((D.now - 7 * 86400 + off) * 1000); d0.setHours(0, 0, 0, 0);
+  const d1 = new Date(d0); d1.setDate(d1.getDate() + 14);
+  const themeIco = { system: 'auto', light: 'sun', dark: 'moon' }[ui.theme];
+  const nextTheme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme];
+  const seg = (a, items, cur, dis) => items.map(([v, l]) => `<button data-a="${a}" data-v="${v}" aria-pressed="${v === cur}"${v === dis ? ' disabled title="Typical is a projection input; it has no line over time"' : ''}>${l}</button>`).join('');
+  const show = ps.filter(p => ui.tab === 'all' || p.id === ui.tab);
+  app.innerHTML =
+    `<div class="top"><button data-a="reload" aria-label="Reload data" title="Reload data (updated ${esc(fmtDT(D.now))})">${ico('reload')}</button>` +
+    `<button data-a="theme" aria-label="Theme: ${ui.theme}, switch to ${nextTheme}" title="Theme: ${ui.theme}">${ico(themeIco)}</button></div>` +
+    `<div class="row t"><h1>Agent Dashboard</h1><span class="sub">${tot} credential${tot === 1 ? '' : 's'} · ${ld} loaded</span><div class="btns grow">` +
+    `<button data-a="emails">${ico('eye')}${ui.emails ? 'Hide emails' : 'Show emails'}</button>` +
+    (D.app ? `<button class="primary" data-a="refresh"${busy ? ' disabled' : ''}>${ico('reload')}${busy ? 'Refreshing…' : 'Refresh'}</button>` : '') +
+    `</div></div>` + (D.drift ? driftRow(D.drift) : '') +
+    `<div class="msg" role="status">${esc(msg)}</div>` +
+    `<div class="row tabs" role="group" aria-label="Provider"><button data-a="tab" data-v="all" aria-pressed="${ui.tab === 'all'}">${ico('grid')}All <span class="n">${tot}</span></button>` +
+    ps.map(p => `<button data-a="tab" data-v="${esc(p.id)}" aria-pressed="${ui.tab === p.id}" style="--acc:var(--c-${esc(p.id)})"><span class="dot"></span>${esc(p.name)} <span class="n">${p.total}</span></button>`).join('') + `</div>` +
+    `<div class="row"><div class="seg" role="group" aria-label="View">${seg('view', [['rem', 'Remaining'], ['drain', 'Usage rate']], ui.view)}</div>` +
+    `<div class="seg" role="group" aria-label="Rate over"><span class="lbl" style="padding:6px 10px">Rate over</span>${seg('win', [['typ', 'Typical'], ['1', '1h'], ['3', '3h'], ['6', '6h'], ['24', '24h']], winKey(), ui.view === 'drain' ? 'typ' : '')}</div>` +
+    `<label class="lbl">Future usage <select data-a="mult">${MULTS.map(([v, l]) => `<option value="${v}"${v === ui.mult ? ' selected' : ''}>${l}</option>`).join('')}</select></label>` +
+    `<div class="range grow"><span class="muted">${esc(fmtD(d0 / 1000))} to ${esc(fmtD(d1 / 1000 - 43200))}</span><button class="i" data-a="shift" data-v="-7" aria-label="Earlier">${ico('left')}</button><button data-a="today">Today</button><button class="i" data-a="shift" data-v="7" aria-label="Later">${ico('right')}</button></div></div>` +
+    (show.length ? show.map(p => panel(p, W)).join('') : '<section class="panel"><p class="muted">No credentials found.</p></section>');
+  pcacheShow(document.getElementById('pcerr'), D.pcacheError);
+  for (const el of app.querySelectorAll('.chart')) hover(el);
+}
+
+function hover(el) {
+  const c = charts[el.dataset.p]; if (!c) return;
+  const svg = el.querySelector('svg'), tip = el.querySelector('.tip'), cx = svg.querySelector('.cx'), cd = svg.querySelector('.cd'), hit = svg.querySelector('.hit');
+  const hide = () => { tip.style.display = 'none'; cx.setAttribute('visibility', 'hidden'); cd.setAttribute('visibility', 'hidden'); };
+  const move = e => {
+    if (!c.cand.length) return;
+    const r = svg.getBoundingClientRect(), k = r.width / c.W;
+    const t = c.x0 + ((e.clientX - r.left) / k - c.L) / (c.W - c.L - c.R) * (c.x1 - c.x0);
+    let q = c.cand[0]; for (const z of c.cand) if (Math.abs(z[0] - t) < Math.abs(q[0] - t)) q = z;
+    const px = c.X(q[0]), py = c.Y(q[1]);
+    cx.setAttribute('x1', px); cx.setAttribute('x2', px); cd.setAttribute('cx', px); cd.setAttribute('cy', py);
+    cx.setAttribute('visibility', 'visible'); cd.setAttribute('visibility', 'visible');
+    const val = q[2] === 'd' ? fr(q[1]) + '%/h' : Math.round(q[1]) + '% left' + (q[2] === 'p' ? ' (projected)' : q[2] === 'b' ? ' (rebuilt)' : '');
+    tip.textContent = fmtDT(q[0]) + ' · ' + val;
+    tip.style.display = 'block'; tip.style.top = (py * k) + 'px';
+    tip.style.left = Math.min(Math.max(px * k, tip.offsetWidth / 2 + 2), r.width - tip.offsetWidth / 2 - 2) + 'px';
+  };
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
+  hit.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') hide(); });
+}
+
+async function loadData() {
+  if (!D.app) { location.reload(); return; }
+  try {
+    const r = await fetch('/api/data', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    D = await r.json(); msg = '';
+  } catch (e) { msg = 'Could not reload data.'; }
+  render();
+}
+
+async function refreshAll() {
+  busy = true; msg = ''; render();
+  try {
+    const r = await fetch('/api/refresh', { method: 'POST', headers: { 'X-Quota-App': '1' } });
+    if (r.status === 409) msg = 'A refresh is already running.';
+    else if (!r.ok) msg = 'Refresh failed (' + r.status + ').';
+    else { D = await r.json(); if (D.refreshNote) msg = D.refreshNote; }      // 202: Codex is still updating
+  } catch (e) { msg = 'Refresh failed: could not reach the app.'; }
+  busy = false; render();
+}
+
+let rs = null;   // the reset dialog's seat: {pid, label, kind (Claude only), busy}
+function openReset(pid, label, kind) {
+  const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label);
+  if (!a || rs || D.pcacheError) return;
+  const win = id => a.windows.find(x => x.id === id), w = win('w'), s = win('s');
+  const used = x => x ? Math.round(x.used * 100) + '%' : '–';
+  const k = pid === 'claude' ? QUOTA_RESET_KINDS[kind] : null, r = k && (a.resets || []).find(x => x.kind === kind);
+  if (pid === 'claude' && !r) return;      // a listed credit, or a pending claim of that kind (r.pending: resent as it was, never a new credit)
+  const resend = !!(r && r.pending);
+  const rw = k ? win(k.win) || w : w;      // the window this reset refills (Fable falls back to the weekly when the seat has no Fable reading)
+  const soon = rw && rw.id !== 's' && rw.reset && rw.reset - D.now <= 86400;
+  const exp = t => esc(fmtDT(t)) + ' (in ' + quotaIn(t - D.now) + ')', cr = (a.bankedList || [])[0];
+  rs = { pid, label, kind, rid: resend ? r.rid : undefined, busy: false };
+  const d = $('rsdlg');
+  d.innerHTML = `<h2 id="rsT">${resend ? 'Resend the pending ' + esc(k.noun) + ' to' : 'Apply a ' + (k ? esc(k.noun) : 'banked reset') + ' to'} seat ${esc(label)}?</h2><dl>` +
+    `<dt>Seat</dt><dd>${esc(label)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd>` +
+    (k ? `<dt>Used now</dt><dd>${[s && '5 h ' + used(s), w && 'Weekly ' + used(w), win('f') && 'Fable ' + used(win('f'))].filter(Boolean).join(' · ') || '–'}</dd>` +
+         `<dt>Refills</dt><dd>${esc(k.refills)}</dd>`
+       : `<dt>Used now</dt><dd>Weekly ${used(w)}${s ? ' · 5 h ' + used(s) : ''}</dd>`) +
+    (rw && rw.reset ? `<dt>${esc(rw.label)} renews</dt><dd>${exp(rw.reset)}</dd>` : '') +
+    (k ? `<dt>Reset used</dt><dd>${esc(k.noun[0].toUpperCase() + k.noun.slice(1))}${r.endsAt ? ' · expires ' + exp(r.endsAt) : ' · no expiry given'}${r.left > 1 ? ` · 1 of ${r.left} banked` : ''}</dd></dl>`
+       : `<dt>Credit used</dt><dd>${cr ? esc(cr.title) + ' · expires ' + exp(cr.expiresAt) : 'One banked reset (its expiry was not supplied)'}</dd></dl>`) +
+    (resend ? `<p class="warn">This sends the earlier unconfirmed request again. It cannot use a second reset.</p>` : `<p class="warn">This uses up the reset and can't be undone.</p>`) +
+    (soon ? `<p class="warn">The ${esc(rw.label.replace('Weekly', 'weekly'))} limit renews on its own in ${Math.max(1, Math.round((rw.reset - D.now) / 3600))} h, so this would buy little.</p>` : '') +
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">${resend ? 'Resend' : 'Apply'} ${k ? esc(k.noun) : 'reset'}</button></div>`;
+  d.showModal();
+}
+// Clear an unconfirmed reset by hand: Codex only once codex-usage shows it was not used; Claude (a pending claim that never settles) only once the seat's
+// limit shows it was not used. Cancel is the default. A clear names the claim or mark it showed, so one replaced meanwhile is refused, not dropped.
+function openClear(label, pid, kind) {
+  if (rs || D.pcacheError) return;
+  const cl = pid === 'claude', k = cl && QUOTA_RESET_KINDS[kind];
+  if (cl && !k) return;
+  const p = (D.providers || []).find(x => x.id === (cl ? 'claude' : 'codex')), a = p && p.accounts.find(x => x.label === label), r = cl && a && (a.resets || []).find(x => x.kind === kind);
+  if (cl && !(r && r.pending && r.rid)) return;      // Clear names the claim the page showed (its request id): no pending claim in view, nothing to clear
+  if (!cl && !(a && a.resetPending)) return;         // likewise Codex: its mark's id ("" for a mark from before ids existed) is what the clear names
+  rs = { pid: cl ? 'claude' : 'codex', label, kind: cl ? kind : undefined, rid: cl ? r.rid : a.resetPendingId || '', clear: true, busy: false };
+  const d = $('rsdlg');
+  d.innerHTML = `<h2 id="rsT">Clear the ${cl ? 'pending ' + esc(k.noun) : 'unconfirmed reset'} on seat ${esc(label)}?</h2>` +
+    `<p class="warn">${cl ? 'Only clear this after the seat shows the reset was not used (its limit has not been refilled). Clearing lets you apply a reset on this seat again, and that starts a new request.'
+      : 'Only clear this after codex-usage shows the reset was not used. Clearing lets you apply a reset on this seat again.'}</p>` +
+    `<div class="dact"><button data-a="rscancel" autofocus>Cancel</button><button class="primary" data-a="rsgo">Clear</button></div>`;
+  d.showModal();
+}
+function toast(text, outcome) {
+  const t = $('toast'); t.textContent = text; t.dataset.outcome = outcome; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, 9000);
+}
+async function copyText(text) {
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+  if (!ok) {                          // no clipboard API (plain http off localhost): select the text in a throwaway field and use the old command
+    const t = document.createElement('textarea'); t.value = text; t.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(t); t.select();
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    t.remove();
+  }
+  toast(ok ? 'Copied — paste into rotator.local.json' : 'Could not copy. Type it into rotator.local.json: ' + text, ok ? 'ok' : 'error');
+}
+async function doReset() {
+  if (!rs || rs.busy) return;
+  rs.busy = true;
+  const d = $('rsdlg'), go = d.querySelector('[data-a="rsgo"]');
+  for (const b of d.querySelectorAll('button')) b.disabled = true;
+  go.textContent = rs.clear ? 'Clearing…' : 'Applying…';
+  let text = 'Reset failed: could not reach the app.', outcome = 'error';
+  try {
+    const cl = rs.pid === 'claude';      // Claude sends the kind only (the server picks the grant); a resend or a clear also names its claim
+    const r = await fetch(rs.clear ? (cl ? '/api/claude-reset-clear' : '/api/codex-reset-clear') : cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(cl ? Object.assign({ seat: rs.label, kind: rs.kind }, rs.clear ? { requestId: rs.rid } : rs.rid ? { resend: true, requestId: rs.rid } : {}) : Object.assign({ seat: rs.label }, rs.clear ? { requestId: rs.rid } : {})) });     // a resend names its claim; a clear names the claim or mark it showed
+    const j = await r.json().catch(() => ({}));
+    text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
+  } catch (e) {}
+  rs = null; d.close();
+  toast(text, outcome); loadData();
+}
+
+// The rotator actions. The Claude CLI ones run on the click; the others ask first (they close an app). The server runs the rotator and answers with its
+// exit code and last line; the data is reloaded so the badges move.
+function usedNow(a) {
+  const u = id => { const w = a.windows.find(x => x.id === id); return w && w.used != null ? Math.round(w.used * 100) + '%' : null; };
+  return [['s', '5 h'], ['w', 'Weekly'], ['f', 'Fable']].map(([id, l]) => u(id) && l + ' ' + u(id)).filter(Boolean).join(' · ') || '–';
+}
+function openSwitch(pid, role, seat) {
+  if (swBusy() || (sw && $('swdlg').open)) return;          // a non-busy leftover from a closed dialog does not block (its close event may still be queued)
+  const p = (D.providers || []).find(x => x.id === pid), a = p && seat && p.accounts.find(x => x.label === seat);
+  if (!p || (seat && !a)) return;
+  sw = { pid, role, seat, busy: false };
+  if (!quotaSwitchAsks(pid, role)) return doSwitch();
+  const seatRow = a ? `<dt>Seat</dt><dd>${esc(seat)}${ui.emails && a.email ? ' · ' + esc(a.email) : ''}</dd><dt>Used now</dt><dd>${esc(usedNow(a))}</dd>` : '';
+  const now = p.inUse && p.inUse.app;
+  const [title, warn, go] = pid === 'claude'
+    ? [`Switch the Claude app to seat ${esc(seat)}?`, 'Quitting the Claude app ends the sessions running in it.', 'Quit and switch']
+    : [role === 'best' ? 'Switch Codex (CLI and app) to the next seat?' : `Switch Codex (CLI and app) to seat ${esc(seat)}?`, 'The Codex app will close and reopen.', 'Switch Codex'];
+  const d = $('swdlg');
+  d.innerHTML = `<h2 id="swT">${title}</h2><dl>${seatRow}${role === 'best' && now ? `<dt>Now on</dt><dd>${esc(now)}</dd>` : ''}</dl>` +
+    `<p class="warn">${esc(warn)}</p><div class="dact"><button data-a="swcancel" autofocus>Cancel</button><button class="primary" data-a="swgo">${esc(go)}</button></div>`;
+  d.showModal();
+}
+async function doSwitch() {
+  if (!sw || sw.busy) return;
+  sw.busy = true;
+  const d = $('swdlg'), go = d.open && d.querySelector('[data-a="swgo"]');
+  if (d.open) { for (const b of d.querySelectorAll('button')) b.disabled = true; go.textContent = 'Switching…'; }
+  render();
+  let text = 'Switch failed: could not reach the app.', outcome = 'error';
+  try {
+    const r = await fetch('/api/switch', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(sw.seat ? { provider: sw.pid, role: sw.role, seat: sw.seat } : { provider: sw.pid, role: sw.role }) });
+    const j = await r.json().catch(() => ({}));
+    text = j.text || 'Switch failed (' + r.status + ').'; outcome = j.outcome || 'error';
+  } catch (e) {}
+  sw = null;
+  if (d.open) d.close();
+  toast(text, outcome); loadData();
+}
+
+function act(a, v, el) {
+  if (a === 'sw') return openSwitch(el.dataset.p, el.dataset.r, v);
+  if (a === 'swcancel') { sw = null; return $('swdlg').close(); }
+  if (a === 'swgo') return doSwitch();
+  if (a === 'reset') return openReset(el.dataset.p, v, el.dataset.k);
+  if (a === 'rsclear') return openClear(v, el.dataset.p, el.dataset.k);
+  if (a === 'rscancel') return $('rsdlg').close();
+  if (a === 'rsgo') return doReset();
+  if (a === 'reload') return loadData();
+  if (a === 'copyw') return copyText(v);
+  if (a === 'refresh') return refreshAll();
+  if (a === 'theme') { ui.theme = { system: 'light', light: 'dark', dark: 'system' }[ui.theme]; store.set('theme', ui.theme); }
+  else if (a === 'emails') { ui.emails = !ui.emails; store.set('emails', ui.emails ? '1' : '0'); }
+  else if (a === 'tab') { ui.tab = v; store.set('tab', v); }
+  else if (a === 'view') { ui.view = v; store.set('view', v); }
+  else if (a === 'win') { ui.win = v; store.set('win', v); }
+  else if (a === 'mult') { ui.mult = v; store.set('mult', v); }
+  else if (a === 'lim') { ui.lim[el.dataset.p] = v; store.set('lim', JSON.stringify(ui.lim)); }
+  else if (a === 'shift') off += parseInt(v, 10) * 86400;
+  else if (a === 'today') off = 0;
+  else return;
+  render();
+}
+
+document.addEventListener('click', e => { const b = e.target.closest('button[data-a]'); if (b) act(b.dataset.a, b.dataset.v, b); });
+$('rsdlg').addEventListener('cancel', e => { if (rs && rs.busy) e.preventDefault(); });          // Esc must not hide a reset that is in flight
+$('rsdlg').addEventListener('close', () => { if (rs && !rs.busy) rs = null; });
+$('rsdlg').addEventListener('click', e => { if (e.target === e.currentTarget && rs && !rs.busy) e.currentTarget.close(); });     // a click on the backdrop
+$('swdlg').addEventListener('cancel', e => { if (sw && sw.busy) e.preventDefault(); });          // Esc must not hide a switch that is running
+$('swdlg').addEventListener('close', e => { if (sw && !sw.busy && !e.currentTarget.open) sw = null; });
+$('swdlg').addEventListener('click', e => { if (e.target === e.currentTarget && sw && !sw.busy) e.currentTarget.close(); });
+document.addEventListener('change', e => { if (e.target.dataset && e.target.dataset.a === 'mult') act('mult', e.target.value, e.target); });
+document.addEventListener('toggle', e => { const d = e.target; if (d.tagName === 'DETAILS' && d.dataset.p) closed[d.dataset.p] = !d.open; }, true);
+let rt, lastW = innerWidth;
+addEventListener('resize', () => { if (innerWidth === lastW) return; lastW = innerWidth; clearTimeout(rt); rt = setTimeout(render, 120); });
+
+if (D.app) {
+  const m = document.querySelector('meta[http-equiv="refresh"]'); if (m) m.remove();
+  setInterval(() => { if (!busy) loadData(); }, 60000);
+}
+render();
+</script>
+</body>
+</html>

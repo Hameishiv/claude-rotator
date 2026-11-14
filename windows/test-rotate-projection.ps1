@@ -1,7 +1,7 @@
 <#
 test-rotate-projection.ps1 — self-check for the two 2026-09-22 rotator fixes.
 
-  pwsh -NoProfile -File C:\Dev\Rotators\test-rotate-projection.ps1
+  pwsh -NoProfile -File test-rotate-projection.ps1      (from the rotator folder)
 
 Covers the logic that actually decides a rotation, not the network calls:
   1. the session-window projection (rotate BEFORE the wall at a real burn rate),
@@ -254,6 +254,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript @(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 })
   Check 'over budget among 512+ pre-park lines (no parse reached) => answered' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   Check 'same 512+ pre-park lines within budget => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # The CPU arm of the every-512-lines check, alone: the wall clock is far away and no line reaches a parse.
+  Check 'CPU budget spent among 512+ pre-park lines (wall clock far off) => answered' (Test-ParkedLockAnswered -LockPath $lk -BudgetSec 0 -WallSec 1e9)
+  # A CPU time that cannot be read leaves only the wall clock; the scan must still find a post-park answer.
+  WriteTranscript (@(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 }) + @((UserLine 'go with B' 30 $ts0)))
+  Check 'CPU probe throws => scan still finds the post-park answer' (Test-ParkedLockAnswered -LockPath $lk -CpuProbe { throw 'no cpu time' })
+  WriteTranscript @(1..520 | ForEach-Object { UserLine 'x' -60 $ts0 })
+  Check 'CPU probe throws, nothing after the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk -CpuProbe { throw 'no cpu time' }))
   WriteTranscript $noise
   Check 'transcript scan over its wall-clock backstop => answered (fail-open, pinged)' (Test-ParkedLockAnswered -LockPath $lk -WallSec 0)
   WriteTranscript ($noise + @((UserLine @(@{ type = 'text'; text = 'go with B' }) 4000 $ts0)))
@@ -322,6 +329,18 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'rotator ping behind a system-reminder => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":"/usage","origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}'))
   Check 'bare /usage typed mid-turn (queued) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  # Housekeeping commands queued mid-turn use the same exclusion list as the typed ones; a real queued message still answers.
+  function QueuedHuman([string]$prompt) { WriteTranscript ($noise + @('{"type":"attachment","attachment":{"type":"queued_command","prompt":' + (ConvertTo-Json $prompt -Compress) + ',"origin":{"kind":"human"},"timestamp":"' + (Stamp 4000 $ts0) + '"},"timestamp":"' + (Stamp 4000 $ts0) + '"}')) }
+  foreach ($q in '/seats', '/seats 3', '/compact', '/ck-board', '/cache-keeper:keepwarm') {
+    QueuedHuman $q
+    Check "queued '$q' after the park => still parked" (-not (Test-ParkedLockAnswered -LockPath $lk))
+  }
+  QueuedHuman '/usage now'
+  Check "queued '/usage now' (a status command with arguments) => answered" (Test-ParkedLockAnswered -LockPath $lk)
+  QueuedHuman '/merge-pr 90 resume'
+  Check "queued '/merge-pr 90 resume' => answered" (Test-ParkedLockAnswered -LockPath $lk)
+  QueuedHuman 'go with B'
+  Check 'queued plain-text owner message after the park => answered' (Test-ParkedLockAnswered -LockPath $lk)
   # Read BEFORE the park (no post-park line precedes it), e.g. "park it, I'll decide tonight": not an answer.
   WriteTranscript (@('{"type":"attachment","attachment":{"type":"queued_command","prompt":"park it, I will decide tonight","origin":{"kind":"human"},"timestamp":"' + (Stamp -30 $ts0) + '"},"timestamp":"' + (Stamp -30 $ts0) + '"}') + $noise)
   Check 'owner text queued and read before the park => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
@@ -367,6 +386,13 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'two line-start rulings, this PR second => answered' (Test-ParkedLockAnswered -LockPath $lk)
   WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } }), (UserLine 'go with B' 4000 $ts0 @{ origin = @{ kind = 'human' } })))
   Check 'an oversized ruling number for another PR is not this one, and the scan carries on => answered' (Test-ParkedLockAnswered -LockPath $lk)
+  # Twins without the later human line: the oversized number alone must not answer this PR. The first is
+  # the same peer line as above; the second carries the ruling at a line start (origin.body, as a relay
+  # does), which is the form the formal-ruling match reads.
+  WriteTranscript ($noise + @((UserLine 'Another Claude session sent a message: Owner ruling for #99999999999999999999: x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer' } })))
+  Check 'an oversized ruling number for another PR, no later human line => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
+  WriteTranscript ($noise + @((UserLine 'x' 3990 $ts0 @{ isMeta = $true; origin = @{ kind = 'peer'; body = 'Owner ruling for #99999999999999999999: x' } })))
+  Check 'an oversized ruling number at a line start, no later human line => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached.' 4000 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser = $true } })))
   Check 'CLI usage-reset continuation resubmitted by cache-keeper => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   WriteTranscript ($noise + @((UserLine @(@{ type = 'tool_result'; tool_use_id = 'q'; content = 'The user answered: "Ship it?"="Usage reset: the 5-hour limit capped this window"' }) 4000 $ts0)))
@@ -390,7 +416,7 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   WriteTranscript ($noise + @((UserLine "<command-message>usage</command-message>`n<command-name>/usage</command-name>`n<command-args></command-args>" 4000 $ts0)))
   Check 'a slash command he typed to check quota (CLI: no origin) => still parked' (-not (Test-ParkedLockAnswered -LockPath $lk))
   # The desktop app stamps cache-keeper's immediate commands human (seen: /keepwarm while a question waited).
-  foreach ($c in 'keepwarm', 'board', 'cache-keeper:keepwarm') {
+  foreach ($c in 'keepwarm', 'board', 'cache-keeper:keepwarm', 'compact', 'seats') {
     WriteTranscript ($noise + @((UserLine "<command-message>$c</command-message>`n<command-name>/$c</command-name>`n<command-args></command-args>" 4000 $ts0 @{ origin = @{ kind = 'human' } })))
     Check "cache-keeper housekeeping command /$c stamped human => still parked" (-not (Test-ParkedLockAnswered -LockPath $lk))
   }
@@ -668,10 +694,44 @@ stuff' 1787 $ts0 @{ origin = @{ kind = 'plugin'; name = 'cache-keeper'; asUser =
   Check 'hung launcher => pinged, within the timeout cap' ((-not $r) -and $sw.Elapsed.TotalSeconds -lt 8) "took $([int]$sw.Elapsed.TotalSeconds)s"
 } finally { Remove-Item -LiteralPath $sd -Recurse -Force -ErrorAction SilentlyContinue }
 
+# 10f. production calls Test-MergePrParked with no -TimeoutSec (claude-resume-sessions.ps1), so the default is the production cap.
+Check 'Test-MergePrParked default -TimeoutSec is 30 s (10 s raced the launcher and failed open)' `
+  ((Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'MergePrParked.ps1') -Raw) -match '\[int\]\$TimeoutSec = 30,') 'the launcher call needs headroom under load'
+
 # 11. the summary counts skipped separately from pinged/failed (wiring present in both scripts).
 $resSrc = Get-Content (Join-Path (Split-Path -Parent $PSCommandPath) 'claude-resume-sessions.ps1') -Raw
 Check 'resume script emits the line Ping-ActiveSessions counts' ($resSrc -match 'Skipped parked review \$\(\$mp\.Repo\)#') 'wording drifted between the two scripts'
 Check 'Ping-ActiveSessions counts skipped separately' (($src -match 'Skipped parked review') -and ($src -match 'skipped \$\(\$skipLines\.Count\) parked')) 'summary does not report skipped'
+# 11b. on Linux the resume script stops after discovery, before any Windows-only delivery. A source check: $IsLinux
+#      is a constant, so this Windows suite cannot run the Linux branch itself.
+$lx = $resSrc.IndexOf('if ($IsLinux -or $IsMacOS) { Write-Host "`nsession resume is not supported on Linux yet; sessions left as they are')
+Check 'resume script stops before delivery on Linux' (($lx -gt $resSrc.IndexOf('if ($DryRun)')) -and ($lx -lt $resSrc.IndexOf('if (-not $OwnWindowOnly) {')) -and ($lx -lt $resSrc.IndexOf("Join-Path `$here 'Inject-ConsoleInput.ps1'"))) "guard at $lx"
+
+# 12. the access-refusal fallback (usage unknown) goes through Select-RotationTarget and keeps its exclusions,
+#     the cached Fable rejection included. The real function, loaded from the script, over stub readers.
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Select-RotationTarget' }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+$script:fbRows = @(); $script:fbFable = @{}; $script:fbDisabled = @(); $script:fbApp = $null; $script:fbFableCalls = @()
+function Rank-Accounts { param($r, $f) $script:fbRows }
+function Get-AppSeatLabel { $script:fbApp }
+function Read-AccessDisabled { param($l) if ($script:fbDisabled -contains $l) { 'marked' } }
+function Get-UsageCached { param($Label, $Refresh, $Model, $CacheSuffix, $CacheOnly)
+  $script:fbFableCalls += , @($Label, $Refresh, $CacheOnly)
+  if ($script:fbFable.ContainsKey($Label)) { [pscustomobject]@{ ok = $true; oi7_stat = $script:fbFable[$Label] } } else { [pscustomobject]@{ ok = $false } } }
+function Row([string]$l, [string]$acc = 'unknown') { [pscustomobject]@{ label = $l; usable = $false; access = $acc } }
+$script:fbRows = @((Row 'A'), (Row 'B'), (Row 'C'), (Row 'D'), (Row 'E' 'ok'))
+$script:fbApp = 'B'; $script:fbDisabled = @('C'); $script:fbFable = @{ D = 'rejected' }
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback skips the active, app, disabled and Fable-rejected seats' ($null -eq $w) "picked '$($w.label)'"
+$script:fbFable = @{ D = 'allowed' }; $script:fbFableCalls = @()
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback picks an unknown-usage seat whose Fable cache is not rejected' (($w.label -eq 'D') -and $w.usageUnknown -and $w.s5 -eq 0) "picked '$($w.label)'"
+Check 'fallback reads Fable from the cache only (no probe on a failed network)' (($script:fbFableCalls.Count -eq 1) -and -not $script:fbFableCalls[0][1] -and $script:fbFableCalls[0][2]) "calls: $($script:fbFableCalls | ForEach-Object { $_ -join '/' })"
+$script:fbRows = @((Row 'F'), (Row 'D')); $script:fbFable = @{ D = 'rejected' }
+$w = Select-RotationTarget 85 -UnknownExcept 'A'
+Check 'fallback passes over a Fable-rejected seat to the next one' ($w.label -eq 'F') "picked '$($w.label)'"
+Check 'Invoke-CheckRotate routes the fallback through Select-RotationTarget' ($src -match 'Select-RotationTarget \$sessBar -UnknownExcept \$act') 'the fallback picks a seat itself again'
 
 Write-Host ""
 if ($fail) { Write-Host "$fail check(s) FAILED" -ForegroundColor Red; exit 1 }
