@@ -244,10 +244,13 @@ assert.strictEqual(quotaShare(600, 600), 100);
   const clrSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
   const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
   const fns = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', clrSrc + '\nreturn { openClear, st: () => rs };')(
-    { now: 1 }, () => dlg, s => String(s), {}, String, String, QUOTA_RESET_KINDS);
+    { now: 1, providers: [{ id: 'codex', accounts: [{ label: 'B', resetPending: true, resetPendingId: 'm-1' }, { label: 'C' }, { label: 'L', resetPending: true, resetPendingId: '' }] }] }, () => dlg, s => String(s), {}, String, String, QUOTA_RESET_KINDS);
+  fns.openClear('C');                                                           // a Codex seat with no unconfirmed mark in view: nothing to clear, nothing opens
+  assert.ok(dlg.opened === 0 && fns.st() === null);
   fns.openClear('B');
   assert.ok(dlg.opened === 1 && dlg.innerHTML.includes('Only clear this after codex-usage shows the reset was not used. Clearing lets you apply a reset on this seat again.')
     && /<button data-a="rscancel" autofocus>Cancel<\/button><button class="primary" data-a="rsgo">Clear<\/button>/.test(dlg.innerHTML) && fns.st().clear === true, dlg.innerHTML);
+  assert.strictEqual(fns.st().rid, 'm-1');                                      // the Codex Clear names the mark the page showed
   assert.ok(/rs\.clear \? \(cl \? '\/api\/claude-reset-clear' : '\/api\/codex-reset-clear'\)/.test(tpl) && /a === 'rsclear'\) return openClear\(v, el\.dataset\.p, el\.dataset\.k\)/.test(tpl));
 }
 // a Claude seat+kind with a pending (unsettled) claim is offered as a resend, even with no credit of that kind listed, and its dialog says so
@@ -264,7 +267,8 @@ assert.strictEqual(quotaShare(600, 600), 100);
   assert.ok(!resetBtn(cl, { label: 'A', resets: [{ kind: 'full', left: 1, endsAt: null }] }).includes('rsclear'));
   const dlgSrc = tpl.slice(tpl.indexOf('let rs = null;'), tpl.indexOf('\nfunction toast('));
   const dlg = { innerHTML: '', opened: 0, showModal() { this.opened++; } };
-  const D = { now: 1000, providers: [{ id: 'claude', accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true }] }] }] };
+  const D = { now: 1000, providers: [{ id: 'claude', accounts: [{ label: 'A', windows: [], resets: [{ kind: 'full', pending: true }] }] },
+    { id: 'codex', accounts: [{ label: 'A', windows: [], resetPending: true, resetPendingId: 'cx-9' }, { label: 'L', windows: [], resetPending: true }] }] };
   const openReset = new Function('D', '$', 'esc', 'ui', 'fmtDT', 'quotaIn', 'QUOTA_RESET_KINDS', dlgSrc + '\nreturn openReset;')(
     D, () => dlg, s => String(s), { emails: false }, String, String, QUOTA_RESET_KINDS);
   openReset('claude', 'A', 'full');
@@ -287,6 +291,13 @@ assert.strictEqual(quotaShare(600, 600), 100);
     await pair.doReset();
     assert.deepStrictEqual(sent[2], ['/api/claude-reset-clear', { seat: 'A', kind: 'full', requestId: 'r-1' }]);
     assert.strictEqual(sent.length, 3);
+    // the Codex Clear names the unconfirmed mark the page showed too (a mark from before ids existed sends the empty id), so a mark replaced meanwhile is refused, not dropped
+    pair.openClear('A', 'codex');
+    await pair.doReset();
+    pair.openClear('L', 'codex');
+    await pair.doReset();
+    assert.deepStrictEqual(sent.slice(3), [['/api/codex-reset-clear', { seat: 'A', requestId: 'cx-9' }], ['/api/codex-reset-clear', { seat: 'L', requestId: '' }]]);
+    sent.length = 3;
     const opened = dlg2.opened;
     pair.openClear('A', 'claude', 'nonsense');                                    // an unknown kind opens nothing
     pair.openClear('A', 'claude', 'fable');                                       // a kind with no pending claim in view opens nothing: there is no claim to name

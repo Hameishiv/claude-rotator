@@ -185,6 +185,30 @@ Check 'fresh install: the heartbeat seat is written to .active' ((Test-Path (Joi
 Check 'fresh install: the app seat resolves to C' ((Get-AppSeatLabel) -eq 'C') (Get-AppSeatLabel)
 Clear-AppIdentity
 
+# --- the configured heartbeat repo wins over a cached .laptop-sync.json that names another repo: its issue number and logged-once flags do not carry over ---
+$localCfg = try { Get-Content (Join-Path $PSScriptRoot 'rotator.local.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+$hbWant = if ($localCfg -and $localCfg.heartbeatRepo) { [string]$localCfg.heartbeatRepo } else { 'your-org/claude-config-backup' }
+$syncConf = Join-Path $appRoot '.laptop-sync.json'
+$script:ghPaths = @()
+function timeout { <# MOCK-NO-NETWORK #> $global:LASTEXITCODE = 0; $script:ghPaths += "$($args[3])"; if ("$($args[3])" -like '*state=open*') { '7' } else { ConvertTo-Json -Compress @([DateTimeOffset]::UtcNow.ToString('o'), 'app-seat: D') } }
+if ((Get-Command timeout).CommandType -ne 'Function' -or (Get-Command timeout).Definition -notmatch 'MOCK-NO-NETWORK') { Write-Host 'ABORT: timeout is not the mock' -ForegroundColor Red; exit 2 }
+try {
+  New-Item -ItemType Directory -Path $appRoot -Force | Out-Null
+  ConvertTo-Json ([ordered]@{ repo = 'someone-else/other-repo'; issue = 99; staleMin = 15; lastSeen = 'B'; lastUpdated = '2020-01-01T00:00:00.0000000+00:00'; staleLogged = $true; unconfLogged = $true }) | Set-Content -LiteralPath $syncConf -Encoding UTF8
+  $env:CLAUDE_ROTATOR_SKIP_APP_SYNC = '0'; $script:AppSeatSynced = $false
+  Sync-AppSeatFromLaptop
+  $cache = Get-Content -LiteralPath $syncConf -Raw | ConvertFrom-Json
+  Check 'cached heartbeat repo differs: the configured repo is the one read' (($script:ghPaths.Count -gt 0) -and (@($script:ghPaths | Where-Object { $_ -notlike "repos/$hbWant/*" }).Count -eq 0)) ($script:ghPaths -join ' | ')
+  Check 'cached heartbeat repo differs: the other repo issue number is dropped and the issue is looked up again' (($script:ghPaths[0] -like '*state=open*') -and ($script:ghPaths -notcontains 'repos/someone-else/other-repo/issues/99') -and ([int]$cache.issue -eq 7)) ($script:ghPaths -join ' | ')
+  Check 'cached heartbeat repo differs: the cache now names the configured repo and the logged-once flags are reset' (($cache.repo -eq $hbWant) -and ($cache.staleLogged -eq $false) -and ($cache.unconfLogged -eq $false) -and ($cache.lastSeen -eq 'D')) ($cache | ConvertTo-Json -Compress)
+  # a cache that already names the configured repo is trusted as before: its issue number is used with no lookup
+  ConvertTo-Json ([ordered]@{ repo = $hbWant; issue = 55; staleMin = 15; lastSeen = ''; lastUpdated = ''; staleLogged = $false; unconfLogged = $false }) | Set-Content -LiteralPath $syncConf -Encoding UTF8
+  $script:ghPaths = @(); $script:AppSeatSynced = $false
+  Sync-AppSeatFromLaptop
+  Check 'cached heartbeat repo matches: its issue number is kept, with no issue lookup' (($script:ghPaths.Count -eq 1) -and ($script:ghPaths[0] -eq "repos/$hbWant/issues/55")) ($script:ghPaths -join ' | ')
+} finally { $env:CLAUDE_ROTATOR_SKIP_APP_SYNC = '1'; Remove-Item function:timeout }
+Clear-AppIdentity
+
 # --- the CLI version is read once per run, with a timeout, from the `claude` on PATH; unreadable -> the fallback ---
 $stubDir = Join-Path $root 'stub-claude'
 New-Item -ItemType Directory -Path $stubDir -Force | Out-Null

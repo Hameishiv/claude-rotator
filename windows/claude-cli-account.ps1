@@ -597,6 +597,7 @@ function Sync-AppSeatFromLaptop {
   $c = [ordered]@{ repo = $hbRepo; issue = 0; staleMin = 15; lastSeen = ''; lastUpdated = ''; staleLogged = $false; unconfLogged = $false }
   if (Test-Path $conf) { try { $j = Get-Content $conf -Raw | ConvertFrom-Json; foreach ($k in @($c.Keys)) { if ($null -ne $j.$k) { $c[$k] = $j.$k } } } catch {} }
   $save = { try { $c | ConvertTo-Json | Set-Content -LiteralPath $conf -Encoding UTF8 } catch {} }
+  if ([string]$c.repo -ne $hbRepo) { $c.repo = $hbRepo; $c.issue = 0; $c.unconfLogged = $false; $c.staleLogged = $false; $c.lastSeen = ''; $c.lastUpdated = ''; & $save }   # the configured heartbeat repo always wins over the cache: another repo's issue number and logged-once flags mean nothing here
   $known = if (Test-Path $act) { (Get-Content $act -Raw).Trim() } else { '' }
   $gh = { param([string]$path, [string]$jq) $o = & timeout 15 gh api $path --jq $jq 2>$null; if ($LASTEXITCODE -ne 0) { return $null }; $o }
   if (-not [int]$c.issue) {

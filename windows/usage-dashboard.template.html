@@ -428,14 +428,15 @@ function openReset(pid, label, kind) {
   d.showModal();
 }
 // Clear an unconfirmed reset by hand: Codex only once codex-usage shows it was not used; Claude (a pending claim that never settles) only once the seat's
-// limit shows it was not used. Cancel is the default. A Claude clear names the claim it showed, so a claim replaced meanwhile is refused, not dropped.
+// limit shows it was not used. Cancel is the default. A clear names the claim or mark it showed, so one replaced meanwhile is refused, not dropped.
 function openClear(label, pid, kind) {
   if (rs || D.pcacheError) return;
   const cl = pid === 'claude', k = cl && QUOTA_RESET_KINDS[kind];
   if (cl && !k) return;
-  const p = (D.providers || []).find(x => x.id === pid), a = p && p.accounts.find(x => x.label === label), r = cl && a && (a.resets || []).find(x => x.kind === kind);
+  const p = (D.providers || []).find(x => x.id === (cl ? 'claude' : 'codex')), a = p && p.accounts.find(x => x.label === label), r = cl && a && (a.resets || []).find(x => x.kind === kind);
   if (cl && !(r && r.pending && r.rid)) return;      // Clear names the claim the page showed (its request id): no pending claim in view, nothing to clear
-  rs = { pid: cl ? 'claude' : 'codex', label, kind: cl ? kind : undefined, rid: cl ? r.rid : undefined, clear: true, busy: false };
+  if (!cl && !(a && a.resetPending)) return;         // likewise Codex: its mark's id ("" for a mark from before ids existed) is what the clear names
+  rs = { pid: cl ? 'claude' : 'codex', label, kind: cl ? kind : undefined, rid: cl ? r.rid : a.resetPendingId || '', clear: true, busy: false };
   const d = $('rsdlg');
   d.innerHTML = `<h2 id="rsT">Clear the ${cl ? 'pending ' + esc(k.noun) : 'unconfirmed reset'} on seat ${esc(label)}?</h2>` +
     `<p class="warn">${cl ? 'Only clear this after the seat shows the reset was not used (its limit has not been refilled). Clearing lets you apply a reset on this seat again, and that starts a new request.'
@@ -468,7 +469,7 @@ async function doReset() {
   try {
     const cl = rs.pid === 'claude';      // Claude sends the kind only (the server picks the grant); a resend or a clear also names its claim
     const r = await fetch(rs.clear ? (cl ? '/api/claude-reset-clear' : '/api/codex-reset-clear') : cl ? '/api/claude-reset' : '/api/codex-reset', { method: 'POST', headers: { 'X-Quota-App': '1', 'Content-Type': 'application/json' },
-      body: JSON.stringify(cl ? Object.assign({ seat: rs.label, kind: rs.kind }, rs.clear ? { requestId: rs.rid } : rs.rid ? { resend: true, requestId: rs.rid } : {}) : { seat: rs.label }) });     // a resend names its claim
+      body: JSON.stringify(cl ? Object.assign({ seat: rs.label, kind: rs.kind }, rs.clear ? { requestId: rs.rid } : rs.rid ? { resend: true, requestId: rs.rid } : {}) : Object.assign({ seat: rs.label }, rs.clear ? { requestId: rs.rid } : {})) });     // a resend names its claim; a clear names the claim or mark it showed
     const j = await r.json().catch(() => ({}));
     text = j.text || 'Reset failed (' + r.status + ').'; outcome = j.outcome || 'error';
   } catch (e) {}

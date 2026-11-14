@@ -1278,6 +1278,7 @@ def build_provider(hist, pid, emails, now, extra):
         acts = [r for r in sw if r != "best" and label in sw[r] and use.get("app" if r == "both" else r) != label]
         if pid == "codex" and label in (extra.get("codexPending") or ()):
             a["resetPending"] = True        # its last reset is unconfirmed: no Apply reset until a reading settles it
+            a["resetPendingId"] = extra["codexPending"][label]      # the mark the page shows: its Clear names it (a mark from before ids existed is "")
         if acts:                            # the switch buttons: roles whose rotator can use this seat, minus the one it already holds
             a["switch"] = acts
         rk = [(k, usable_grants(cr, k, now)) for k in RESET_KINDS] if pid == "claude" and extra.get("claudeReset") else []
@@ -1445,7 +1446,7 @@ def load_extra():
         pass
     return {"notes": c.get("notes"), "pnote": c.get("pnote"), "credits": c.get("credits") if credits_enabled() else None, "claims": pending_claims(c), "claudeReset": credits_enabled(), "drift": drift if isinstance(drift, dict) else None, "canReset": redeem_script() is not None, "inUse": in_use(), "switch": switch_targets(),
             "weights": dict(read_weights_cfg(), plans={"codex": plans}), "codex": {"pairs": pairs},
-            "codexPending": sorted(c.get("codex_pending") or {}), "codexRefresh": codex_usage_argv() is not None, "pcacheError": perr}
+            "codexPending": {s: (v.get("id") or "") if isinstance(v, dict) else "" for s, v in sorted((c.get("codex_pending") or {}).items())}, "codexRefresh": codex_usage_argv() is not None, "pcacheError": perr}
 
 
 LOCK_WAIT = 30                      # s: how long a writer waits for the history or provider-cache lock
@@ -2442,7 +2443,7 @@ class Store:
             if seat in pend:
                 return {"outcome": "error", "text": "The last reset on seat %s is unconfirmed. Check codex-usage; if the reset was not used, use Clear on that "
                                                     "seat, then apply again." % seat}
-            pend[seat] = {"at": int(time.time())}
+            pend[seat] = {"at": int(time.time()), "id": secrets.token_urlsafe(16)}      # the id is what a Clear names: a mark replaced by a newer reset is not the one the page showed
         box, hand, done = {}, threading.Lock(), threading.Event()
 
         def job():
@@ -2466,11 +2467,17 @@ class Store:
         applog("codex reset: seat %s -> still running after %d s; waiting for it" % (seat, RESET_TIMEOUT))
         return {"outcome": "running", "text": RESET_RUNNING}
 
-    def codex_reset_clear(self, seat):
-        """Drop a seat's unconfirmed-reset mark by hand (the caller holds `refreshing`): the user checked codex-usage and the reset was not used."""
+    def codex_reset_clear(self, seat, rid):
+        """Drop a seat's unconfirmed-reset mark by hand (the caller holds `refreshing`): the user checked codex-usage and the reset was not used. `rid` is the mark
+        the page showed ("" or None for a mark written before ids existed): when the mark has changed meanwhile (cleared, then replaced by a newer reset) it is
+        refused and left alone, as `claude_reset_clear` does."""
         with self.lock:
             with pcache_txn() as c:
-                had = (c.get("codex_pending") or {}).pop(seat, None) is not None
+                pend = c.get("codex_pending") or {}
+                cur = pend.get(seat)
+                if cur is not None and ((cur.get("id") if isinstance(cur, dict) else None) or "") != (rid or ""):
+                    return {"outcome": "error", "text": "That pending reset changed; reload to see it."}
+                had = pend.pop(seat, None) is not None
             if had:
                 applog("codex reset: seat %s unconfirmed mark cleared by hand" % seat)
                 self.rebuild(time.time())
@@ -2752,15 +2759,16 @@ def make_handler(store, port):
         def codex_reset_clear(self):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                seat = json.loads(self.rfile.read(n)).get("seat") if 0 < n <= 1024 else None
+                b = json.loads(self.rfile.read(n)) if 0 < n <= 1024 else {}
+                seat, rid = b.get("seat"), b.get("requestId")
             except (ValueError, AttributeError):
-                seat = None
-            if not valid_seat(seat, codex_homes()):
+                seat = rid = None
+            if not valid_seat(seat, codex_homes()) or not (rid is None or isinstance(rid, str)):
                 return self.js(400, {"outcome": "error", "text": "Unknown Codex seat."})
             if not store.refreshing.acquire(blocking=False):
                 return self.js(409, {"outcome": "error", "text": "Another action is running; try again in a minute."})
             try:
-                self.js(200, store.codex_reset_clear(seat))
+                self.js(200, store.codex_reset_clear(seat, rid))
             except PcacheError as e:                 # the provider cache cannot be read: the message says what to do
                 applog("codex reset clear error: %s" % e)
                 self.js(500, {"outcome": "error", "text": str(e)})
@@ -3738,9 +3746,29 @@ def selftest():
             n_ = len(seen_)
             r_ = cst.codex_reset("A", "/x", crash)
             assert "is unconfirmed" in r_["text"] and "Clear" in r_["text"] and len(seen_) == n_                  # refused: the script does not run again
-            assert build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": ["A"]})["providers"][0]["accounts"][0]["resetPending"] is True
+            assert build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": {"A": "id1"}})["providers"][0]["accounts"][0]["resetPending"] is True
             # a reading straight after the unclear answer, even one whose count dropped, does not lift it; nor does a later sample
-            assert cst.codex_reset_clear("A") =={"outcome": "ok", "text": "Cleared. Apply reset is back on seat A."} and load_pcache()["codex_pending"] == {}
+            # a Clear names the mark the page showed (its id): the right id clears; a mark replaced by a newer reset (new id) is refused and stays; a mark from before ids existed is cleared by ""
+            pid1 = load_pcache()["codex_pending"]["A"]["id"]
+            assert pid1 and build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": {"A": pid1}})["providers"][0]["accounts"][0]["resetPendingId"] == pid1
+            assert cst.codex_reset_clear("A", "stale") == {"outcome": "error", "text": "That pending reset changed; reload to see it."} and load_pcache()["codex_pending"]["A"]["id"] == pid1
+            assert cst.codex_reset_clear("A", None)["outcome"] == "error" and cst.codex_reset_clear("A", "")["outcome"] == "error" and "A" in load_pcache()["codex_pending"]   # an id-less clear does not take an id'd mark
+            assert cst.codex_reset_clear("A", pid1) =={"outcome": "ok", "text": "Cleared. Apply reset is back on seat A."} and load_pcache()["codex_pending"] == {}
+            with pcache_txn() as c_:
+                c_["codex_pending"] = {"A": {"at": 1}}                                                                  # written by a version before ids: id ""
+            assert cst.codex_reset_clear("A", "x")["outcome"] == "error" and "A" in load_pcache()["codex_pending"]
+            assert cst.codex_reset_clear("A", "")["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
+            with pcache_txn() as c_:
+                c_["codex_pending"] = {"A": {"at": 1}}
+            assert build([{"t": 1, "codex": {"A": {"ts": 1, "w": 0.1, "banked": 3}}}], 5, {}, False, {"canReset": True, "codexPending": {"A": ""}})["providers"][0]["accounts"][0]["resetPendingId"] == ""
+            assert cst.codex_reset_clear("A", None)["outcome"] == "ok" and load_pcache()["codex_pending"] == {}         # a page from before ids sends no requestId: it still clears a legacy mark
+            cst.codex_reset("A", "/x", crash)
+            new1 = load_pcache()["codex_pending"]["A"]["id"]
+            assert cst.codex_reset_clear("A", new1)["outcome"] == "ok"
+            cst.codex_reset("A", "/x", crash)
+            new2 = load_pcache()["codex_pending"]["A"]["id"]                                                            # cleared and replaced by a newer reset: the first page's Clear must not drop it
+            assert new2 != new1 and cst.codex_reset_clear("A", new1)["outcome"] == "error" and load_pcache()["codex_pending"]["A"]["id"] == new2
+            assert cst.codex_reset_clear("A", new2)["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
             r_ = cst.codex_reset("A", "/x", lambda argv, **kw: Proc(b"?", 1) if "--confirm" in argv else Proc(json.dumps(dict(rd, rate_limits_before=dict(rd["rate_limits_before"], banked_reset_credits=1))).encode()))
             assert "unconfirmed" in r_["text"] and "A" in load_pcache()["codex_pending"]                              # the read showed 3 -> 1: still marked
             stub = {k: globals()[k] for k in ("read_claude", "read_codex", "fetch_grok", "read_gemini", "gemini_email")}
@@ -3761,8 +3789,8 @@ def selftest():
                 globals().update(stub)
             assert rs_["s"] == {"X": {"ts": 1, "w": 0.1}} and rs_["grok"]["grok"] == {"ok": False, "note": "Grok usage unavailable (RuntimeError)"}, rs_
             assert rs_["gemini"]["antigravity"] == {"ok": False, "note": "Antigravity usage unavailable (RuntimeError)"} and "gemini read failed: RuntimeError" in open(APPLOG).read(), rs_
-            assert cst.codex_reset_clear("A")["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
-            assert cst.codex_reset_clear("A")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
+            assert cst.codex_reset_clear("A", load_pcache()["codex_pending"]["A"]["id"])["outcome"] == "ok" and load_pcache()["codex_pending"] == {}
+            assert cst.codex_reset_clear("A", "")["outcome"] == "error" and "cleared by hand" in open(APPLOG).read()
             r_ = cst.codex_reset("A", "/x", fake)                                                                   # a clear answer: no mark left
             assert r_["outcome"] == "redeemed" and load_pcache()["codex_pending"] == {}
         finally:
@@ -4777,20 +4805,21 @@ def selftest():
             globals()["credits_enabled"] = lambda cfg=None: False
             assert hp(ok_)[0] == 404 and len(hc) == 1                                                       # the kill switch
             # the hand clear of an unconfirmed Codex reset: the same guards, single flight with every other action
-            hs.codex_reset_clear = lambda seat: (hc.append(("clear", seat)), {"outcome": "ok", "text": "c"})[1]
+            hs.codex_reset_clear = lambda seat, rid: (hc.append(("clear", seat, rid)), {"outcome": "ok", "text": "c"})[1]
             keep_ch, cp_ = codex_homes, "/api/codex-reset-clear"
             globals()["codex_homes"] = lambda cdir=None: ["A", "B"]
             try:
                 assert hp({"seat": "A"}, path=cp_, app=None)[0] == 403 and hp({"seat": "A"}, host="evil.example:%d" % port, path=cp_)[0] == 403
-                assert hp({"seat": "Z"}, path=cp_)[0] == 400 and hp(b"x", path=cp_)[0] == 400 and len(hc) == 1
+                assert hp({"seat": "Z"}, path=cp_)[0] == 400 and hp(b"x", path=cp_)[0] == 400 and hp({"seat": "A", "requestId": 5}, path=cp_)[0] == 400 and hp({"seat": "A", "requestId": ["x"]}, path=cp_)[0] == 400 and len(hc) == 1
                 hs.refreshing.acquire()
                 assert hp({"seat": "A"}, path=cp_)[0] == 409 and len(hc) == 1
                 hs.refreshing.release()
-                st_, body_ = hp({"seat": "A"}, path=cp_)
-                end_ = time.time() + 5                  # the handler releases the lock in `finally`, just after the reply is sent
-                while hs.refreshing.locked() and time.time() < end_:
-                    time.sleep(0.02)
-                assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("clear", "A") and not hs.refreshing.locked()
+                for body_in, want in (({"seat": "A", "requestId": "rid9"}, "rid9"), ({"seat": "A", "requestId": ""}, ""), ({"seat": "A"}, None)):      # the page's request id reaches the store; absent stays absent
+                    st_, body_ = hp(body_in, path=cp_)
+                    end_ = time.time() + 5                  # the handler releases the lock in `finally`, just after the reply is sent
+                    while hs.refreshing.locked() and time.time() < end_:
+                        time.sleep(0.02)
+                    assert st_ == 200 and json.loads(body_)["outcome"] == "ok" and hc[-1] == ("clear", "A", want) and not hs.refreshing.locked()
             finally:
                 globals()["codex_homes"] = keep_ch
             # the hand clear of a pending Claude claim: the same guards (origin header, loopback host, body size), a known seat and kind, single flight
