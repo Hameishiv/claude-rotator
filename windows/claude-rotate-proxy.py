@@ -18,9 +18,10 @@ forwarded untouched. Binds 127.0.0.1 only. The desktop app cannot be routed thro
 sets ANTHROPIC_BASE_URL itself, and that beats every settings file (tested 2026-10-30).
 
 Run:   pythonw -I claude-rotate-proxy.py          (the 'Claude rotate proxy' task does this)
-Check: claude-rotate-proxy.py --self-test         (offline checks of the pure helpers)
+Check: claude-rotate-proxy.py --self-test         (offline checks: pure helpers, and cache writes in a temp root)
 """
 import http.client
+from contextlib import contextmanager
 import json
 import os
 import socket
@@ -58,13 +59,17 @@ FIELDS = {"status": RL + "status", "s5_util": RL + "5h-utilization", "s5_stat": 
           "w7_reset": RL + "7d-reset", "oi7_util": RL + "7d_oi-utilization",
           "oi7_stat": RL + "7d_oi-status", "oi7_reset": RL + "7d_oi-reset",
           "claim": RL + "representative-claim", "org": "anthropic-organization-id"}
-WRITE_EVERY = 5        # s between cache writes per seat (a rejection always writes at once)
+WRITE_EVERY = 5        # s between cache writes per seat. A rejection skips it, and so does a Fable reading while this
+                       # proxy last saw a Fable rejection in that file. After a failed write, nothing is written for this long.
+CACHE_LOCK_TRIES = 40  # x 25 ms: a cold PowerShell writer can hold the cache lock for over 100 ms
 ROTATE_COOLDOWN = 20   # s: after a rotation attempt that changed nothing, don't ask again yet
 LOG_MAX = 1_000_000
 
-_lock = threading.Lock()          # tokens, cache-write stamps, log
+_lock = threading.Lock()          # tokens and log
+_cache_locks = {}                  # same-process writers to each cache path
 _rotate_lock = threading.Lock()   # one rotation request at a time
-_state = {"tokens": {}, "by_label": {}, "loaded": 0.0, "written": {}, "last_rotate": 0.0}
+_state = {"tokens": {}, "by_label": {}, "loaded": 0.0, "written": {}, "last_rotate": 0.0,
+          "fable_capped": set(), "failed": {}}   # -fable keys whose file held a rejection when this proxy last read or wrote it
 
 
 def log(msg):
@@ -122,7 +127,7 @@ def usage_record(label, status, model, headers):
     # A rejection is worth recording even with no utilisation numbers: it is what a --now check
     # must see (Grok review 2026-10-30).
     rejected = any(data[k] == "rejected" for k in ("status", "s5_stat", "w7_stat", "oi7_stat"))
-    return data if (data["s5_util"] or data["oi7_util"] or rejected) else None
+    return data if (data["s5_util"] or data["oi7_util"] or data["oi7_stat"] or rejected) else None
 
 
 def is_quota_rejection(status, headers):
@@ -132,26 +137,189 @@ def is_quota_rejection(status, headers):
     return any(headers.get(RL + k) == "rejected" for k in ("status", "5h-status", "7d-status", "7d_oi-status"))
 
 
+@contextmanager
+def lock_cache(stream):
+    """Take the same byte-range lock as the PowerShell cache writer."""
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        acquire = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        release = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        acquire = lambda: fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+        release = lambda: fcntl.lockf(stream, fcntl.LOCK_UN, 1)
+    for attempt in range(CACHE_LOCK_TRIES):
+        try:
+            acquire()
+            break
+        except OSError:
+            if attempt == CACHE_LOCK_TRIES - 1:
+                raise
+            time.sleep(0.025)
+    try:
+        yield
+    finally:
+        release()
+
+
+def read_cache_for_update(path):
+    for attempt in range(2):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                entry = json.load(f)
+            if isinstance(entry, dict) and isinstance(entry.get("data"), dict):
+                extra = entry.get("fable_cap")
+                if not extra or (isinstance(extra, dict) and isinstance(extra.get("data"), dict)):
+                    return entry
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            pass
+        if not attempt:
+            time.sleep(0.025)   # An older PowerShell writer might still be publishing in place.
+    return {}
+
+
+def observed_ms(entry):
+    try:
+        return int(entry.get("observed_ms") or int(entry.get("ts") or 0) * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def fable_observed_ms(entry):
+    reading = entry.get("fable_cap") or entry
+    data = reading.get("data", {})
+    try:
+        status = int(data.get("http") or 0)
+    except (TypeError, ValueError, OverflowError):
+        status = 0   # malformed metadata must not block the write that repairs it
+    if data.get("ok") and (data.get("oi7_stat") or data.get("oi7_util") is not None or 200 <= status < 300):
+        return observed_ms(reading)
+    try:
+        return int(entry.get("fable_confirmed_ms") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+DEFAULT_WINDOW = ("s5_util", "s5_stat", "w7_util", "w7_stat")
+
+
+def default_fable_observation(cached):
+    """The newest Fable observation in a default-cache record: its own proxy reading, or the one nested under it."""
+    old = cached.get("data", {})
+    nested = cached.get("fable_cap")
+    if old.get("src") == "proxy" and old.get("ok") and (old.get("oi7_stat") or old.get("oi7_util") is not None):
+        own = {"ts": cached.get("ts"), "observed_ms": observed_ms(cached), "data": old}
+        if not nested or observed_ms(nested) <= own["observed_ms"]:
+            return own
+    return nested
+
+
+def other_limit_rejection(data):
+    """A rejection whose Fable window names a status that is not rejected: some other limit refused it."""
+    return data.get("status") == "rejected" and bool(data.get("oi7_stat")) and data.get("oi7_stat") != "rejected"
+
+
+def cache_entry(prior, suffix, entry, has_fable):
+    if suffix:
+        # Keep the last measurement and its timestamp for the watcher and usage history.
+        # A future-dated measurement (a clock set back) is not kept, or its timestamp would outlive this write.
+        if (entry["data"].get("oi7_util") is None and prior.get("data", {}).get("oi7_util") is not None
+                and observed_ms(prior) <= entry["observed_ms"]):
+            return {**prior, "fable_cap": entry}
+    elif has_fable and all(entry["data"].get(k) is None for k in DEFAULT_WINDOW) and prior.get("data") and             observed_ms(prior) <= entry["observed_ms"] and not other_limit_rejection(entry["data"]):
+        # A Fable-only response names no default window: keep the default reading (and any cap it holds) and add this
+        # as the Fable backup, as the -fable file nests a status-only reading. A newer nested observation it raced
+        # (and not future-dated) stays. A rejection whose Fable window says it is not the Fable cap (another limit's,
+        # e.g. claim five_hour with no 5h fields) is stored at the top level, where default-cap readers see it.
+        nested = prior.get("fable_cap")
+        if nested and entry["observed_ms"] < observed_ms(nested) <= time.time_ns() // 1_000_000:
+            return prior
+        return {**prior, "fable_cap": entry}
+    elif not has_fable:
+        # A default-only write must not lose the default cache's copy of a Fable observation (a rejection or an
+        # allowance): an older proxy's only copy, the backup when the -fable write was skipped, or a nested
+        # Fable-only response.
+        cap = default_fable_observation(prior)
+        # A future-dated cap (a clock set back) is dropped, or it would come back once the clock passes it.
+        if cap and observed_ms(cap) <= time.time_ns() // 1_000_000:   # not future-dated; a newer cap is kept
+            entry["fable_cap"] = cap
+    else:
+        # A full Fable reading, or a Fable-only response with no default reading to nest under (stored at the top
+        # level), is the newer Fable word, unless a Fable observation it raced (nested a moment later by another
+        # response) is newer still and not future-dated: keep that one.
+        cap = default_fable_observation(prior)
+        if cap and entry["observed_ms"] < observed_ms(cap) <= time.time_ns() // 1_000_000:
+            entry["fable_cap"] = cap
+    return entry
+
+
 def write_cache(label, data):
     """Atomic write of <label>/usage-cache.json (and -fable when the Fable window rode along)."""
     rejected = any(data.get(k) == "rejected" for k in ("status", "s5_stat", "w7_stat", "oi7_stat"))
-    now = time.time()
-    for suffix, present in (("", data.get("s5_util") or rejected), ("-fable", data.get("oi7_util"))):
+    has_fable = data.get("oi7_util") or data.get("oi7_stat")
+    receipt = time.time_ns() // 1_000_000
+    mono = time.monotonic()   # throttle and backoff: a clock set back must not stall writes
+    never = float("-inf")
+    for suffix, present in (("", data.get("s5_util") or rejected), ("-fable", has_fable)):
         if not present:
             continue
         key = label + suffix
-        with _lock:
-            if not rejected and now - _state["written"].get(key, 0) < WRITE_EVERY:
-                continue
-            _state["written"][key] = now
+        # Throttle before any lock or file read: this runs before the response reaches the client.
+        if mono - _state["failed"].get(key, never) < WRITE_EVERY:
+            continue   # the lock was just stuck: at most one lock wait per WRITE_EVERY, whatever the reading
+        if (not rejected and mono - _state["written"].get(key, never) < WRITE_EVERY
+                and not (suffix and key in _state["fable_capped"])):
+            continue
         path = os.path.join(ROOT, label, "usage-cache%s.json" % suffix)
         tmp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"ts": int(now), "data": data}, f)
-            os.replace(tmp, path)
-        except OSError as e:
-            log("cache write failed for %s: %s" % (key, e))
+        with _lock:
+            local_guard = _cache_locks.setdefault(path, threading.Lock())
+        failure = None
+        with local_guard:
+            # Re-checked here: threads queued behind a failed write must not each wait out the lock again.
+            if mono - _state["failed"].get(key, never) < WRITE_EVERY or (
+                    not rejected and not suffix and mono - _state["written"].get(key, never) < WRITE_EVERY):
+                continue
+            try:
+                with open(path + ".lock", "a+b") as guard, lock_cache(guard):
+                    prior = read_cache_for_update(path)
+                    effective = (prior.get("fable_cap") if suffix else None) or prior
+                    if suffix:
+                        # Learned on each read. A rejection another writer saved since is seen on the next unthrottled write.
+                        if effective.get("data", {}).get("oi7_stat") == "rejected":
+                            _state["fable_capped"].add(key)
+                        else:
+                            _state["fable_capped"].discard(key)
+                    previous_ms = fable_observed_ms(prior) if suffix else observed_ms(effective)
+                    # An older reading never replaces a newer one. On a same-millisecond tie a rejection wins.
+                    if previous_ms <= time.time_ns() // 1_000_000 and (
+                            receipt < previous_ms or (receipt == previous_ms and not rejected)):
+                        continue
+                    clears_fable_cap = suffix and effective.get("data", {}).get("oi7_stat") == "rejected"
+                    if not rejected and not clears_fable_cap and mono - _state["written"].get(key, never) < WRITE_EVERY:
+                        continue
+                    entry = cache_entry(prior, suffix, {"ts": receipt // 1000, "observed_ms": receipt, "data": data}, has_fable)
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(entry, f)
+                    try:
+                        os.replace(tmp, path)
+                    except PermissionError:
+                        time.sleep(0.025)
+                        os.replace(tmp, path)
+                    _state["written"][key] = mono
+                    if suffix:
+                        if ((entry.get("fable_cap") or entry).get("data", {}).get("oi7_stat") == "rejected"):
+                            _state["fable_capped"].add(key)
+                        else:
+                            _state["fable_capped"].discard(key)
+            except Exception as e:   # a cache write must never stop the response from being relayed
+                _state["failed"][key] = mono   # recorded before the next queued thread can take the lock
+                failure = e
+        if failure:
+            log("cache write failed for %s: %s" % (key, failure))
 
 
 # The proxy's own refusal (no eligible seat left), in the API's canonical shape: the code and wording every refusal classifier keys on
@@ -495,7 +663,80 @@ def self_test():
         assert any(c["body"] == LOCAL_REFUSAL.decode() and c["disabled"] is True for c in json.load(handle)), "the local refusal is not a shared fixture"
     assert not is_subscription_disabled(0, "disabled Claude subscription access")
     marker_self_test()
+    cache_self_test()
     print("self-test ok")
+
+
+def cache_self_test():
+    """write_cache against a sandbox root: repair of malformed metadata, same-millisecond ties, carried allowances."""
+    import shutil, tempfile
+    global ROOT, LOG
+    saved, ROOT = ROOT, tempfile.mkdtemp(prefix="crp-cache-")
+    saved_log, LOG = LOG, os.path.join(ROOT, ".proxy-log.txt")
+    real_ns = time.time_ns
+    try:
+        os.makedirs(os.path.join(ROOT, "S"))
+        fable = os.path.join(ROOT, "S", "usage-cache-fable.json")
+        default = os.path.join(ROOT, "S", "usage-cache.json")
+        load = lambda path: json.load(open(path, encoding="utf-8"))
+        with open(fable, "w", encoding="utf-8") as f:
+            json.dump({"ts": 1, "data": {"ok": True, "http": "x", "oi7_stat": "rejected"}}, f)
+        write_cache("S", {"ok": True, "http": 200, "src": "proxy", "oi7_stat": "allowed"})
+        assert load(fable)["data"]["oi7_stat"] == "allowed", "malformed http blocked its own repair"
+        tick = real_ns() + 10 ** 9
+        time.time_ns = lambda: tick
+        _state["written"].clear()
+        write_cache("S", {"ok": True, "http": 200, "src": "proxy", "oi7_stat": "allowed"})
+        write_cache("S", {"ok": True, "http": 429, "src": "proxy", "oi7_stat": "rejected"})
+        assert load(fable)["data"]["oi7_stat"] == "rejected", "a same-millisecond rejection was dropped"
+        write_cache("S", {"ok": True, "http": 200, "src": "proxy", "oi7_stat": "allowed"})
+        assert load(fable)["data"]["oi7_stat"] == "rejected", "a same-millisecond allowance replaced a rejection"
+        time.time_ns = real_ns
+        _state["written"].clear()
+        with open(default, "w", encoding="utf-8") as f:
+            json.dump({"ts": 2, "observed_ms": 2000, "data": {"ok": True, "src": "proxy", "s5_util": "0.1", "oi7_stat": "allowed"}}, f)
+        write_cache("S", {"ok": True, "http": 200, "src": "proxy", "s5_util": "0.2"})
+        assert load(default).get("fable_cap", {}).get("data", {}).get("oi7_stat") == "allowed", "a default refresh lost a Fable allowance"
+        _state["written"].clear()
+        with open(default, "w", encoding="utf-8") as f:
+            json.dump({"ts": 3, "observed_ms": 3000, "data": {"ok": True, "src": "proxy", "s5_util": "0.3", "oi7_util": "0.5"}}, f)
+        write_cache("S", {"ok": True, "http": 200, "src": "proxy", "s5_util": "0.4"})
+        assert load(default).get("fable_cap", {}).get("data", {}).get("oi7_util") == "0.5", "a default refresh lost a Fable utilization reading"
+        with open(default, "w", encoding="utf-8") as f:
+            json.dump({"ts": 4, "observed_ms": 4000, "data": {"ok": True, "src": "proxy", "s5_stat": "rejected", "status": "rejected"}}, f)
+        write_cache("S", {"ok": True, "http": 429, "src": "proxy", "status": "rejected", "oi7_stat": "rejected"})
+        saved_default = load(default)
+        assert saved_default["data"].get("s5_stat") == "rejected" and saved_default["fable_cap"]["data"]["oi7_stat"] == "rejected",             "a Fable-only rejection replaced the default cap"
+        with open(fable, "w", encoding="utf-8") as f:
+            f.write('{"ts": 5, "observed_ms": Infinity, "data": {"ok": true, "http": 200, "oi7_stat": "allowed"}}')
+        _state["failed"].clear()
+        write_cache("S", {"ok": True, "http": 429, "src": "proxy", "oi7_stat": "rejected"})   # must not raise
+        time.time_ns = real_ns
+        now = time.time_ns() // 1_000_000
+        nested = {"ts": now // 1000, "observed_ms": now - 10, "data": {"ok": True, "src": "proxy", "http": 429, "oi7_stat": "rejected"}}
+        prior = {"ts": (now - 5000) // 1000, "observed_ms": now - 5000, "data": {"ok": True, "src": "proxy", "s5_util": 0.1}, "fable_cap": nested}
+        late = {"ts": (now - 2000) // 1000, "observed_ms": now - 2000, "data": {"ok": True, "src": "proxy", "s5_util": 0.2}}
+        assert cache_entry(prior, "", dict(late), False).get("fable_cap") == nested, "a late default write dropped a newer Fable rejection"
+        future = dict(nested, observed_ms=now + 3_600_000)
+        assert "fable_cap" not in cache_entry(dict(prior, fable_cap=future), "", dict(late), False), "a future-dated cap was carried"
+        late_full = {"ts": (now - 2000) // 1000, "observed_ms": now - 2000, "data": {"ok": True, "src": "proxy", "s5_util": 0.2, "oi7_stat": "allowed", "oi7_util": 0.3}}
+        assert cache_entry(prior, "", dict(late_full), True).get("fable_cap") == nested, "a late full Fable reading dropped a newer Fable rejection"
+        older = dict(nested, observed_ms=now - 9000)
+        assert "fable_cap" not in cache_entry(dict(prior, fable_cap=older), "", dict(late_full), True), "a full Fable reading kept an older Fable cap"
+        late_only = {"ts": (now - 2000) // 1000, "observed_ms": now - 2000, "data": {"ok": True, "src": "proxy", "http": 200, "oi7_stat": "allowed"}}
+        assert cache_entry(prior, "", dict(late_only), True).get("fable_cap") == nested, "a late Fable-only response replaced a newer nested Fable observation"
+        assert cache_entry(dict(prior, fable_cap=older), "", dict(late_only), True)["fable_cap"]["observed_ms"] == now - 2000, "a Fable-only response did not replace an older nested observation"
+        assert cache_entry(dict(prior, fable_cap=dict(nested, observed_ms=now + 3_600_000)), "", dict(late_only), True)["fable_cap"]["observed_ms"] == now - 2000, "a future-dated nested observation blocked a Fable-only response"
+        for fable_word in ("allowed", "allowed_warning"):
+            other = {"ts": now // 1000, "observed_ms": now, "data": {"ok": True, "src": "proxy", "http": 429, "status": "rejected",
+                                                                     "claim": "five_hour", "oi7_stat": fable_word}}
+            stored = cache_entry(dict(prior), "", dict(other), True)
+            assert stored["data"].get("status") == "rejected" and stored["data"].get("claim") == "five_hour",                 "another limit's sparse rejection was nested out of the default readers' sight"
+    finally:
+        time.time_ns = real_ns
+        _state["written"].clear(); _state["failed"].clear(); _state["fable_capped"].clear()
+        shutil.rmtree(ROOT, ignore_errors=True)
+        ROOT, LOG = saved, saved_log
 
 
 def marker_self_test():

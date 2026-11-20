@@ -34,10 +34,20 @@ class Fake(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("content-length") or 0))
         tok = (self.headers.get("authorization") or "")[7:]
         seen.append(tok)
-        if tok == "tok-A":   # seat A is an ordinary seat whose session window is spent
+        if self.path.endswith("?fable-allowed"):
+            self.send_response(200)
+            self.send_header(RL + "7d_oi-status", "allowed")
+            self.end_headers()
+            return
+        fable_status_only = self.path.endswith("?fable-status-only")
+        if tok == "tok-A" or fable_status_only:
             body = b'{"type":"error","error":{"type":"rate_limit_error","message":"spent"}}'
             self.send_response(429)
-            for k, v in (("status", "rejected"), ("5h-status", "rejected"), ("5h-utilization", "1.0")):
+            if fable_status_only:
+                fields = (("7d_oi-status", "rejected"), ("7d_oi-reset", "1893456000"))
+            else:
+                fields = (("status", "rejected"), ("5h-status", "rejected"), ("5h-utilization", "1.0"))
+            for k, v in fields:
                 self.send_header(RL + k, v)
             self.send_header("content-type", "application/json")
             self.end_headers()
@@ -143,11 +153,50 @@ def main():
         with open(os.path.join(root, ".active"), "w") as f:
             f.write("A")
         open(os.path.join(root, ".no-rotate"), "w").close()
+        with open(os.path.join(root, "A", "usage-cache-fable.json"), "w", encoding="utf-8") as f:
+            f.write('{"data":')  # An interrupted in-place write must not freeze this cache.
         time.sleep(21)   # past the proxy's rotate cooldown, so the rotator really is asked
         seen.clear()
-        status, body = call(port, "tok-A")
+        status, body = call(port, "tok-A", "/v1/messages?fable-status-only")
         assert status == 429 and b"spent" in body and seen == ["tok-A"], (status, body, seen)
-        print("ok  nothing to rotate to -> original 429, no replay")
+        with open(os.path.join(root, "A", "usage-cache-fable.json"), encoding="utf-8") as f:
+            fab = json.load(f)["data"]
+        assert fab["oi7_stat"] == "rejected" and fab["oi7_reset"] == "1893456000" and fab["oi7_util"] is None, fab
+        print("ok  status-only Fable rejection is cached, original 429 returned when no seat can rotate")
+
+        fable_path = os.path.join(root, "B", "usage-cache-fable.json")
+        with open(fable_path, encoding="utf-8") as f:
+            measurement = json.load(f)
+        with open(os.path.join(root, ".active"), "w") as f:
+            f.write("B")
+        status, _ = call(port, "tok-A", "/v1/messages?fable-status-only")
+        assert status == 429
+        with open(fable_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        cap = saved.pop("fable_cap")
+        assert saved == measurement and cap["ts"] > measurement["ts"], (saved, cap)
+        assert cap["data"]["oi7_stat"] == "rejected" and cap["data"]["oi7_util"] is None, cap
+        time.sleep(0.02)   # a later millisecond: on a tie the rejection is meant to win
+        status, _ = call(port, "tok-A", "/v1/messages?fable-allowed")
+        assert status == 200
+        with open(fable_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        allowance = saved.pop("fable_cap")
+        assert saved == measurement and allowance["data"]["oi7_stat"] == "allowed", (saved, allowance)
+        assert allowance["observed_ms"] > cap["observed_ms"], (cap, allowance)
+        future = dict(measurement, ts=measurement["ts"] + 86400, observed_ms=(measurement["ts"] + 86400) * 1000)
+        with open(fable_path, "w", encoding="utf-8") as f:
+            json.dump(future, f)   # a clock set back: the measurement on disk is dated tomorrow
+        status, _ = call(port, "tok-A", "/v1/messages?fable-status-only")
+        assert status == 429
+        with open(fable_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        assert "fable_cap" not in saved and saved["data"]["oi7_stat"] == "rejected", saved
+        assert saved["observed_ms"] <= time.time() * 1000, saved
+        print("ok  a status-only Fable rejection does not carry a future-dated measurement's timestamp forward")
+        with open(os.path.join(root, ".active"), "w") as f:
+            f.write("A")
+        print("ok  status-only Fable rejection preserves the last measured utilization and its timestamp")
 
         # 5. health
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

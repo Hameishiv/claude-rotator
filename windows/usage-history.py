@@ -2089,6 +2089,10 @@ def parse_log_line(msg):
         c = re.search(r"(FABLE|WEEKLY) window CAPPED at (\d+)%", msg)
         if c:
             v["f" if c.group(1) == "FABLE" else "w"] = _pct(c, 2)
+        elif "FABLE window REJECTED" in msg:   # only a measured Fable %: a status-only rejection is no sample
+            c = re.search(r"\bfable (\d+)%", msg)
+            if c:
+                v["f"] = _pct(c)
         c = re.search(r"\bweekly (\d+)%", msg)
         if c:
             v["w"] = _pct(c)
@@ -4410,6 +4414,9 @@ def selftest():
     assert parse_log_line("NO USABLE TARGET - staying on 'Work'. A=sn/a/w10% (capped (cached cap in force)) B=sn/a/wn/a (capped (cached cap in force)) C=s5%/w20%") == {"A": {"w": 0.1}, "C": {"w": 0.2}}
     assert parse_log_line("TRIGGER: active account 'Personal' WEEKLY window CAPPED at 100% (session 20%) [via proxy]") == {"Personal": {"w": 1.0}}
     assert parse_log_line("TRIGGER: active account 'Work' at 49% (session 49%, weekly 49%) >= 1%") == {"Work": {"w": 0.49}}
+    assert parse_log_line("TRIGGER: active account 'A' FABLE window REJECTED by the server (claim seven_day_oi; Gate C cannot run)") == {}
+    assert parse_log_line("TRIGGER: active account 'A' FABLE window REJECTED by the server (claim seven_day_oi; weekly 62%; Gate C cannot run)") == {"A": {"w": 0.62}}
+    assert parse_log_line("TRIGGER: active account 'A' FABLE window REJECTED by the server (claim seven_day_oi; fable 20%; weekly 62%; Gate C cannot run)") == {"A": {"f": 0.2, "w": 0.62}}
     mlog = "\n".join([ts(L - 4 * 86400) + "  ROTATED 'Personal' -> Work (w@x.org) session 0%, weekly 41%, fable 14%",
                       ts(L - 3 * 86400) + "  DRY RUN: would rotate 'Work' -> Personal (p@x.org) worst 0%, fable 0%"])
     mrecs, mem = backfill_records(mlog, {"Work": {"w": 0.5, "wr": wr}, "Personal": {"w": 0.2, "wr": wr}}, L - 8 * 86400, L)
@@ -4499,6 +4506,19 @@ def selftest():
             rs_ = read_seat("A")
             assert (rs_["ts"], rs_["s"], rs_["w"], rs_["st"]) == (100, .1, .5, "allowed"), rs_
             assert rs_["f"] is None and "fts" not in rs_, rs_             # no Fable measurement at all: no Fable read time either
+        fable_path = os.path.join(rd, "A", "usage-cache-fable.json")
+        fable_cap = {"ts": 110, "data": {"ok": True, "src": "proxy", "http": 429,
+                     "oi7_stat": "rejected", "oi7_util": None, "oi7_reset": "120"}}
+        with open(fable_path, "w", encoding="utf-8") as fh:
+            json.dump(fable_cap, fh)
+        rs_ = read_seat("A")
+        assert (rs_["ts"], rs_["s"], rs_["w"]) == (100, .1, .5), rs_
+        assert rs_["f"] is None and "fts" not in rs_, rs_                 # status alone supplies no Fable utilization sample
+        with open(fable_path, "w", encoding="utf-8") as fh:
+            json.dump({"ts": 90, "data": {"ok": True, "oi7_util": .2, "oi7_reset": 105, "oi7_stat": "allowed"},
+                       "fable_cap": fable_cap}, fh)
+        rs_ = read_seat("A")
+        assert (rs_["f"], rs_["fts"], rs_["fr"]) == (.2, 90, 105), rs_   # the measurement survives nesting (its status: #24 item 1)
     finally:
         globals()["ROOT"] = keep_root
         __import__("shutil").rmtree(rd, ignore_errors=True)

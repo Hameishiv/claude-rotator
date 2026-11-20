@@ -60,6 +60,12 @@ $global:ClaudeRotatorProbeOverride = {
     if ($plan -eq 'fable-disabled') {
       return [pscustomobject]@{ label=$Label; ok=$false; access='disabled'; http=403; code='oauth_org_not_allowed'; note='subscription disabled (403 oauth_org_not_allowed)' }
     }
+    if ($plan -eq 'fable-overlap') {
+      Start-Sleep -Milliseconds 1100   # give the proxy write a later epoch second than the start of this probe
+      $proxyAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      @{ ts = $proxyAt; data = @{ ok = $true; src = 'proxy'; oi7_stat = 'rejected'; oi7_reset = $proxyAt + 3600 } } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root $Label) 'usage-cache.json') -Encoding UTF8
+    }
     return [pscustomobject]@{ label=$Label; ok=$true; access='ok'; http=200; oi7_util=0.1; oi7_stat='allowed'; note='' }
   }
   if ($plan -eq 'disabled') {
@@ -470,8 +476,8 @@ function Write-FableCache([string]$l, [int64]$age, $reset) {
 }
 $nowS = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 Reset-Case
-Write-FableCache 'A' ($FableTTL + 3600) ([string]($nowS + 3 * 86400))
-Check 'a Fable cap read past the TTL still counts until its reset' (Test-FableCapCached 'A')
+Write-FableCache 'A' (8 * 86400) ([string]($nowS + 3 * 86400))
+Check 'a Fable cap older than a week still counts when its reset is in the future' (Test-FableCapCached 'A')
 Write-FableCache 'A' ($FableTTL + 3600) ([string]($nowS - 60))
 Check 'a Fable cap whose reset has passed no longer counts' (-not (Test-FableCapCached 'A'))
 Write-FableCache 'A' 10 $null
@@ -551,6 +557,261 @@ Write-DefaultCache 'A' $stale @{ s5_stat = 'rejected'; s5_reset = ($nowS - 60); 
 $script:plan['A'] = 'default-500'
 $null = Get-UsageCached 'A' $true 'haiku' ''
 Check 'a headerless default probe still replaces a cap that has reset' ((Get-Content (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Raw | ConvertFrom-Json).data.http -eq 500)
+
+# A proxy response can name only the Fable window, without measuring its utilization.
+Reset-Case
+Clear-AppIdentity
+foreach ($l in 'A','C') { $script:plan[$l] = 'network' }
+$seatA = Join-Path $Root 'A'
+$statusOnly = @{ ts = $nowS - $stale; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429
+                 status = 'rejected'; oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 3600); oi7_util = $null } }
+$cacheNames = 'usage-cache.json','usage-cache-fable.json'
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a Fable-only rejection is no default cap' (-not (Test-CapCached 'A' 'default'))
+Check 'the network fallback honors a legacy rejection stored only in the default cache' ((Select-RotationTarget 90 'B').label -eq 'C')
+$measured = @{ ts = $nowS - $stale; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'
+               oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 3600); oi7_util = '1.0' } }
+$measured | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'the network fallback honors a measured Fable rejection whose Fable cache write was skipped' ((Select-RotationTarget 90 'B').label -eq 'C')
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$allowedFable = @{ ts = $statusOnly.ts + 60; data = @{ ok = $true; oi7_stat = 'allowed'; oi7_util = 0.1 } }
+$fablePath = Join-Path $seatA 'usage-cache-fable.json'
+@{ ts = $statusOnly.ts + 60; data = @{ ok = $true; http = 500 } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'an older rotator unable to read Fable cannot mask a legacy rejection' ((Select-RotationTarget 90 'B').label -eq 'C')
+$allowedFable | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a newer Fable reading supersedes the legacy rejection' ((Select-RotationTarget 90 'B').label -eq 'A')
+$allowedFable.ts = $statusOnly.ts - 60
+$allowedFable | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a legacy rejection supersedes an older Fable reading' ((Select-RotationTarget 90 'B').label -eq 'C')
+$allowedFable.ts = $nowS + 86400
+$allowedFable | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a future-dated Fable reading does not outrank a default-cache rejection' ((Select-RotationTarget 90 'B').label -eq 'C')
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+@{ ts = $statusOnly.ts + 60; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; s5_util = 0.1; oi7_stat = 'allowed' } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a newer Fable allowance in the default cache supersedes the Fable cache rejection' ((Select-RotationTarget 90 'B').label -eq 'A')
+@{ ts = $statusOnly.ts + 60; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; s5_util = 0.1; oi7_util = 0.2 } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a newer Fable utilization reading in the default cache supersedes the Fable cache rejection' ((Select-RotationTarget 90 'B').label -eq 'A')
+$measuredCap = @{ ts = $statusOnly.ts; data = @{ ok = $true; http = 429; oi7_stat = 'rejected'; oi7_util = 1.0; oi7_reset = [string]($nowS + 3600) } }
+$measuredCap | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache.json')
+Check 'the watcher baseline reports a measured Fable cap' ((Read-FableCache 'A').capped)
+$sameResponse = @{ ts = $nowS; observed_ms = $nowS * 1000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'
+                   oi7_stat = 'rejected'; oi7_util = 1.0; oi7_reset = [string]($nowS + 3600) } }
+foreach ($name in $cacheNames) { $sameResponse | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA $name) -Encoding UTF8 }
+Check 'the watcher baseline reports a cap the proxy saved in both caches at once' ((Read-FableCache 'A').capped)
+@{ ts = $statusOnly.ts + 60; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; s5_util = 0.1; oi7_stat = 'allowed' } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$measuredCap | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'the watcher baseline agrees: a newer default-cache allowance clears a measured Fable cap' (-not (Read-FableCache 'A').capped)
+function Set-NestedRej($TopTs, $TopSrc, $NestTs, $NestData) {
+  $top = @{ label = 'A'; ok = $true; http = 200; status = 'allowed'; s5_util = 0.2; w7_util = 0.3 }
+  if ($TopSrc) { $top.src = $TopSrc }
+  @{ ts = $TopTs; observed_ms = $TopTs * 1000; data = $top
+     fable_cap = @{ ts = $NestTs; observed_ms = $NestTs * 1000; data = $NestData } } |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+}
+$rej429 = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day_oi'; oi7_stat = 'rejected' }
+$oiOnly = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 3600) }
+Set-NestedRej ($nowS - 900) 'proxy' $nowS $rej429
+$sample = Get-ProxySample 'A' $true
+Check 'a --now check sees a fresh nested Fable-only rejection under a stale default reading' ($sample.fable_only_rejection -and $sample.status -eq 'rejected' -and $sample.claim -eq 'seven_day_oi')
+Check 'a nested Fable-only rejection sample carries no session value for the projection' ($null -eq $sample.s5_util)
+Set-NestedRej $nowS $null $nowS $rej429
+Check 'a --now check sees a fresh nested Fable-only rejection under a rotator probe reading' ((Get-ProxySample 'A' $true).fable_only_rejection)
+Set-NestedRej ($nowS - 900) 'proxy' $nowS $oiOnly
+Check 'a nested rejection carried only by 7d_oi-status is seen' ((Get-ProxySample 'A' $true).fable_only_rejection)
+Set-NestedRej ($nowS - 900) 'proxy' ($nowS + 3600) $rej429
+Check 'a future-dated nested rejection is not a fresh rejection' ($null -eq (Get-ProxySample 'A' $true))
+Set-NestedRej ($nowS - 900) 'proxy' ($nowS - 600) $rej429
+Check 'a stale nested rejection does not satisfy a --now check' ($null -eq (Get-ProxySample 'A' $true))
+$renewedRej = $rej429.Clone(); $renewedRej.oi7_reset = [string]($nowS - 60)
+Set-NestedRej ($nowS - 900) 'proxy' $nowS $renewedRej
+Check 'a nested rejection whose Fable window already renewed does not trigger' ($null -eq (Get-ProxySample 'A' $true))
+$weeklyCarried = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day'; w7_util = 1.0; oi7_stat = 'allowed'; oi7_util = 0.2 }
+Set-NestedRej $nowS 'proxy' $nowS $weeklyCarried
+Check 'a carried reading naming only weekly utilization is not a Fable-only rejection' ($null -eq (Get-ProxySample 'A' $true))
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $oiOnly } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a top-level Fable-only rejection (no default reading to nest under) is seen as a Fable rejection' ((Get-ProxySample 'A' $true).fable_only_rejection)
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $rej429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a top-level Fable-only rejection with an overall status is a Fable rejection, not a session cap' ((Get-ProxySample 'A' $true).fable_only_rejection)
+# $rej429 carries the overall status too, as a real Fable 429 does: a renewed, future-dated or superseded one must not
+# fall through to a session cap (a stale one is also stopped by the freshness test that sample needs).
+$topRenewed = $rej429.Clone(); $topRenewed.oi7_reset = [string]($nowS - 60)
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $topRenewed } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a top-level Fable rejection whose window already renewed does not trigger' ($null -eq (Get-ProxySample 'A' $true))
+@{ ts = $nowS - 600; observed_ms = ($nowS - 600) * 1000; data = $rej429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a stale top-level Fable rejection does not satisfy a --now check' ($null -eq (Get-ProxySample 'A' $true))
+@{ ts = $nowS + 3600; observed_ms = ($nowS + 3600) * 1000; data = $rej429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a future-dated top-level Fable rejection is not a fresh rejection' ($null -eq (Get-ProxySample 'A' $true))
+@{ ts = $nowS - 30; observed_ms = ($nowS - 30) * 1000; data = $rej429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = @{ label = 'A'; ok = $true; http = 200; oi7_stat = 'allowed'; oi7_util = 0.4 } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -Encoding UTF8
+Check 'a newer Fable cache allowance supersedes a top-level Fable rejection' ($null -eq (Get-ProxySample 'A' $true))
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -ErrorAction SilentlyContinue
+$plain429 = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'five_hour' }
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $plain429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$sample = Get-ProxySample 'A' $true
+Check 'a top-level 429 whose Fable window is not rejected stays an overall rejection, not a Fable cap' ($sample.status -eq 'rejected' -and -not $sample.fable_only_rejection)
+# The shape the proxy now stores at the top level: another limit's sparse 429 that carries a Fable status.
+$other429 = $plain429.Clone(); $other429.oi7_stat = 'allowed'
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $other429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$sample = Get-ProxySample 'A' $true
+Check "a top-level five_hour 429 whose Fable window says allowed is an overall rejection the watcher sees" ($sample.status -eq 'rejected' -and -not $sample.fable_only_rejection)
+# The production Fable 429 shape: 7d window allowed with utilization, overall and Fable windows rejected.
+$prod429 = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day_oi'
+              w7_util = 0.62; w7_stat = 'allowed'; oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 3600) }
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $prod429 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a full Fable 429 with an allowed 7d window is a Fable rejection, not a session cap' ((Get-ProxySample 'A' $true).fable_only_rejection)
+$prodRenewed = $prod429.Clone(); $prodRenewed.oi7_reset = [string]($nowS - 60); $prodRenewed.s5_util = 0.3; $prodRenewed.s5_stat = 'allowed'
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $prodRenewed } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a renewed full Fable 429 is not reported as a rejection' ($null -eq (Get-ProxySample 'A' $true))
+$sample = Get-ProxySample 'A' $false
+Check '... but its session value still feeds the projection, without the overall rejection' ($sample -and [double]$sample.s5_util -eq 0.3 -and $sample.status -ne 'rejected' -and -not $sample.fable_only_rejection)
+@{ ts = $nowS - 600; observed_ms = ($nowS - 600) * 1000; data = $prodRenewed } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a stale renewed full Fable 429 does not feed the projection' ($null -eq (Get-ProxySample 'A' $false))
+$prodNoSession = $prod429.Clone(); $prodNoSession.oi7_reset = [string]($nowS - 60)
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = $prodNoSession } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+Check 'a renewed full Fable 429 with no session value does not feed the projection' ($null -eq (Get-ProxySample 'A' $false))
+$carried = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'five_hour'; s5_util = 1.0; s5_stat = 'rejected'; oi7_stat = 'allowed'; oi7_util = 0.2 }
+Set-NestedRej $nowS 'proxy' $nowS $carried
+Check 'a carried full reading rejected on a default window is not a Fable-only rejection' ($null -eq (Get-ProxySample 'A' $true))
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day'; s5_util = 0.2; w7_util = 1.0; s5_stat = 'allowed'; w7_stat = 'rejected' }
+   fable_cap = @{ ts = $nowS; observed_ms = $nowS * 1000; data = $rej429 } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$sample = Get-ProxySample 'A' $true
+Check 'a fresh weekly cap above a nested Fable rejection is the sample reported' ($sample.w7_stat -eq 'rejected' -and -not $sample.fable_only_rejection)
+Set-NestedRej ($nowS - 900) 'proxy' ($nowS - 30) $rej429
+@{ ts = $nowS; observed_ms = $nowS * 1000; data = @{ label = 'A'; ok = $true; http = 200; oi7_stat = 'allowed'; oi7_util = 0.4 } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -Encoding UTF8
+Check 'a newer Fable cache allowance supersedes a nested Fable rejection' ($null -eq (Get-ProxySample 'A' $true))
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -ErrorAction SilentlyContinue
+Set-NestedRej ($nowS - 900) 'proxy' ($nowS - 30) $rej429
+@{ ts = $nowS - 600; observed_ms = ($nowS - 600) * 1000; data = @{ label = 'A'; ok = $true; http = 200; oi7_stat = 'allowed'; oi7_util = 0.85 }
+   fable_cap = @{ ts = $nowS; observed_ms = $nowS * 1000; data = @{ label = 'A'; ok = $true; http = 429; oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 3600) } } } |
+  ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -Encoding UTF8
+Check 'a newer status-only Fable cache rejection keeps the nested Fable rejection' ((Get-ProxySample 'A' $true).fable_only_rejection)
+@{ ts = $nowS + 3600; observed_ms = ($nowS + 3600) * 1000; data = @{ label = 'A'; ok = $true; http = 200; oi7_stat = 'allowed'; oi7_util = 0.4 } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -Encoding UTF8
+Check 'a future-dated Fable cache allowance does not hide a fresh nested rejection' ((Get-ProxySample 'A' $true).fable_only_rejection)
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache.json') -ErrorAction SilentlyContinue
+@{ ts = $nowS + 3600; observed_ms = ($nowS + 3600) * 1000; data = @{ label = 'A'; ok = $true; http = 429; oi7_stat = 'rejected'; oi7_reset = [string]($nowS + 7200) } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -Encoding UTF8
+Check 'a future-dated Fable cache rejection is not a cap in force' (-not (Test-FableCapCached 'A'))
+Remove-Item -LiteralPath (Join-Path $seatA 'usage-cache-fable.json') -ErrorAction SilentlyContinue
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA 'usage-cache.json') -Encoding UTF8
+$allowedFable.ts = $statusOnly.ts - 60
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a status-only Fable rejection is a cap in the Fable cache' (Test-FableCapCached 'A')
+Check 'a status-only Fable rejection supplies no utilization baseline' ($null -eq (Read-FableCache 'A'))
+Check 'the network fallback skips the Fable-capped seat' ((Select-RotationTarget 90 'B').label -eq 'C')
+$statusOnly.data.oi7_reset = [string]($nowS - 60)
+foreach ($name in $cacheNames) {
+  $statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seatA $name) -Encoding UTF8
+}
+Check 'the network fallback can use the seat after its Fable reset' ((Select-RotationTarget 90 'B').label -eq 'A')
+
+Reset-Case
+foreach ($l in 'B','C','D','E','F') { $script:plan[$l] = 'http401' }
+$script:plan['A'] = 'fable-500'
+$statusOnly.data.oi7_reset = [string]($nowS + 3600)
+$defaultPath = Join-Path $seatA 'usage-cache.json'
+$statusOnly | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $defaultPath -Encoding UTF8
+Check 'normal selection honors the legacy Fable cap after a healthy default refresh and a headerless Fable probe' ($null -eq (Select-RotationTarget 90))
+$refreshed = Read-UsageCacheFile $defaultPath
+Check 'the default refresh saves its new reading and retains the original Fable cap timestamp' ($refreshed.data.http -eq 200 -and $refreshed.fable_cap.ts -eq $statusOnly.ts)
+$future = $statusOnly | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+$future.ts = $nowS + 86400; $future | Add-Member -NotePropertyName observed_ms -NotePropertyValue (($nowS + 86400) * 1000) -Force
+$future | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $defaultPath -Encoding UTF8
+Write-UsageCacheFile $defaultPath 'A' @{ ts = $nowS; observed_ms = $nowS * 1000 + 1; data = @{ ok = $true; http = 200; s5_util = 0.1 } } $false
+Check 'a default refresh drops a future-dated legacy Fable cap' (-not (Read-UsageCacheFile $defaultPath).fable_cap)
+$nowMsT = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+@{ ts = [int64](($nowMsT - 5000) / 1000); observed_ms = $nowMsT - 5000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; s5_util = 0.1 }
+   fable_cap = @{ ts = [int64](($nowMsT - 10) / 1000); observed_ms = $nowMsT - 10; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; oi7_stat = 'rejected' } } } |
+  ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $defaultPath -Encoding UTF8
+Write-UsageCacheFile $defaultPath 'A' @{ ts = [int64](($nowMsT - 2000) / 1000); observed_ms = $nowMsT - 2000; data = @{ ok = $true; http = 200; s5_util = 0.2 } } $false
+Check 'a default refresh that finishes late keeps a newer Fable cap' ((Read-UsageCacheFile $defaultPath).fable_cap.data.oi7_stat -eq 'rejected')
+
+Reset-Case
+$allowedFable.fable_cap = $statusOnly
+$allowedFable | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+$baseline = Read-FableCache 'A'
+Check 'a status-only cap preserves the older measured baseline' ($baseline.pct -eq 10 -and $baseline.ts -eq $allowedFable.ts -and -not $baseline.capped)
+Check 'cap checks use the status-only rejection alongside the measured baseline' (Test-FableCapCached 'A')
+$allowedFable.data.oi7_stat = 'rejected'
+$statusOnly.data.oi7_reset = $nowS - 60
+$allowedFable | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a preserved rejected measurement does not supply a watcher cap once the newer rejection resets' (-not (Read-FableCache 'A').capped)
+
+Reset-Case
+$statusOnly.ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$statusOnly | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $defaultPath -Encoding UTF8
+$statusOnly | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+$a = Rank-Accounts $false $false | Where-Object label -eq 'A'
+Check 'fresh default cache does not classify a Fable-only rejection as a default cap' $a.usable
+$fableFromCache = Get-UsageCached 'A' $false 'fable' '-fable' $true
+Check 'a fresh cached Fable rejection is no longer returned after its reset' (-not $fableFromCache.ok)
+Check 'a malformed reset formats as unknown' ((FmtReset 'invalid reset') -eq '(unknown)')
+
+Reset-Case
+$script:plan['A'] = 'fable-overlap'
+$null = Get-UsageCached 'A' $true 'fable' '-fable'
+Check 'a successful Fable response supersedes a proxy rejection received during the probe' (-not (Test-FableCapCached 'A'))
+$script:plan['A'] = 'fable-500'
+$null = Get-UsageCached 'A' $true 'fable' '-fable'
+Check 'a subsequent headerless Fable probe does not revive the superseded cap' (-not (Test-FableCapCached 'A'))
+
+Reset-Case
+$second = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1
+$observed = $second * 1000
+Write-UsageCacheFile $fablePath 'A' @{ ts = $second; observed_ms = $observed + 200; data = @{ ok = $true; http = 200; oi7_stat = 'allowed' } } $true
+Write-UsageCacheFile $fablePath 'A' @{ ts = $second; observed_ms = $observed + 100; data = @{ ok = $true; http = 429; oi7_stat = 'rejected' } } $true
+Check 'a delayed cache write cannot reinstate a rejection from earlier in the same second' ((Read-FableUsageCache $seatA).data.oi7_stat -eq 'allowed')
+
+$repair = @{ ts = $second; observed_ms = $observed + 300; data = @{ ok = $true; http = 429; oi7_stat = 'rejected' } }
+Set-Content -LiteralPath $fablePath -Value '{"data":' -Encoding UTF8
+Write-UsageCacheFile $fablePath 'A' $repair $true
+Check 'a persistently invalid Fable cache is repaired by the next observation' (Test-FableCapCached 'A')
+@{ ts = $second + 86400; observed_ms = $observed + 86400000; data = @{ok=$true; http=200; oi7_stat='allowed'} } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Check 'a future-dated reading is not served as fresh' (-not (Get-UsageCached 'A' $false 'fable' '-fable' $true).ok)
+Write-UsageCacheFile $fablePath 'A' $repair $true
+Check 'a future cache timestamp does not block the next Fable observation' (Test-FableCapCached 'A')
+@{ ts = $second + 86400; observed_ms = $observed + 86400000; data = @{ok=$true; http=200; oi7_util=0.4} } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fablePath -Encoding UTF8
+Write-UsageCacheFile $fablePath 'A' $repair $true
+$saved = Read-UsageCacheFile $fablePath
+Check 'a status-only write does not carry a future-dated measurement forward' (-not $saved.fable_cap -and [long]$saved.observed_ms -eq $repair.observed_ms)
+
+# With no usable reset, a headerless probe preserves both the cap and its original timestamp for up to a week.
+$week = 7 * 86400
+foreach ($case in @(
+    @{ window = 'session'; fields = @{ s5_stat = 'rejected'; status = 'rejected' } },
+    @{ window = 'weekly'; fields = @{ w7_stat = 'rejected'; w7_reset = 'unreadable'; status = 'rejected' } },
+    @{ window = 'overall'; fields = @{ status = 'rejected' } },
+    @{ window = 'Fable'; fable = $true })) {
+  Reset-Case
+  $which, $model, $suffix = if ($case.fable) { 'fable', 'fable', '-fable' } else { 'default', 'haiku', '' }
+  $script:plan['A'] = "$which-500"
+  $cf = Join-Path $seatA "usage-cache$suffix.json"
+  foreach ($age in ($week - 60), ($week + 60)) {
+    if ($case.fable) { Write-FableCache 'A' $age $null }
+    else { Write-DefaultCache 'A' $age $case.fields }
+    $before = Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json
+    $inForce = $age -lt $week
+    Check "the $($case.window) cap without a reset at age ${age}s counts only within a week" ((Test-CapCached 'A' $which) -eq $inForce)
+    $null = Get-UsageCached 'A' $true $model $suffix
+    $after = Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json
+    if ($inForce) {
+      Check "a headerless probe retains the $($case.window) cap without renewing its timestamp" ($after.ts -eq $before.ts -and (Test-CapCached 'A' $which))
+    } else {
+      Check "a headerless probe replaces the expired $($case.window) cap" ($after.data.http -eq 500 -and -not (Test-CapCached 'A' $which))
+    }
+  }
+}
 
 # --- issue #11: the normal ranking and selection path honours a cached cap when the live probe is headerless ---
 # A is the only seat the other probes leave usable (401s), so selecting it can only be the cap being ignored.
@@ -647,7 +908,7 @@ foreach ($case in @(
   }
 }
 
-# Only the reading $keepCap keeps a cap for (an ok non-2xx with none of the window's fields) is checked against the cache: a 2xx
+# Only the reading Write-UsageCacheFile keeps a cached cap through (an ok non-2xx with none of the window's fields) is checked against the cache: a 2xx
 # (with or without the window) or a non-2xx carrying the window decides, even when its cache write failed and the old cap is still
 # on disk. The old cache is past its TTL here, so the live reading is the one ranked.
 foreach ($case in @(
@@ -786,6 +1047,104 @@ Write-AccessDisabled -Label 'D' -TokFp (Get-TokenFingerprint (TokenOf 'D'))
 Check 'a refusal of the replacement itself still counts' ($null -ne (Read-AccessDisabled 'D'))
 Reset-Case
 
+# --- the watcher rotates on a fresh nested Fable-only proxy rejection, as a Fable cap, and leaves the session projection alone ---
+$pingsBefore = $script:pings; $probeBefore = $global:ClaudeRotatorProbeOverride
+# A's live Fable probe agrees with the rejection, as on a real capped seat.
+$global:ClaudeRotatorProbeOverride = { param($Label, $Model)
+  if ($Label -eq 'A' -and $Model -eq 'fable') {
+    return [pscustomobject]@{ label = 'A'; ok = $true; access = 'ok'; http = 429; oi7_util = 1.0; oi7_stat = 'rejected'; status = 'rejected'; note = '' } }
+  & $probeBefore $Label $Model }.GetNewClosure()
+$tn = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$nestedFableRej = @{ ts = $tn - 900; observed_ms = ($tn - 900) * 1000
+  data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; status = 'allowed'; s5_util = 0.2; w7_util = 0.3 }
+  fable_cap = @{ ts = $tn; observed_ms = $tn * 1000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day_oi'; oi7_stat = 'rejected' } } }
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+$nestedFableRej | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+Check 'a fresh nested Fable-only rejection rotates the watcher off the seat' ((Get-ActiveLabel) -ne 'A') ("active=$(Get-ActiveLabel)")
+Check '... and the ping names the fable limit' (($script:pings -join ' ') -match 'fable') ("pings=$($script:pings -join ' | ')")
+$rlN = Join-Path $Root '.rotate-log.txt'
+$logN = if (Test-Path -LiteralPath $rlN) { Get-Content -LiteralPath $rlN -Raw } else { '' }
+Check '... and its trigger line leaves out the weekly % of a default reading older than the proxy freshness window' ($logN -match 'FABLE window REJECTED by the server \(claim seven_day_oi; Gate C cannot run\)') ("log=$logN")
+$nestedFresh = $nestedFableRej.Clone(); $nestedFresh.ts = $tn; $nestedFresh.observed_ms = $tn * 1000
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+$nestedFresh | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$logN = if (Test-Path -LiteralPath $rlN) { Get-Content -LiteralPath $rlN -Raw } else { '' }
+Check '... and with a fresh default reading the nested trigger line carries its weekly %' ($logN -match 'claim seven_day_oi; weekly 30%; ') ("log=$logN")
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+foreach ($l in 'B','C','D','E','F') { $script:plan[$l] = 'quota' }
+@{ acct = 'A'; nextHaiku = 0; lastWorst = 55; lastTs = $tn - 300; fableBase = 0; fableTs = 0; nextFable = 0; rotations = @() } |
+  ConvertTo-Json | Set-Content -LiteralPath $RotateState -Encoding UTF8
+$nestedFableRej | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$stAfter = Get-Content $RotateState -Raw | ConvertFrom-Json
+Check 'with no free seat the Fable-only rejection leaves the session projection state alone' ([int]$stAfter.lastWorst -eq 55 -and [int64]$stAfter.lastTs -eq ($tn - 300)) ("lastWorst=$($stAfter.lastWorst) lastTs=$($stAfter.lastTs)")
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+@{ ts = $tn; observed_ms = $tn * 1000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; oi7_stat = 'rejected'; oi7_reset = [string]($tn + 3600) } } |
+  ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+Check 'a fresh top-level Fable-only rejection (no default reading) rotates the watcher off the seat' ((Get-ActiveLabel) -ne 'A') ("active=$(Get-ActiveLabel)")
+Check '... and the ping names the fable limit' (($script:pings -join ' ') -match 'fable') ("pings=$($script:pings -join ' | ')")
+# The production Fable 429 shape: 7d window allowed with utilization, overall and Fable windows rejected.
+$wProd = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'seven_day_oi'
+            w7_util = 0.62; w7_stat = 'allowed'; oi7_stat = 'rejected'; oi7_reset = [string]($tn + 3600) }
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+@{ ts = $tn; observed_ms = $tn * 1000; data = $wProd } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+Check 'a fresh production-shape Fable 429 rotates the watcher off the seat' ((Get-ActiveLabel) -ne 'A') ("active=$(Get-ActiveLabel)")
+Check '... and the ping names the fable limit, not the session' (($script:pings -join ' ') -match 'fable' -and ($script:pings -join ' ') -notmatch 'session limit') ("pings=$($script:pings -join ' | ')")
+$rlP = Join-Path $Root '.rotate-log.txt'
+$logP = if (Test-Path -LiteralPath $rlP) { Get-Content -LiteralPath $rlP -Raw } else { '' }
+Check '... and its trigger line keeps the weekly reading, and invents no Fable %, for usage history' ($logP -match 'FABLE window REJECTED by the server \(claim seven_day_oi; weekly 62%; ') ("log=$logP")
+$wMeas = $wProd.Clone(); $wMeas.oi7_util = 0.2
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+@{ ts = $tn; observed_ms = $tn * 1000; data = $wMeas } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$logM = if (Test-Path -LiteralPath $rlP) { Get-Content -LiteralPath $rlP -Raw } else { '' }
+Check '... and a measured Fable % rides the trigger line' ($logM -match 'claim seven_day_oi; fable 20%; weekly 62%; ') ("log=$logM")
+$wBad = $wProd.Clone(); $wBad.w7_util = 'abc'; $wBad.oi7_util = 'NaN'
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+@{ ts = $tn; observed_ms = $tn * 1000; data = $wBad } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$logB = if (Test-Path -LiteralPath $rlP) { Get-Content -LiteralPath $rlP -Raw } else { '' }
+Check 'malformed utilization headers on a Fable 429 still rotate, and stay out of the trigger line' ((Get-ActiveLabel) -ne 'A' -and $logB -match 'claim seven_day_oi; Gate C cannot run') ("active=$(Get-ActiveLabel) log=$logB")
+# A sparse nested 429 whose Fable window says allowed (another limit rejected it) is not a Fable cap.
+$sparse = @{ ts = $tn - 900; observed_ms = ($tn - 900) * 1000
+  data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 200; status = 'allowed'; s5_util = 0.2; w7_util = 0.3 }
+  fable_cap = @{ ts = $tn; observed_ms = $tn * 1000; data = @{ label = 'A'; ok = $true; src = 'proxy'; http = 429; status = 'rejected'; claim = 'five_hour'; oi7_stat = 'allowed' } } }
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+$sparse | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$logS = if (Test-Path -LiteralPath $rlP) { Get-Content -LiteralPath $rlP -Raw } else { '' }
+Check 'a nested 429 whose Fable window says allowed is not reported as a Fable cap' ($logS -notmatch 'FABLE window REJECTED' -and ($script:pings -join ' ') -notmatch 'fable') ("log=$logS pings=$($script:pings -join ' | ')")
+$sparse.fable_cap.data.oi7_stat = 'allowed_warning'
+Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+$sparse | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+$null = Invoke-CheckRotate 0 $false $true 'test'
+$logS = if (Test-Path -LiteralPath $rlP) { Get-Content -LiteralPath $rlP -Raw } else { '' }
+Check '... nor one whose Fable window says allowed_warning' ($logS -notmatch 'FABLE window REJECTED' -and ($script:pings -join ' ') -notmatch 'fable') ("log=$logS pings=$($script:pings -join ' | ')")
+# Renewed, on a healthy seat: no trigger at all, on a --now check and on a scheduled one (which reads the
+# status-rewritten copy). Every seat is equally healthy here, so a wrong trigger would only 'stay put':
+# assert on the trigger log line, not on which seat ends up active.
+$global:ClaudeRotatorProbeOverride = $probeBefore
+$wRenewed = $wProd.Clone(); $wRenewed.oi7_reset = [string]($tn - 60); $wRenewed.s5_util = 0.1; $wRenewed.s5_stat = 'allowed'
+foreach ($forceNow in $true, $false) {
+  Reset-Case; Clear-AppIdentity; Set-Active 'A'; $script:pings = @()
+  $tr = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  @{ ts = $tr; observed_ms = $tr * 1000; data = $wRenewed } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path (Join-Path $Root 'A') 'usage-cache.json') -Encoding UTF8
+  $null = Invoke-CheckRotate 0 $false $forceNow 'test'
+  $rl = Join-Path $Root '.rotate-log.txt'
+  $logText = if (Test-Path -LiteralPath $rl) { Get-Content -LiteralPath $rl -Raw } else { '' }
+  Check "a renewed production-shape Fable 429 fires no trigger (forceNow=$forceNow)" ($logText -notmatch 'TRIGGER:' -and $script:pings.Count -eq 0 -and (Get-ActiveLabel) -eq 'A') ("active=$(Get-ActiveLabel) pings=$($script:pings -join ' | ') log=$logText")
+  # --now probes live; a scheduled tick uses the rewritten copy and does not probe.
+  $aProbes = if ($script:probes.ContainsKey('A')) { [int]$script:probes['A'] } else { 0 }
+  if ($forceNow) { Check '... and --now probed A live instead of reading the rewritten copy' ($aProbes -ge 1) ("probes=$aProbes") }
+  else { Check '... and the scheduled tick used the rewritten copy, with no live probe of A' ($aProbes -eq 0) ("probes=$aProbes") }
+}
+Reset-Case
+$global:ClaudeRotatorProbeOverride = $probeBefore; $script:pings = $pingsBefore
+
 # --- the claude wrapper's seat gate never blocks a credential command (every seat refused, the user adds a token) ---
 $gd = Join-Path $root 'gate'; $gh = Join-Path $gd 'home'; $ga = Join-Path $gh '.claude-cli-accounts'
 New-Item -ItemType Directory -Force -Path (Join-Path $ga 'B') | Out-Null
@@ -823,6 +1182,9 @@ Check 'rotations persisted the token through the mock only' (@($script:envWrites
 Check 'access rotation pinged sessions through the mock only' ($script:pings.Count -ge 1) ("pings=$($script:pings.Count)")
 $hkcuAfter = (Get-ItemProperty -Path 'HKCU:\Environment' -Name $EnvName -ErrorAction SilentlyContinue).$EnvName
 Check 'HKCU:\Environment is untouched' ($hkcuAfter -eq $hkcuBefore)
+} catch {
+  # A throw skips every check after it: it is a failure, never a silent ALL PASSED.
+  $fail++; Write-Host "  FAIL  the run threw, so the checks after it never ran: $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" -ForegroundColor Red
 } finally {
   foreach ($n in $envKeep.Keys) { [Environment]::SetEnvironmentVariable($n, $envKeep[$n], 'Process') }
   Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
