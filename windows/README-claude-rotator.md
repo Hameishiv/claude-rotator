@@ -563,7 +563,7 @@ more (the exclusions above still apply), un-archived ones included. Rolling back
 sessions again, kept ones included, and forgets `autoArchived`; redeploying this version does not bring them back:
 restore them from `.pruned-history-backups`. Opening the app while the sync is writing can undo an auto-archive; the next
 run then reads that as your un-archive and records the session as `kept`.
-The sync runs at Idle CPU priority and puts the caller's priority back when it ends (the rotator runs it in its own process).
+The sync runs at Idle CPU priority and puts the caller's priority back when it ends, including when it stops on an error (the rotator runs it in-process after a switch).
 
 1. **Substantive** (the only category kept by default) — not an automated dispatch (merge-pr /
    address-pr, review agents, ping tests, bare slash commands) and ≥ `-MinAssistant` assistant
@@ -601,7 +601,8 @@ whose uuid isn't in the transcript, sessions touched in the last 10 minutes, and
 since the sync read them are left alone. A record that can't be written or added, or an account folder
 that can't be created, is skipped with a warning and retried next run; the rest of the sync carries on. A record
 that can't be read is skipped too, but warned about only when the archive/pin step runs and the record was
-known from the last run; otherwise silently. Every record the sync writes or
+known from the last run, or (outside `-Quiet`) counted in the notice when no record matches the workspace;
+otherwise silently. Every record the sync writes or
 creates goes through a temp file and an atomic replace, so a killed run can't leave one half-written.
 
 **Archive and pin flags follow you across seats (2026-11-03).** Each seat keeps its own record
@@ -641,17 +642,54 @@ The script itself lives at `%USERPROFILE%\.grok\bin\sync-app-history.ps1` (the s
 there to deploy a change. `rotator-sync --pull` does not deploy it: it copies the file into the live rotator folder,
 which nothing runs it from, so a clean `rotator-sync --check` does not mean the running copy is current.
 
+Before deploying this version, save the absolute workspace path as a single unquoted UTF-8 line in
+`%USERPROFILE%\.claude\history-sync-workspace.txt`. The account-switch hook and the scheduled task
+read that file on each run. Use the spelling recorded by Claude Code, including a final backslash
+when the workspace is a share root and Claude Code recorded it with one.
+
+Run this PowerShell command and paste the path at the prompt.
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude" | Out-Null
+Set-Content -LiteralPath "$env:USERPROFILE\.claude\history-sync-workspace.txt" -Encoding utf8 -Value (Read-Host 'Workspace path')
+```
+
+For a workspace the desktop app has never used, start and save one session in the app on any account
+so the sync can reuse the app's workspace ID. Before replacing the installed script, run the checkout
+copy from the repo root in PowerShell. The preview runs at Idle priority in its own process.
+
+```powershell
+pwsh -NoProfile -Command {
+  (Get-Process -Id $PID).PriorityClass = 'Idle'
+  & .\windows\sync-app-history.ps1 -DryRun
+}
+```
+
+Confirm that the `WOULD: added … record(s) for …` summary names the intended workspace. If a CLI
+session that meets the copy rules above is missing from the app, the preview should plan an addition
+or a clone. Zero is expected when every eligible session is already present or none qualify. If the
+preview says `no transcripts`, check the path and that the workspace has CLI transcripts for this user.
+If it says `no app record on any seat has workspace`, the app has not recorded this path (letter case
+aside: new records take the spelling the app already uses on that seat, or the shared one where the
+seat has none): save one session for the workspace in the
+app, or correct the path to the app's spelling. If it says
+`no readable app record`, some records could not be read (the app may be writing them): close the
+app and run the preview again before changing the path.
+
+Manual runs can pass an absolute `-Cwd` to override the file. If neither is supplied, the sync stops
+before opening the app's session index.
+
 **The app reads its index at launch** — after a sync, new records appear when the app is
 restarted (or the workspace reopened), not in an already-open window.
 
 ```
-claude-sync-history                      # sync the default project (copy recent 7d + substantive; archive older)
+claude-sync-history                      # sync the configured workspace (copy recent 7d + substantive; archive older)
 claude-sync-history -DryRun              # preview what would be added/archived, change nothing
 claude-sync-history -MaxAgeDays 14       # widen/narrow the window (0 = copy all ages, no auto-archive); also the archive age:
                                          # a smaller value archives the sessions older than it on every seat; later runs with the default do not un-archive them (unless its transcript is written again: then it is revived)
 claude-sync-history -KeepResumable       # also keep interrupted / died-pre-merge runs
 claude-sync-history -MinAssistant 10     # stricter "substantive" bar
-claude-sync-history -Cwd 'C:\Dev\other'  # a different workspace
+claude-sync-history -Cwd 'C:\path\to\project'  # a different workspace
 ```
 
 - Script: `C:\Users\User\.grok\bin\sync-app-history.ps1`

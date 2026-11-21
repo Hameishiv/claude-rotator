@@ -26,67 +26,161 @@
   record after another record was written keeps its plain date (the failed record is written next run, the entry stays a date,
   and a resume revives it); an un-archive seen in a
   -MaxAgeDays 0 run is remembered too; a session of another cwd is left alone; a state file without the cli map plus an unreadable record auto-archives nothing.
-  Copies the LIVE app session index into a fresh sandbox under C:\Dev\Temp and runs the sync there with
+  Builds a synthetic app session index in a fresh sandbox and runs the sync there with
   %APPDATA% / %USERPROFILE% redirected, and -AssumeAppClosed (so the app-running check is skipped for the sandbox).
-  The real files are only read. The sandbox is deleted on success and kept (path printed) on failure. Exit 1 on
-  any failure. Each sync run takes ~1-2 min on a full index.
+  The sandbox is deleted on success and kept (path printed) on failure. Exit 1 on any failure.
     pwsh -File test-sync-app-history.ps1 [<path to sync-app-history.ps1>]
 #>
 $Script = if ($args[0]) { [string]$args[0] } else { Join-Path $PSScriptRoot 'sync-app-history.ps1' }
-$sb = "C:\Dev\Temp\sync-app-history-test\$(Get-Date -Format 'yyyyMMdd-HHmmss')-$PID"   # per run: the pid keeps runs started in the same second apart
-$proj = "$sb\home\.claude\projects\C--Dev-hameishiv"
-New-Item -ItemType Directory "$sb\app\Claude", $proj, "$sb\home\.claude-app-seats" -Force | Out-Null
-Copy-Item "$env:APPDATA\Claude\claude-code-sessions" "$sb\app\Claude\" -Recurse -Force
+$sb = Join-Path ([IO.Path]::GetTempPath()) "sync-app-history-test's-[fixture]-$([guid]::NewGuid())"
+# This path is only a transcript key. Keep its encoded directory name independent of TEMP.
+$workspace = [IO.Path]::Combine([IO.Path]::GetPathRoot($PSHOME), "sync-fixture's-[workspace]-café\NUL.txt\COM1\..$([char]0xAD)")
+$encoded = $workspace -creplace '[^A-Za-z0-9]', '-'
+$proj = "$sb\home\.claude\projects\$encoded"
+$ccs = "$sb\app\Claude\claude-code-sessions"
+New-Item -ItemType Directory $proj, "$sb\home\.claude-app-seats", $ccs -Force | Out-Null
+$fixtureSessions = @(1..4 | ForEach-Object { [guid]::NewGuid().ToString() })
+foreach ($seat in 'A','B','C') {
+  $folder = Join-Path (Join-Path $ccs $seat) 'fixture-workspace'
+  New-Item -ItemType Directory -Path $folder -Force | Out-Null
+  foreach ($cli in $fixtureSessions) {
+    $id = "local_$([guid]::NewGuid())"
+    @{ sessionId = $id; cliSessionId = $cli; cwd = $workspace; originCwd = $workspace
+       title = 'Synthetic session'; isArchived = $false } |
+      ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $folder "$id.json") -NoNewline
+  }
+}
 # One synthetic, recent, substantive transcript so the script has a session to create records for (pass 2).
-# The real index's transcripts are NOT copied, so nothing else is created or auto-archived.
+# It is the fixture workspace's only transcript, so nothing else is created or auto-archived.
 $X = [guid]::NewGuid().ToString()
 $asst = 1..7 | ForEach-Object { '{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok ' + $_ + '"}]}}' }
-Set-Content "$proj\$X.jsonl" (@('{"type":"user","message":{"role":"user","content":"please help me with the flag sync test"}}') + $asst)
+Set-Content -LiteralPath "$proj\$X.jsonl" (@('{"type":"user","message":{"role":"user","content":"please help me with the flag sync test"}}') + $asst)
 "sandbox: $sb"
-$ccs = "$sb\app\Claude\claude-code-sessions"; $statePath = "$sb\home\.claude-app-seats\.flag-state.json"
+$statePath = "$sb\home\.claude-app-seats\.flag-state.json"
+$workspaceFile = "$sb\home\.claude\history-sync-workspace.txt"
+$lockPath = "$sb\home\.claude-app-seats\.sync-history.lock"
 $fail = 0; $script:out = @(); $script:rc = 0
-function run([string]$extra = '') {
+$runSync = @'
+$env:APPDATA, $env:USERPROFILE, $scriptPath, $optionsJson = $args
+$options = ConvertFrom-Json -AsHashtable $optionsJson
+& $scriptPath -NoPrune -AssumeAppClosed @options *>&1
+'@
+function run([hashtable]$options = @{}) {
   # -NoPrune is a no-op now; passed so an old invocation is proven to still work
-  $script:out = @(pwsh -NoProfile -Command "`$env:APPDATA='$sb\app'; `$env:USERPROFILE='$sb\home'; & '$Script' -NoPrune -AssumeAppClosed $extra *>&1" 2>&1 | ForEach-Object { "$_" })
+  $json = ConvertTo-Json -InputObject $options -Compress
+  $script:out = @(pwsh -NoProfile -CommandWithArgs $runSync "$sb\app" "$sb\home" $Script $json 2>&1 | ForEach-Object { "$_" })
   $script:rc = $LASTEXITCODE
   $script:out | Where-Object { $_ -match '^set |^WOULD |isArchived|isStarred|auto-archiv|not synced|rror|xception|WARNING|added \d' } | ForEach-Object { "    $_" }
 }
 function check($name, $ok) { if ($ok) { "PASS $name" } else { "FAIL $name"; $script:fail++ } }
 function key($f) { $f.Substring($ccs.Length).TrimStart('\') }
-function recs { Get-ChildItem $ccs -Recurse -Filter local_*.json | ForEach-Object { try { $j = Get-Content $_.FullName -Raw | ConvertFrom-Json } catch { return }; [pscustomobject]@{ f = $_.FullName; id = $j.sessionId; cli = [string]$j.cliSessionId; arch = [bool]$j.isArchived; star = [bool]$j.isStarred; title = [string]$j.title } } | Where-Object cli }
-function setRec($f, $k, $v) { $j = Get-Content $f -Raw | ConvertFrom-Json; $j | Add-Member -NotePropertyName $k -NotePropertyValue $v -Force; Set-Content $f ($j | ConvertTo-Json -Compress -Depth 100) -NoNewline }
-function recHash { (Get-ChildItem $ccs -Recurse -Filter local_*.json | Sort-Object FullName | ForEach-Object { "$($_.FullName):$((Get-FileHash $_.FullName -Algorithm MD5).Hash)" }) -join '|' }
-function state { Get-Content $statePath -Raw | ConvertFrom-Json -AsHashtable }
+function recs { Get-ChildItem -LiteralPath $ccs -Recurse -Filter local_*.json | ForEach-Object { try { $j = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } catch { return }; [pscustomobject]@{ f = $_.FullName; id = $j.sessionId; cli = [string]$j.cliSessionId; arch = [bool]$j.isArchived; star = [bool]$j.isStarred; title = [string]$j.title } } | Where-Object cli }
+function setRec($f, $k, $v) { $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json; $j | Add-Member -NotePropertyName $k -NotePropertyValue $v -Force; Set-Content -LiteralPath $f ($j | ConvertTo-Json -Compress -Depth 100) -NoNewline }
+function recHash { (Get-ChildItem -LiteralPath $ccs -Recurse -Filter local_*.json | Sort-Object FullName | ForEach-Object { "$($_.FullName):$((Get-FileHash -LiteralPath $_.FullName -Algorithm MD5).Hash)" }) -join '|' }
+function state { Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable }
 function mixed($R, $p) { @($R | Group-Object cli | Where-Object { ($_.Group.$p -contains $true) -and ($_.Group.$p -contains $false) }).Count }
 function ofSession($cli) { @(recs | Where-Object { $_.cli -eq $cli }) }
 # An old (30-day, or $days) substantive session with an unflagged record next to each of the synthetic session's records.
 function mkOld([int]$days = 30) {
   $o = [guid]::NewGuid().ToString()
-  Set-Content "$proj\$o.jsonl" (@('{"type":"user","message":{"role":"user","content":"an old session for the auto-archive test"}}') + $asst)
-  (Get-Item "$proj\$o.jsonl").LastWriteTime = (Get-Date).AddDays(-$days)
+  Set-Content -LiteralPath "$proj\$o.jsonl" (@('{"type":"user","message":{"role":"user","content":"an old session for the auto-archive test"}}') + $asst)
+  (Get-Item -LiteralPath "$proj\$o.jsonl").LastWriteTime = (Get-Date).AddDays(-$days)
   foreach ($r in (ofSession $X)) {
-    $j = Get-Content $r.f -Raw | ConvertFrom-Json
+    $j = Get-Content -LiteralPath $r.f -Raw | ConvertFrom-Json
     $j.sessionId = "local_$([guid]::NewGuid())"; $j.cliSessionId = $o
     $j | Add-Member -NotePropertyName isArchived -NotePropertyValue $false -Force; $j.PSObject.Properties.Remove('isStarred')
-    Set-Content (Join-Path (Split-Path $r.f) "$($j.sessionId).json") ($j | ConvertTo-Json -Compress -Depth 100) -NoNewline
+    Set-Content -LiteralPath (Join-Path (Split-Path -LiteralPath $r.f) "$($j.sessionId).json") ($j | ConvertTo-Json -Compress -Depth 100) -NoNewline
   }
   $o
 }
 # move a session's transcript write time to $days days ago (0 = now)
-function touch($cli, [double]$days) { (Get-Item "$proj\$cli.jsonl").LastWriteTime = (Get-Date).AddDays(-$days) }
+function touch($cli, [double]$days) { (Get-Item -LiteralPath "$proj\$cli.jsonl").LastWriteTime = (Get-Date).AddDays(-$days) }
 function autoVal($cli) { [string](state)['autoArchived'][$cli] }
 function autoDone($cli) { $a = (state)['autoArchived']; [bool]($a -and $a.ContainsKey($cli)) }
 # is this record's sessionId in its folder's archived-sessions.idx?
-function inIdx($r) { $p = Join-Path (Split-Path $r.f) 'archived-sessions.idx'; (Test-Path $p) -and (@((Get-Content $p -Raw | ConvertFrom-Json).archived) -contains $r.id) }
+function inIdx($r) { $p = Join-Path (Split-Path -LiteralPath $r.f) 'archived-sessions.idx'; (Test-Path -LiteralPath $p) -and (@((Get-Content -LiteralPath $p -Raw | ConvertFrom-Json).archived) -contains $r.id) }
 
-# The live index already agrees across seats, so plant a disagreement for the first run to resolve.
+$initialIndex = recHash
+run @{ Quiet = $true }
+check 'a missing workspace setting fails before writing state' ($rc -ne 0 -and ($out -match 'No history sync workspace is configured') -and -not (Test-Path -LiteralPath $lockPath) -and (recHash) -eq $initialIndex)
+[IO.File]::WriteAllBytes($workspaceFile, [byte[]](0x43, 0x3A, 0x5C, 0xE9))
+run @{ Quiet = $true }
+check 'a non-UTF-8 setting fails before writing state' ($rc -ne 0 -and ($out -match 'as UTF-8') -and -not (Test-Path -LiteralPath $lockPath) -and (recHash) -eq $initialIndex)
+$invalidWorkspaces = @(
+  'relative-path'
+  ($workspace + '"')
+  ($workspace + ':archive')
+  ($workspace + ' ')
+  ($workspace + '.')
+  '\\?\UNC\?\C:\x'
+  '\\server\share:stream\workspace'
+  '\\server\sh*re\workspace'
+  '\\server'
+  '\\?\C:project'
+  '\\?\C:\draft\..\release'
+  '\\?\C:\draft\.\release'
+  '\\?\C:\work/project'
+  '\\?\C:\work\\project'
+  '\\?\\UNC\server\share\repo'
+  '\\.\C:\work\trailing.'
+  '//?/C:/work/project'
+  'C:\work\NUL'
+  '\\?\'
+  '\\.\'
+  '\\.\pipe\history'
+  '\\localhost\pipe\history'
+  '\\localhost\pipe.\history'
+  '\\localhost\pipe \history'
+  '\\localhost\mailslot\history'
+  '\\?\UNC\localhost\MAILSLOT.\history'
+  '\\localhost\IPC$\history'
+  '\\?\UNC\localhost\PIPE\history'
+  '\\?\Volume{00000000-0000-0000-0000-000000000000}\work'
+)
+foreach ($invalidWorkspace in $invalidWorkspaces) {
+  Set-Content -LiteralPath $workspaceFile $invalidWorkspace
+  run @{ Quiet = $true }
+  check "an invalid workspace setting ($invalidWorkspace) fails before writing state" ($rc -ne 0 -and ($out -match 'Use a valid absolute Windows workspace path') -and -not (Test-Path -LiteralPath $lockPath) -and (recHash) -eq $initialIndex)
+}
+$overrideWorkspace = $workspace.Replace('\', '/') + '/ignored/.././'
+run @{ Cwd = $overrideWorkspace; DryRun = $true }
+check 'an explicit workspace overrides an invalid setting and plans additions on all three seats' ($rc -eq 0 -and ($out -match '^WOULD: added 3,') -and (recHash) -eq $initialIndex)
+run @{ Cwd = '\\history-sync-fixture.invalid\share\PROJEC~1'; DryRun = $true }
+check 'a valid UNC workspace with no local transcripts can be previewed' ($rc -eq 0 -and ($out -match '^no transcripts') -and (recHash) -eq $initialIndex)
+# Transcripts but no app record for that exact path: the preview says why nothing is planned.
+$unrecorded = $workspace + 'unrecorded'
+$unrecordedProj = "$sb\home\.claude\projects\$($unrecorded -creplace '[^A-Za-z0-9]', '-')"
+$null = New-Item -ItemType Directory -Path $unrecordedProj -Force
+Copy-Item -LiteralPath "$proj\$X.jsonl" -Destination "$unrecordedProj\$([guid]::NewGuid()).jsonl"
+run @{ Cwd = $unrecorded; DryRun = $true }
+check 'a workspace with transcripts but no app record says so' ($rc -eq 0 -and ($out -match '^no app record on any seat has workspace') -and ($out -match '^WOULD: added 0,') -and (recHash) -eq $initialIndex)
+run @{ Cwd = $unrecorded; DryRun = $true; Quiet = $true }
+check 'the no-app-record notice stays silent under -Quiet' ($rc -eq 0 -and -not ($out -match 'no app record') -and (recHash) -eq $initialIndex)
+# An unreadable record could be the matching one: the notice says so instead of blaming the path.
+$brokenRec = Join-Path (Get-ChildItem -LiteralPath (Get-ChildItem -LiteralPath $ccs -Directory | Select-Object -First 1).FullName -Directory | Select-Object -First 1).FullName 'broken-record.json'
+Set-Content -LiteralPath $brokenRec '{"cwd":' -NoNewline
+run @{ Cwd = $unrecorded; DryRun = $true }
+check 'an unreadable record turns the notice into a retry-after-the-app-closes hint' ($rc -eq 0 -and ($out -match '^no readable app record on any seat has workspace .*\(1 record\(s\) could not be read\): retry after the desktop app closes') -and (recHash) -eq $initialIndex)
+run @{ Cwd = $unrecorded; DryRun = $true; Quiet = $true }
+check 'the unreadable-record notice stays silent under -Quiet' ($rc -eq 0 -and -not ($out -match 'app record') -and (recHash) -eq $initialIndex)
+Remove-Item -LiteralPath $brokenRec -Force
+Remove-Item -LiteralPath $unrecordedProj -Recurse -Force
+Set-Content -LiteralPath $workspaceFile "$workspace\"
+
+# The sandbox index agrees across seats, so plant a disagreement for the first run to resolve.
 $U = recs | Where-Object { $_.cli -ne $X } | Group-Object cli | Where-Object { $_.Count -ge 2 -and -not ($_.Group.star -contains $true) -and -not ($_.Group.arch -contains $true) } | Select-Object -First 1
 if (-not $U) { "FAIL no unflagged multi-seat session in the index to test with"; exit 1 }
 setRec $U.Group[0].f 'isArchived' $true
+# Run 1 reads a setting saved the way Windows PowerShell 5.1 saves it (UTF-8 with a BOM, CRLF) and
+# spelled in a different case from the app's records: new records must still carry the app's spelling.
+[IO.File]::WriteAllBytes($workspaceFile, [byte[]](0xEF, 0xBB, 0xBF) + [Text.Encoding]::UTF8.GetBytes("$($workspace.ToLowerInvariant())\`r`n"))
 "--- run 1 (baseline: first run, no state file)"; run; $R = recs
+Set-Content -LiteralPath $workspaceFile "$workspace\"
+$newCwds = @(Get-ChildItem -LiteralPath $ccs -Recurse -Filter local_*.json | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.cliSessionId -eq $X } | ForEach-Object { $_.cwd; $_.originCwd })
+check 'a BOM, CRLF, differently cased setting is read, and new records keep the app''s spelling' ($newCwds.Count -ge 4 -and @($newCwds | Where-Object { -not [string]::Equals($_, $workspace, [StringComparison]::Ordinal) }).Count -eq 0)
 check "first run: archived on one seat -> archived on all $($U.Count)" (@(ofSession $U.Name | Where-Object { -not $_.arch }).Count -eq 0)
 check 'run 1 exits 0' ($rc -eq 0)
-check 'state file written' (Test-Path $statePath)
+check 'state file written' (Test-Path -LiteralPath $statePath)
 check 'every record of a session with any archived record is archived' ((mixed $R 'arch') -eq 0)
 check 'every record of a session with any starred record is starred' ((mixed $R 'star') -eq 0)
 check "synthetic session got records ($(@($R | Where-Object cli -eq $X).Count))" (@($R | Where-Object cli -eq $X).Count -ge 2)
@@ -97,21 +191,21 @@ check "idle run prints no 'set ' line, no error" (-not ($out -match '^set |rror|
 check 'state file has the autoArchived map' ((state).ContainsKey('autoArchived'))
 
 "--- a state file from before auto-archive (no autoArchived map) loads"
-$st = state; $st.Remove('autoArchived'); Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5); run
+$st = state; $st.Remove('autoArchived'); Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5); run
 check 'pre-change state: no warning, exits 0' (-not ($out -match 'unreadable') -and $rc -eq 0)
 check 'pre-change state: the map is added' ((state).ContainsKey('autoArchived'))
 "--- a malformed autoArchived map fails like the other maps: warn, change nothing, leave the file"
-$st = state; $st['autoArchived'] = 'x'; Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
-$bad = Get-Content $statePath -Raw; $h = recHash; run
+$st = state; $st['autoArchived'] = 'x'; Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+$bad = Get-Content -LiteralPath $statePath -Raw; $h = recHash; run
 check 'malformed map: warns' ([bool]($out -match "'autoArchived' is not an object"))
-check 'malformed map: no record changed, file left as is' ((recHash) -eq $h -and (Get-Content $statePath -Raw) -eq $bad)
-$st = state; $st['autoArchived'] = @{}; Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+check 'malformed map: no record changed, file left as is' ((recHash) -eq $h -and (Get-Content -LiteralPath $statePath -Raw) -eq $bad)
+$st = state; $st['autoArchived'] = @{}; Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
 
 "--- a .sync-tmp left by a killed run is removed"
-$leftover = "$((Get-ChildItem $ccs -Recurse -Filter local_*.json | Select-Object -First 1).FullName).sync-tmp"; Set-Content $leftover 'x' -NoNewline; run
-check 'leftover .sync-tmp removed' (-not (Test-Path $leftover))
+$leftover = "$((Get-ChildItem -LiteralPath $ccs -Recurse -Filter local_*.json | Select-Object -First 1).FullName).sync-tmp"; Set-Content -LiteralPath $leftover 'x' -NoNewline; run
+check 'leftover .sync-tmp removed' (-not (Test-Path -LiteralPath $leftover))
 
-# a real multi-seat session, nothing flagged, for the pin / archive tests
+# An unflagged multi-seat session for the pin / archive tests.
 $G = recs | Where-Object { $_.cli -ne $X } | Group-Object cli | Where-Object { $_.Count -ge 2 -and -not ($_.Group.star -contains $true) -and -not ($_.Group.arch -contains $true) } | Sort-Object Count -Descending | Select-Object -First 1
 if (-not $G) { "FAIL no unflagged multi-seat session in the index to test with"; exit 1 }
 $g0 = $G.Group[0]; $g1 = $G.Group[1]
@@ -136,7 +230,7 @@ check "un-archived: removed from every folder's archived-sessions.idx" (@(ofSess
 # seats were recorded differently: seat 0 was 'on' (now off), seat 1 was 'off' (now on).
 $st = state
 foreach ($fl in 'isArchived', 'isStarred') { $st[$fl][(key $g0.f)] = $true; $st[$fl][(key $g1.f)] = $false; setRec $g0.f $fl $false; setRec $g1.f $fl $true }
-Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5); run
+Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5); run
 $S = ofSession $G.Name
 check 'on wins: archived on every seat' (@($S | Where-Object { -not $_.arch }).Count -eq 0)
 check 'on wins: starred on every seat' (@($S | Where-Object { -not $_.star }).Count -eq 0)
@@ -144,11 +238,11 @@ foreach ($r in $S) { setRec $r.f 'isArchived' $false; setRec $r.f 'isStarred' $f
 check 'reset: nothing flagged on that session' (@(ofSession $G.Name | Where-Object { $_.arch -or $_.star }).Count -eq 0)
 
 "--- a record not seen last run that is ON spreads (archived on a newly used seat)"
-$st = state; $st['isArchived'].Remove((key $g1.f)); Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+$st = state; $st['isArchived'].Remove((key $g1.f)); Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
 setRec $g1.f 'isArchived' $true; run
 check 'unseen archived record -> archived on every seat' (@(ofSession $G.Name | Where-Object { -not $_.arch }).Count -eq 0)
 "--- a record not seen last run that is OFF does not un-archive the others (a new app record starts off)"
-$st = state; $st['isArchived'].Remove((key $g0.f)); Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+$st = state; $st['isArchived'].Remove((key $g0.f)); Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
 setRec $g0.f 'isArchived' $false; run
 check 'unseen off record -> still archived on every seat' (@(ofSession $G.Name | Where-Object { -not $_.arch }).Count -eq 0)
 foreach ($r in (ofSession $G.Name)) { setRec $r.f 'isArchived' $false }; run
@@ -177,12 +271,12 @@ foreach ($r in (ofSession $G.Name)) { setRec $r.f 'isArchived' $true }; run     
 $keep1 = Get-Content -LiteralPath $g1.f -Raw
 if ($H) { setRec $H.Group[0].f 'isStarred' $true }                                     # another session changed in the same run
 $x0 = (ofSession $X)[0]; setRec $x0.f 'isStarred' $true                               # a change the save must record
-$stHash = (Get-FileHash $statePath).Hash
+$stHash = (Get-FileHash -LiteralPath $statePath).Hash
 setRec $g0.f 'isArchived' $false; Set-Content -LiteralPath $g1.f 'not json' -NoNewline; run   # un-archive on seat 0; seat 1 unreadable
 check 'unreadable record warns' ($out -match 'could not read')
 $st = state
 check 'unreadable record: its session keeps its last baseline' ($st['isArchived'][(key $g0.f)] -eq $true -and $st['isArchived'][(key $g1.f)] -eq $true)
-check 'unreadable record: the rest of the state is saved (not the whole-save stop)' ((-not ($out -match 'is not saved this run')) -and ((Get-FileHash $statePath).Hash -ne $stHash) -and $st['isStarred'][(key $x0.f)] -eq $true -and $st['cli'] -and $st['cli'][(key $g1.f)] -eq $G.Name)
+check 'unreadable record: the rest of the state is saved (not the whole-save stop)' ((-not ($out -match 'is not saved this run')) -and ((Get-FileHash -LiteralPath $statePath).Hash -ne $stHash) -and $st['isStarred'][(key $x0.f)] -eq $true -and $st['cli'] -and $st['cli'][(key $g1.f)] -eq $G.Name)
 if ($H) {
   check 'unreadable record: another session changed in the same run is saved' (@(ofSession $H.Name | Where-Object { $st['isStarred'][(key $_.f)] -ne $true }).Count -eq 0)
   foreach ($r in (ofSession $H.Name)) { setRec $r.f 'isStarred' $false }
@@ -193,10 +287,10 @@ check 'readable again: un-archived on every seat, not re-archived' (@(ofSession 
 
 "--- a flag write in the same run as pass 1.5's reconcile: the records the flag pass just wrote are reconciled too"
 # give the transcript real turn ids and an age past pass 1.5's 10-minute window, for this scenario only
-$tPath = "$proj\$X.jsonl"; $tOrig = Get-Content $tPath -Raw
+$tPath = "$proj\$X.jsonl"; $tOrig = Get-Content -LiteralPath $tPath -Raw
 $tu = 1..7 | ForEach-Object { '00000000-0000-0000-0000-00000000000' + $_ }
-Set-Content $tPath (@('{"type":"user","message":{"role":"user","content":"please help me with the flag sync test"}}') + ($tu | ForEach-Object { '{"parentUuid":null,"type":"assistant","uuid":"' + $_ + '","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}' }))
-(Get-Item $tPath).LastWriteTime = (Get-Date).AddMinutes(-30)
+Set-Content -LiteralPath $tPath (@('{"type":"user","message":{"role":"user","content":"please help me with the flag sync test"}}') + ($tu | ForEach-Object { '{"parentUuid":null,"type":"assistant","uuid":"' + $_ + '","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}' }))
+(Get-Item -LiteralPath $tPath).LastWriteTime = (Get-Date).AddMinutes(-30)
 $xs = @(ofSession $X)
 setRec $xs[0].f 'lastAssistantUuid' $tu[6]; foreach ($r in ($xs | Select-Object -Skip 1)) { setRec $r.f 'lastAssistantUuid' $tu[2] }
 setRec $xs[0].f 'isStarred' $true; run
@@ -204,21 +298,21 @@ check 'flag write + pass 1.5: run exits 0' ($rc -eq 0)
 check 'flag write + pass 1.5: no error' (-not ($out -match 'Method invocation|op_Subtraction|xception'))
 check 'flag write + pass 1.5: pass 2 still ran' ([bool]($out -match '\badded \d+, cloned'))
 check 'flag write + pass 1.5: no record mistaken for an outside change' (-not ($out -match 'left .* alone'))
-$after = @(ofSession $X | ForEach-Object { Get-Content $_.f -Raw | ConvertFrom-Json })
+$after = @(ofSession $X | ForEach-Object { Get-Content -LiteralPath $_.f -Raw | ConvertFrom-Json })
 check "flag write + pass 1.5: every record reconciled to the last turn ($($after.Count) records)" ($after.Count -ge 2 -and -not ($after | Where-Object { $_.lastAssistantUuid -ne $tu[6] }))
 check 'flag write + pass 1.5: every record pinned' (-not ($after | Where-Object { -not $_.isStarred }))
 "--- a record pass 1.5 can't write is skipped with a warning; the run still finishes and pass 2 still runs"
 $xs = @(ofSession $X)
 foreach ($r in ($xs | Select-Object -Skip 1)) { setRec $r.f 'lastAssistantUuid' $tu[2] }
-(Get-Item $tPath).LastWriteTime = (Get-Date).AddMinutes(-30)
+(Get-Item -LiteralPath $tPath).LastWriteTime = (Get-Date).AddMinutes(-30)
 (Get-Item -LiteralPath $xs[1].f).IsReadOnly = $true; run
 check 'unwritable reconcile: run exits 0' ($rc -eq 0)
 check 'unwritable reconcile: warned' ([bool]($out -match 'could not reconcile'))
 check 'unwritable reconcile: pass 2 still ran' ([bool]($out -match '\badded \d+, cloned'))
-check 'unwritable reconcile: other records reconciled' (-not (@(ofSession $X | Where-Object { $_.f -ne $xs[1].f } | ForEach-Object { Get-Content $_.f -Raw | ConvertFrom-Json }) | Where-Object { $_.lastAssistantUuid -ne $tu[6] }))
-check 'unwritable reconcile: no temp file left' (-not (Get-ChildItem -LiteralPath (Split-Path $xs[1].f) -Filter '*.sync-tmp'))
+check 'unwritable reconcile: other records reconciled' (-not (@(ofSession $X | Where-Object { $_.f -ne $xs[1].f } | ForEach-Object { Get-Content -LiteralPath $_.f -Raw | ConvertFrom-Json }) | Where-Object { $_.lastAssistantUuid -ne $tu[6] }))
+check 'unwritable reconcile: no temp file left' (-not (Get-ChildItem -LiteralPath (Split-Path -LiteralPath $xs[1].f) -Filter '*.sync-tmp'))
 (Get-Item -LiteralPath $xs[1].f).IsReadOnly = $false
-Set-Content $tPath $tOrig -NoNewline
+Set-Content -LiteralPath $tPath $tOrig -NoNewline
 foreach ($r in (ofSession $X)) { setRec $r.f 'lastAssistantUuid' ''; setRec $r.f 'isStarred' $false }; run
 
 "--- a held session's new record is neutral (off) and not in the state; the next good run sets it"
@@ -230,7 +324,7 @@ check "held: a record was recreated ($($new.Count))" ($new.Count -ge 1)
 check 'held: the recreated record is neither archived nor pinned' (@($new | Where-Object { $_.arch -or $_.star }).Count -eq 0)
 $st = state; check 'held: the recreated record is not in the saved state' (@($new | Where-Object { $st['isArchived'].ContainsKey((key $_.f)) }).Count -eq 0)
 Set-Content -LiteralPath $xs[1].f $keepX -NoNewline
-$new | Where-Object { (Split-Path $_.f) -eq (Split-Path $xs[1].f) } | ForEach-Object { Remove-Item -LiteralPath $_.f }   # the duplicate next to the unreadable record (issue #12)
+$new | Where-Object { (Split-Path -LiteralPath $_.f) -eq (Split-Path -LiteralPath $xs[1].f) } | ForEach-Object { Remove-Item -LiteralPath $_.f }   # the duplicate next to the unreadable record (issue #12)
 run
 check 'held, next good run: every record of the session is archived' (@(ofSession $X | Where-Object { -not $_.arch }).Count -eq 0)
 foreach ($r in (ofSession $X)) { setRec $r.f 'isArchived' $false }; run
@@ -246,15 +340,15 @@ check 'empty record, restored: un-archived on every seat, not re-archived' (@(of
 
 "--- the desktop app is running: no record is changed and the state is not saved"
 setRec $g0.f 'isArchived' $true
-$h = recHash; $stBefore = Get-Content $statePath -Raw; run '-AssumeAppRunning'
+$h = recHash; $stBefore = Get-Content -LiteralPath $statePath -Raw; run @{ AssumeAppRunning = $true }
 check 'app running: says flags are not synced' ($out -match 'not synced: the desktop app .*is running')
 check 'app running: no record changed' ((recHash) -eq $h)
-check 'app running: state file not saved' ((Get-Content $statePath -Raw) -eq $stBefore)
+check 'app running: state file not saved' ((Get-Content -LiteralPath $statePath -Raw) -eq $stBefore)
 setRec $g0.f 'isArchived' $false
 
 "--- a record created while the app is running is neutral (off), so it can't count as a change next run"
 $xs = @(ofSession $X); foreach ($r in $xs) { setRec $r.f 'isArchived' $true; setRec $r.f 'isStarred' $true }
-$before = @($xs.f); Remove-Item -LiteralPath $xs[0].f; run '-AssumeAppRunning'
+$before = @($xs.f); Remove-Item -LiteralPath $xs[0].f; run @{ AssumeAppRunning = $true }
 $new = @(ofSession $X | Where-Object { $before -notcontains $_.f -or $_.f -eq $xs[0].f })
 check "app running: a record was recreated for the synthetic session ($($new.Count))" ($new.Count -ge 1)
 check 'app running: the recreated record is neither archived nor pinned' (@($new | Where-Object { $_.arch -or $_.star }).Count -eq 0)
@@ -262,11 +356,11 @@ run; foreach ($r in (ofSession $X)) { setRec $r.f 'isArchived' $false; setRec $r
 check 'reset: synthetic session unflagged' (@(ofSession $X | Where-Object { $_.arch -or $_.star }).Count -eq 0)
 
 "--- a state file from before the record->session map: an unreadable record stops the whole save"
-$st = state; $st.Remove('cli'); Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
-$stBefore = Get-Content $statePath -Raw; $keep1 = Get-Content -LiteralPath $g1.f -Raw
+$st = state; $st.Remove('cli'); Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+$stBefore = Get-Content -LiteralPath $statePath -Raw; $keep1 = Get-Content -LiteralPath $g1.f -Raw
 Set-Content -LiteralPath $g1.f 'not json' -NoNewline; run
 check 'old state file: says the state is not saved' ($out -match 'is not saved this run')
-check 'old state file: state file unchanged' ((Get-Content $statePath -Raw) -eq $stBefore)
+check 'old state file: state file unchanged' ((Get-Content -LiteralPath $statePath -Raw) -eq $stBefore)
 Set-Content -LiteralPath $g1.f $keep1 -NoNewline; run
 check 'old state file: the next good run adds the map' ([bool](state)['cli'])
 
@@ -280,15 +374,15 @@ check 'deleted record: dropped from the saved state' (-not (state)['isArchived']
 Set-Content -LiteralPath $gd.f $keepD -NoNewline; run
 
 "--- corrupt state file: warn, change nothing, leave the file as is"
-$good = Get-Content $statePath -Raw
+$good = Get-Content -LiteralPath $statePath -Raw
 setRec $g0.f 'isArchived' $true          # a real change that a healthy run would spread to every seat
-Set-Content $statePath 'not json' -NoNewline
+Set-Content -LiteralPath $statePath 'not json' -NoNewline
 $h = recHash; run
 check 'warns about the state file' (($out -match 'WARNING.*unreadable|unreadable.*not synced') -and ($out -match [regex]::Escape('.flag-state.json')))
 check 'no record changed' ((recHash) -eq $h)
-check 'state file left as is' ((Get-Content $statePath -Raw) -eq 'not json')
+check 'state file left as is' ((Get-Content -LiteralPath $statePath -Raw) -eq 'not json')
 check 'corrupt state does not fail the run' ($rc -eq 0)
-Set-Content $statePath $good -NoNewline; setRec $g0.f 'isArchived' $false
+Set-Content -LiteralPath $statePath $good -NoNewline; setRec $g0.f 'isArchived' $false
 
 "--- missing ~\.claude-app-seats directory (a first run again: pinned on one seat -> pinned on all)"
 setRec $g0.f 'isStarred' $true
@@ -296,7 +390,7 @@ Remove-Item -LiteralPath "$sb\home\.claude-app-seats" -Recurse -Force
 run
 check 'first run again: starred on every seat' (@(ofSession $G.Name | Where-Object { -not $_.star }).Count -eq 0)
 check 'run succeeds' ($rc -eq 0 -and -not ($out -match 'rror|xception'))
-check 'state file exists again' (Test-Path $statePath)
+check 'state file exists again' (Test-Path -LiteralPath $statePath)
 
 "--- a record the script clones from another seat carries the flags"
 $RX = ofSession $X
@@ -306,7 +400,7 @@ if ($RX.Count -ge 2) {
   setRec $a.f 'isArchived' $true; setRec $a.f 'isStarred' $true
   run
   $S = ofSession $X
-  $new = @($S | Where-Object { $_.f -ne $a.f -and (Split-Path $_.f) -eq (Split-Path $b.f) })
+  $new = @($S | Where-Object { $_.f -ne $a.f -and (Split-Path -LiteralPath $_.f) -eq (Split-Path -LiteralPath $b.f) })
   check 'the deleted record was re-created' ($new.Count -eq 1 -and $S.Count -eq $RX.Count)
   check 'every record of the session archived + starred' (@($S | Where-Object { -not ($_.arch -and $_.star) }).Count -eq 0)
   $st = state
@@ -329,7 +423,7 @@ if ($RX.Count -ge 1) {
 }
 
 "--- auto-archive: an old session is archived on every seat; no record moves or disappears"
-$O1 = mkOld; $paths = @((Get-ChildItem $ccs -Recurse -Filter local_*.json).FullName); run
+$O1 = mkOld; $paths = @((Get-ChildItem -LiteralPath $ccs -Recurse -Filter local_*.json).FullName); run
 $S = ofSession $O1
 check "old session: archived on every seat ($($S.Count))" ($S.Count -ge 2 -and @($S | Where-Object { -not $_.arch }).Count -eq 0)
 check "old session: in every folder's archived-sessions.idx" (@($S | Where-Object { -not (inIdx $_) }).Count -eq 0)
@@ -342,10 +436,10 @@ setRec $S[0].f 'isArchived' $false; run; run
 check 'un-archived on every seat and still so two runs later' (@(ofSession $O1 | Where-Object arch).Count -eq 0)
 
 "--- the app being open defers auto-archive to the next run"
-$O2 = mkOld; run '-AssumeAppRunning'
+$O2 = mkOld; run @{ AssumeAppRunning = $true }
 check 'app open: old session not archived' (@(ofSession $O2 | Where-Object arch).Count -eq 0)
 check 'app open: not marked done' (-not (autoDone $O2))
-run '-DryRun'
+run @{ DryRun = $true }
 check 'dry run: reports it WOULD auto-archive 1 session' ([bool]($out -match '^WOULD auto-archive 1 session'))
 check 'dry run: nothing archived' (@(ofSession $O2 | Where-Object arch).Count -eq 0)
 run
@@ -358,7 +452,7 @@ check 'pinned old session: pinned on every seat' (@(ofSession $O3 | Where-Object
 check 'pinned old session: archived on none, not marked done' (@(ofSession $O3 | Where-Object arch).Count -eq 0 -and -not (autoDone $O3))
 
 "--- a held session (a record it had can't be read) is not auto-archived or marked done, and is retried"
-$O4 = mkOld; run '-MaxAgeDays 0'                                      # its records join the baseline; 0 = auto-archive off
+$O4 = mkOld; run @{ MaxAgeDays = 0 }                                      # its records join the baseline; 0 = auto-archive off
 check '-MaxAgeDays 0: not archived' (@(ofSession $O4 | Where-Object arch).Count -eq 0 -and -not (autoDone $O4))
 $r4 = @(ofSession $O4); $raw4 = Get-Content -LiteralPath $r4[1].f -Raw; Set-Content -LiteralPath $r4[1].f 'not json' -NoNewline; run   # not $o4: PowerShell names ignore case
 check 'held: warns' ([bool]($out -match 'could not read'))
@@ -368,7 +462,7 @@ check 'retried: archived on every seat and marked done' (@(ofSession $O4 | Where
 check 'run succeeds' ($rc -eq 0 -and -not ($out -match 'rror|xception'))
 
 "--- an old session the user un-archived since the last run is not archived, and is remembered"
-$O5 = mkOld; foreach ($r in (ofSession $O5)) { setRec $r.f 'isArchived' $true }; run '-MaxAgeDays 0'   # archived on every seat, all known, not marked done
+$O5 = mkOld; foreach ($r in (ofSession $O5)) { setRec $r.f 'isArchived' $true }; run @{ MaxAgeDays = 0 }   # archived on every seat, all known, not marked done
 check 'user-off: setup: archived everywhere, not marked done' (@(ofSession $O5 | Where-Object { -not $_.arch }).Count -eq 0 -and -not (autoDone $O5))
 setRec (ofSession $O5)[0].f 'isArchived' $false; run
 check 'user-off: un-archived on every seat' (@(ofSession $O5 | Where-Object arch).Count -eq 0)
@@ -390,12 +484,12 @@ check 'other cwd: not archived' (@(ofSession $O7 | Where-Object arch).Count -eq 
 check 'other cwd: not remembered as done' (-not (autoDone $O7))
 
 "--- a state file without the record->session map plus an unreadable record: nothing is auto-archived, autoArchived is not changed"
-$O8 = mkOld; run '-MaxAgeDays 0'                                     # its records join the baseline
-$st = state; $st.Remove('cli'); Set-Content $statePath ($st | ConvertTo-Json -Compress -Depth 5)
-$stBefore = Get-Content $statePath -Raw; $r8 = @(ofSession $O8); $raw8 = Get-Content -LiteralPath $r8[1].f -Raw
+$O8 = mkOld; run @{ MaxAgeDays = 0 }                                     # its records join the baseline
+$st = state; $st.Remove('cli'); Set-Content -LiteralPath $statePath ($st | ConvertTo-Json -Compress -Depth 5)
+$stBefore = Get-Content -LiteralPath $statePath -Raw; $r8 = @(ofSession $O8); $raw8 = Get-Content -LiteralPath $r8[1].f -Raw
 Set-Content -LiteralPath $r8[1].f 'not json' -NoNewline; run
 check 'no cli map + unreadable record: not archived, not remembered' (@(ofSession $O8 | Where-Object arch).Count -eq 0 -and -not (autoDone $O8))
-check 'no cli map + unreadable record: state file (autoArchived) unchanged' ((Get-Content $statePath -Raw) -eq $stBefore)
+check 'no cli map + unreadable record: state file (autoArchived) unchanged' ((Get-Content -LiteralPath $statePath -Raw) -eq $stBefore)
 Set-Content -LiteralPath $r8[1].f $raw8 -NoNewline; run
 check 'no cli map, record readable again: archived on every seat and remembered' (@(ofSession $O8 | Where-Object { -not $_.arch }).Count -eq 0 -and (autoDone $O8))
 
@@ -411,7 +505,7 @@ check 'young, then aged: still remembered' (autoDone $Y)
 
 "--- an un-archive the sync sees in a run that is out of scope (-MaxAgeDays 0) is remembered too"
 $YA = mkOld 1; foreach ($r in (ofSession $YA)) { setRec $r.f 'isArchived' $true }; run   # archived on every seat by hand; young, so not due
-setRec (ofSession $YA)[0].f 'isArchived' $false; run '-MaxAgeDays 0'
+setRec (ofSession $YA)[0].f 'isArchived' $false; run @{ MaxAgeDays = 0 }
 check 'out of scope: un-archived on every seat' (@(ofSession $YA | Where-Object arch).Count -eq 0)
 check 'out of scope: remembered as a kept entry' ((autoVal $YA) -like 'kept *')
 touch $YA 30; run
@@ -429,7 +523,7 @@ check 'seen: resumed: stays archived on every seat (a seen entry is never revive
 "--- a session archived for age and then resumed is un-archived on every seat, and archived again once stale"
 $RV = mkOld; run
 check 'revive: setup: archived on every seat, remembered as a plain date' (@(ofSession $RV | Where-Object { -not $_.arch }).Count -eq 0 -and (autoDone $RV) -and -not ((autoVal $RV) -like 'kept *'))
-touch $RV 0; $AV = mkOld; run '-DryRun'   # a revive and an age archive due in the same run: the summary line carries both
+touch $RV 0; $AV = mkOld; run @{ DryRun = $true }   # a revive and an age archive due in the same run: the summary line carries both
 check 'revive + age archive, dry run: exits 0, no error, says it would un-archive one' ($rc -eq 0 -and -not ($out -match 'rror|xception') -and [bool]($out -match '\+1 would be un-archived because their transcript was written again'))
 run
 check 'revive + age archive in one run: exits 0, no error' ($rc -eq 0 -and -not ($out -match 'rror|xception'))
@@ -447,8 +541,8 @@ check 'revive: stale again: archived once more on every seat' (@(ofSession $RV |
 "--- a new un-archived copy (pass 2 made it while the app was open) does not block a revive"
 $NC = mkOld; run
 check 'revive with a new copy: setup: archived on every seat, plain date' (@(ofSession $NC | Where-Object { -not $_.arch }).Count -eq 0 -and (autoVal $NC) -notmatch '^(kept|seen|revive) ' -and (autoDone $NC))
-$ncSrc = (ofSession $NC)[0]; $ncj = Get-Content $ncSrc.f -Raw | ConvertFrom-Json; $ncj.sessionId = "local_$([guid]::NewGuid())"; $ncj.isArchived = $false
-Set-Content (Join-Path (Split-Path $ncSrc.f) "$($ncj.sessionId).json") ($ncj | ConvertTo-Json -Compress -Depth 100) -NoNewline
+$ncSrc = (ofSession $NC)[0]; $ncj = Get-Content -LiteralPath $ncSrc.f -Raw | ConvertFrom-Json; $ncj.sessionId = "local_$([guid]::NewGuid())"; $ncj.isArchived = $false
+Set-Content -LiteralPath (Join-Path (Split-Path -LiteralPath $ncSrc.f) "$($ncj.sessionId).json") ($ncj | ConvertTo-Json -Compress -Depth 100) -NoNewline
 touch $NC 0; run
 check 'revive with a new copy: un-archived on every record, the new copy included' (@(ofSession $NC | Where-Object arch).Count -eq 0)
 check 'revive with a new copy: no longer remembered' (-not (autoDone $NC))
@@ -499,6 +593,67 @@ foreach ($r in (ofSession $Y)) { setRec $r.f 'isArchived' $true }; run
 check 'kept: archived by hand on every seat' (@(ofSession $Y | Where-Object { -not $_.arch }).Count -eq 0 -and (autoVal $Y) -like 'kept *')
 touch $Y 0; run
 check 'kept: resumed: stays archived on every seat' (@(ofSession $Y | Where-Object { -not $_.arch }).Count -eq 0 -and (autoVal $Y) -like 'kept *')
+
+# A share root can already have local transcripts and app records keyed with the final separator.
+$uncWorkspace = '\\?\unc\history-root-fixture.invalid.\share\'
+$uncEncoded = $uncWorkspace -creplace '[^A-Za-z0-9]', '-'
+$uncProj = "$sb\home\.claude\projects\$uncEncoded"
+$uncBucket = "$ccs\A\unc-share-root-fixture"
+New-Item -ItemType Directory $uncProj, $uncBucket -Force | Out-Null
+$seedId = "local_$([guid]::NewGuid())"
+@{ sessionId = $seedId; cliSessionId = [guid]::NewGuid().ToString(); cwd = $uncWorkspace; originCwd = $uncWorkspace } |
+  ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $uncBucket "$seedId.json") -NoNewline
+$uncSession = [guid]::NewGuid().ToString()
+Set-Content -LiteralPath (Join-Path $uncProj "$uncSession.jsonl") (@('{"type":"user","message":{"role":"user","content":"test a share root"}}') + $asst)
+run @{ Cwd = $uncWorkspace }
+$newUncRecords = @(ofSession $uncSession | ForEach-Object { Get-Content -LiteralPath $_.f -Raw | ConvertFrom-Json })
+check 'a trailing UNC share-root separator is preserved in new app pointers' ($rc -eq 0 -and $newUncRecords.Count -gt 0 -and -not ($newUncRecords | Where-Object { $_.cwd -ne $uncWorkspace -or $_.originCwd -ne $uncWorkspace }))
+$beforeUnc = recHash
+run @{ Cwd = $uncWorkspace.TrimEnd('\'); DryRun = $true }
+check 'a UNC root without a separator does not import from a different transcript key' ($rc -eq 0 -and ($out -match '^no transcripts') -and (recHash) -eq $beforeUnc)
+
+# Two seats spell one workspace in different case: each seat's new records take that seat's own spelling,
+# and a seat with no record of it takes the shared (first-seen) spelling.
+$spellRoot = [IO.Path]::GetPathRoot($PSHOME)
+$spellA = $spellRoot + 'Sync-Spelling-Fixture'; $spellB = $spellRoot + 'SYNC-SPELLING-FIXTURE'
+$spellProj = "$sb\home\.claude\projects\$($spellA -creplace '[^A-Za-z0-9]', '-')"
+New-Item -ItemType Directory $spellProj -Force | Out-Null
+foreach ($pair in @(@('A', $spellA), @('B', $spellB))) {
+  $dir = Join-Path (Join-Path $ccs $pair[0]) 'spelling-fixture'
+  New-Item -ItemType Directory $dir -Force | Out-Null
+  $id = "local_$([guid]::NewGuid())"
+  @{ sessionId = $id; cliSessionId = [guid]::NewGuid().ToString(); cwd = $pair[1]; originCwd = $pair[1]; title = 'Synthetic session' } |
+    ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $dir "$id.json") -NoNewline
+}
+$spellSession = [guid]::NewGuid().ToString()
+Set-Content -LiteralPath (Join-Path $spellProj "$spellSession.jsonl") (@('{"type":"user","message":{"role":"user","content":"test per-seat workspace spelling"}}') + $asst)
+# A titled record on seat A only: seats B and C get clones of it, which must not keep A's spelling on B.
+$spellClone = [guid]::NewGuid().ToString()
+Set-Content -LiteralPath (Join-Path $spellProj "$spellClone.jsonl") (@('{"type":"user","message":{"role":"user","content":"test a cloned record''s spelling"}}') + $asst)
+$id = "local_$([guid]::NewGuid())"
+# Its originCwd names another directory, which clones must keep.
+$cloneOrigin = $spellRoot + 'Some-Other-Origin'
+@{ sessionId = $id; cliSessionId = $spellClone; cwd = $spellA; originCwd = $cloneOrigin; title = 'Titled by the app' } |
+  ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path (Join-Path (Join-Path $ccs 'A') 'spelling-fixture') "$id.json") -NoNewline
+run @{ Cwd = $spellA.ToLowerInvariant() }
+$spellOf = { param($cli) $m = @{}; foreach ($r in (ofSession $cli)) { $j = Get-Content -LiteralPath $r.f -Raw | ConvertFrom-Json; $m[(key $r.f).Split('\')[0]] = @($j.cwd, $j.originCwd, $j.title) }; $m }
+$made = & $spellOf $spellSession; $cloned = & $spellOf $spellClone
+$seatOk = { param($m, $s, $want) $m[$s] -and @($m[$s][0, 1] | Where-Object { -not [string]::Equals($_, $want, [StringComparison]::Ordinal) }).Count -eq 0 }
+check 'new records take the destination seat''s own spelling of the workspace' ($rc -eq 0 -and (& $seatOk $made 'A' $spellA) -and (& $seatOk $made 'B' $spellB) -and (& $seatOk $made 'C' $spellA))
+check 'cloned records take the destination seat''s spelling and keep the app''s title and a different origin' ($cloned['B'] -and $cloned['C'] -and [string]::Equals($cloned['B'][0], $spellB, [StringComparison]::Ordinal) -and [string]::Equals($cloned['C'][0], $spellA, [StringComparison]::Ordinal) -and $cloned['B'][1] -eq $cloneOrigin -and $cloned['C'][1] -eq $cloneOrigin -and $cloned['B'][2] -eq 'Titled by the app')
+
+# A record for 'café' (one character) is a different directory from 'cafe' + combining accent: no match.
+$accentRec = $spellRoot + "accent-caf$([char]0xE9)"; $accentCwd = $spellRoot + "accent-cafe$([char]0x301)"
+$accentProj = "$sb\home\.claude\projects\$($accentCwd -creplace '[^A-Za-z0-9]', '-')"
+$accentDir = Join-Path (Join-Path $ccs 'A') 'accent-fixture'
+New-Item -ItemType Directory $accentProj, $accentDir -Force | Out-Null
+$id = "local_$([guid]::NewGuid())"
+@{ sessionId = $id; cliSessionId = [guid]::NewGuid().ToString(); cwd = $accentRec; originCwd = $accentRec; title = 'Synthetic session' } |
+  ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $accentDir "$id.json") -NoNewline
+Set-Content -LiteralPath (Join-Path $accentProj "$([guid]::NewGuid()).jsonl") (@('{"type":"user","message":{"role":"user","content":"test a combining accent"}}') + $asst)
+$beforeAccent = recHash
+run @{ Cwd = $accentCwd; DryRun = $true }
+check 'a record spelled with a precomposed accent does not match a combining-accent workspace' ($rc -eq 0 -and ($out -match '^no app record on any seat has workspace') -and ($out -match '^WOULD: added 0,') -and (recHash) -eq $beforeAccent)
 
 "$fail failure(s)"
 if ($fail -eq 0) { Remove-Item -LiteralPath $sb -Recurse -Force } else { "sandbox kept: $sb" }
